@@ -71,6 +71,7 @@ runtime delegates allocation to the configured backend.
 | Data structures | [`ds/`](ds/) | Trees, tries, hash tables, locks, and persistent-memory variants |
 | Allocators | [`malloc/`](malloc/) | `lsmalloc` and CXL shared-memory allocators |
 | Concurrency control | [`stm/`](stm/) | TinySTM, TL2, and SwissTM |
+| Kernel drivers | [`drivers/`](drivers/) | Optional experimental Linux memory-mapping modules |
 | Benchmarks and tests | [`tests/`](tests/) | YCSB-C, allocator tests, basic tests, and correctness tests |
 | Applications | [`apps/`](apps/) | The STAMP transactional-memory benchmark suite |
 | Examples | [`demos/`](demos/) | Minimal single-process and multi-process data-structure examples |
@@ -83,6 +84,7 @@ runtime delegates allocation to the configured backend.
 shm-pcc-sdk/
 ├── apps/          # Applications and benchmark suites
 ├── demos/         # Small CXL-SDK usage examples
+├── drivers/       # Optional experimental Linux kernel modules
 ├── ds/            # Concurrent and persistent data structures
 ├── malloc/        # Shared-memory allocator implementations
 ├── shm-lib/       # Core shared-memory runtime library

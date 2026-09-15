@@ -62,6 +62,7 @@ The [BigMem paper](docs/bigmem26.pdf) develops the full SDK rationale.
 | [`allocator/`](allocator/) | Shared-memory allocator implementations; [allocation guide](https://memweave-org.github.io/docs/zh/guides/memory-allocation.html) |
 | [`TXMem/`](TXMem/) | TinySTM, TL2, and SwissTM transactional memory |
 | [`apps/`](apps/) | STAMP application benchmarks |
+| [`drivers/`](drivers/) | Optional experimental Linux memory-mapping modules |
 | [`tests/`](tests/) | YCSB-C, correctness, and allocator tests |
 
 ## Quick start

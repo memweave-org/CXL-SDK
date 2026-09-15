@@ -1,5 +1,7 @@
 #!/bin/bash
 
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)" || exit 1
+
 # 设置设备路径，如果未提供参数则使用默认值
 if [ -z "$1" ]; then
   DEVICE_PATH="/dev/uncached_mem_dev"
@@ -11,7 +13,7 @@ fi
 
 # 编译内核模块
 echo "正在编译内核模块..."
-make
+make -C "$SCRIPT_DIR"
 if [ $? -ne 0 ]; then
   echo "错误：编译内核模块失败。" >&2
   exit 1
@@ -32,7 +34,7 @@ fi
 
 # 安装（加载）内核模块
 echo "正在安装（加载）内核模块..."
-sudo make install
+sudo make -C "$SCRIPT_DIR" install
 if [ $? -ne 0 ]; then
   echo "错误：安装（加载）内核模块失败。" >&2
   exit 1

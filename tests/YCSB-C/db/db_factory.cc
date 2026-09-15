@@ -17,12 +17,10 @@
 // #define ENABLE_BTREE_OLC_DB
 // #define ENABLE_RADIX_ART_OLC_DB
 // #define ENABLE_RADIX_ART_ROWEX_DB
-// #define ENABLE_LEVEL_HASH_DB
 // #define ENABLE_CLHT_DB
 // #define ENABLE_HOT_DB
 // #define ENABLE_MASSTREE_DB
 // #define ENABLE_CLEVEL_HASH_DB
-// #define ENABLE_SHERMAN_DB
 
 #ifdef ENABLE_BTREE_DB
 #include "db/btree_db.h"
@@ -39,9 +37,6 @@
 #ifdef ENABLE_RADIX_ART_ROWEX_DB
 #include "db/radix_art_rowex_db.h"
 #endif
-#ifdef ENABLE_LEVEL_HASH_DB
-#include "db/level_hash_db.h"
-#endif
 #ifdef ENABLE_CLHT_DB
 #include "db/clht_db.h"
 #endif
@@ -53,9 +48,6 @@
 #endif
 #ifdef ENABLE_CLEVEL_HASH_DB
 #include "db/clevel_hash_db.h"
-#endif
-#ifdef ENABLE_SHERMAN_DB
-#include "db/sherman_db.h"
 #endif
 
 using namespace std;
@@ -95,11 +87,6 @@ DB *DBFactory::CreateDB(utils::Properties &props) {
     return ALLOC_AND_CONSTRUCT(BTreeOLCDB, cacheable.malloc, db_thread);
   } else
 #endif
-#ifdef ENABLE_LEVEL_HASH_DB
-      if (props["dbname"] == "levelhash") {
-    return ALLOC_AND_CONSTRUCT(LevelHashDB, cacheable.malloc, db_thread);
-  } else
-#endif
 #ifdef ENABLE_CLHT_DB
       if (props["dbname"] == "clht") {
     return ALLOC_AND_CONSTRUCT(CLHTDB, cacheable.malloc, db_thread, 512);
@@ -119,11 +106,6 @@ DB *DBFactory::CreateDB(utils::Properties &props) {
       if (props["dbname"] == "clevelhash") {
     return ALLOC_AND_CONSTRUCT(CLevelHashDB, cacheable.malloc, db_thread);
   } else
-#endif
-#ifdef ENABLE_SHERMAN_DB
-      if (props["dbname"] == "sherman") {
-    return ALLOC_AND_CONSTRUCT(ShermanDB, cacheable.malloc, db_thread);
-  }
 #endif
   return NULL;
 }

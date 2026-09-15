@@ -128,27 +128,6 @@ task_clevel_breakdown() {
     done
 }
 
-# Fig.13 sherman
-task_sherman_ccconfig_workload_threadcnt() {
-    dir=./log/sherman_ccconfig_workload_threadcnt
-    mkdir -p $dir
-    configs=("nocc")
-    for config in "${configs[@]}"; do
-        ./build.sh "${config}"
-        ./run_shm_ds.sh -db=sherman -mode=server_thread_scale_test 2>&1 | tee $dir/${config}.log
-    done
-}
-
-task_sherman_indivi() {
-    dir=./log/sherman
-    mkdir -p $dir
-    configs=("nocc")
-    for config in "${configs[@]}"; do
-        ./build.sh "${config}"
-        ./run_shm_ds.sh -db=sherman -mode=sherman 2>&1 | tee $dir/${config}.log
-    done
-}
-
 task_thread_scale_test() {
     dir=./log/ycsb
     mkdir -p $dir
@@ -274,13 +253,11 @@ echo "$SUDO_PASSWORD" | sudo -S ./prepare_env.sh
 # task_record_scale_test
 # task_real_ccconfig_workload
 # task_ycsb_ccconfig_workload_threadcnt
-# task_sherman_ccconfig_workload_threadcnt
 # task_ycsb_ccconfig_workload_threadcnt_debug
 task_clevel_ccconfig_workload_threadcnt
 # task_clevel_real_ccconfig_workload
 # task_clevel_breakdown
 # task_bwtree_breakdown
-# task_sherman_indivi
 # task_latency_overhead
 # task_various_value_size
 

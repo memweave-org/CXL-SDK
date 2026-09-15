@@ -312,23 +312,6 @@ case $MODE in
 		# sleep 5
 	done
 	;;
-"sherman")
-	# SERVER_THREADS_N=24
-	DB_TYPE="sherman"
-	workloads=(
-		"workloada_zipfian_100m.spec" 
-		"workloadb_zipfian_100m.spec" 
-		"workloadc_zipfian_100m.spec"
-	)
-	thread_nums=(144)
-	for workload in "${workloads[@]}"; do
-		for thread_num in "${thread_nums[@]}"; do
-		SERVER_THREADS_N=$thread_num
-		run_ycsbc $workload
-		sleep 1
-		done
-	done
-	;;
 "ycsb_workload_threadcnt")
 	local_workloads=(
 		"workloada_zipfian.spec" 

@@ -40,15 +40,6 @@ void hex_dump(const char *filename, const void* addr, int len);
   }
 }
 
-[[maybe_unused]] static inline void convert_levelhash(uint64_t key, uint8_t *buf, int len) {
-  std::string key_str = std::to_string(key);
-  uint64_t str_len = key_str.size();
-  for (int i = 0; i < len - 1; ++i) {
-    buf[i] = static_cast<uint8_t>(key_str[i % str_len]);
-  }
-  buf[len - 1] = '\0';
-}
-
 #if defined(ENABLE_RADIX_ART_OLC_DB) || defined(ENABLE_RADIX_ART_ROWEX_DB)
 #include "OptimisticLockCoupling/Tree.h"
 [[maybe_unused]] static inline void loadKey(TID tid, Key &key) {

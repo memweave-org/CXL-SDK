@@ -4,7 +4,7 @@ This directory contains the YCSB-C workload driver and adapters used to test
 CXL-SDK's concurrent indexes. The driver is based on the C++ port of the
 [Yahoo! Cloud Serving Benchmark](https://github.com/basicthinker/YCSB-C) and has
 been extended with shared-memory setup, paper experiment variants, and adapters
-for BwTree, ClevelHash, CLHT, HOT, Masstree, RadixART, BTreeOLC, and Sherman.
+for BwTree, ClevelHash, CLHT, HOT, Masstree, RadixART, and BTreeOLC.
 
 ## Dependencies
 

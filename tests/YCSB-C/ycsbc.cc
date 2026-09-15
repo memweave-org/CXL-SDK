@@ -152,11 +152,12 @@ void master_process(utils::Properties &props) {
                         SimThreadInfo::worker_machine_count, total_ops);
   auto end = std::chrono::steady_clock::now();
   // std::cerr << "LoadData time: " << std::chrono::duration_cast<std::chrono::milliseconds>(end - begin).count() << "ms" << std::endl;
-  if (total_ops > 0) {
-    std::cerr << "Load throughput: " << total_ops / std::chrono::duration_cast<std::chrono::milliseconds>(end - begin).count() << " Kops/s" << std::endl;
-  } else {
-    std::cerr << "Load throughput: 0 ops/ms" << std::endl;
-  }
+  const double load_ms =
+      std::chrono::duration<double, std::milli>(end - begin).count();
+  const double load_kops_per_sec =
+      load_ms > 0 ? total_ops / load_ms : 0.0;
+  std::cerr << "Load throughput: " << load_kops_per_sec
+            << " Kops/s" << std::endl;
   
 #ifdef TRX_TYPE_STAT
   std::cerr << "\n=== Statistics after LoadData phase ===" << std::endl;

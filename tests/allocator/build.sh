@@ -2,14 +2,14 @@
 
 build_lsmalloc() {
     echo "Building LSMalloc ..."
-    cd $1/../../malloc//lsmalloc
+    cd $1/../../allocator/lsmalloc
     cmake -B build && cmake --build build
     cd $1
 }
 
 build_cxlshm() {
     echo "Building CXLSHM ..."
-    cd $1/../../malloc/cxl-shm
+    cd $1/../../allocator/cxl-shm
     cmake -B build && cmake --build build
     cd $1
 }

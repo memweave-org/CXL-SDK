@@ -59,7 +59,7 @@ add_library(shm-lib STATIC ${SOURCES})
 target_compile_definitions(shm-lib PUBLIC USE_CXL)
 
 option(WITH_CXLALLOC "Link cxlalloc-static; enables INI allocator_backend=cxlalloc" OFF)
-set(CXLALLOC_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../malloc/cxlalloc" CACHE PATH "cxlalloc Rust workspace root")
+set(CXLALLOC_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../allocator/cxlalloc" CACHE PATH "cxlalloc Rust workspace root")
 
 # 链接 shm-lib 依赖的系统库
 find_library(MEMKIND_LIB memkind)

@@ -51,6 +51,7 @@ docs/html/
 
 # SVG files (if generated)
 *.svg
+!docs/arch.svg
 
 # OS-specific files
 .DS_Store

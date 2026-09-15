@@ -9,7 +9,7 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O3 -Wall -pthread")
 
 # 设置STM库路径
-set(STM_DIR "${CMAKE_SOURCE_DIR}/../../stm" CACHE PATH "Path to STM directory")
+set(STM_DIR "${CMAKE_SOURCE_DIR}/../../TXMem" CACHE PATH "Path to STM directory")
 
 # 添加STM包含路径
 include_directories(
@@ -46,4 +46,4 @@ install(TARGETS
     vacation
     yada
     RUNTIME DESTINATION bin
-) 
+)

@@ -415,7 +415,7 @@ void init_cacheable_allocator_unified(const CacheableInitParams &p) {
 #ifndef SHM_LIB_WITH_CXLALLOC
     throw std::runtime_error(
         "allocator_backend=cxlalloc but shm-lib was built without "
-        "WITH_CXLALLOC (prebuild or build malloc/cxlalloc/cxlalloc-static)");
+        "WITH_CXLALLOC (prebuild or build allocator/cxlalloc/cxlalloc-static)");
 #endif
     if (p.mem_type_cxl && p.worker_machine_count > 1) {
       throw std::runtime_error(

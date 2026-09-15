@@ -38,7 +38,7 @@ check_command make
 
 # 获取脚本所在目录的绝对路径
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
-STM_DIR="$(dirname "$SCRIPT_DIR")/../stm"
+STM_DIR="$(dirname "$SCRIPT_DIR")/../TXMem"
 
 # 默认STM实现
 STM_IMPL=${1:-"tl2"}

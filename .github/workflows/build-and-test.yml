@@ -1,0 +1,80 @@
+name: Build and test
+
+on:
+  push:
+    branches: [master, opensource]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-and-test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential cmake \
+            libboost-all-dev libcityhash-dev libibverbs-dev \
+            libjemalloc-dev libmemkind-dev libnuma-dev libssh-dev libtbb-dev
+
+      - name: Check shared-memory STL build
+        run: |
+          cmake -S STL -B "${RUNNER_TEMP}/build-STL"
+          cmake --build "${RUNNER_TEMP}/build-STL" --parallel
+
+      - name: Check YCSB-C index build
+        run: |
+          cmake -S tests/YCSB-C -B "${RUNNER_TEMP}/build-ycsb" \
+            -DVARIANT=nocc \
+            -DBWTREE_MAPPING_TABLE_BITS=16
+          cmake --build "${RUNNER_TEMP}/build-ycsb" --parallel
+
+      - name: Check allocator libraries and tests
+        run: |
+          cmake -S allocator/cxl-shm -B "${RUNNER_TEMP}/build-cxl-shm"
+          cmake --build "${RUNNER_TEMP}/build-cxl-shm" --parallel
+
+          cmake -S allocator/lsmalloc -B "${RUNNER_TEMP}/build-lsmalloc" \
+            -DFAULT_INJECTION=OFF
+          cmake --build "${RUNNER_TEMP}/build-lsmalloc" --parallel
+          truncate -s 4G /dev/shm/logcxl_data
+          truncate -s 1G /dev/shm/logcxl_hashmap
+          trap 'rm -f /dev/shm/logcxl_data /dev/shm/logcxl_hashmap' EXIT
+          ctest --test-dir "${RUNNER_TEMP}/build-lsmalloc" \
+            --output-on-failure --no-tests=error
+
+      - name: Run file-backed BwTree smoke test
+        run: |
+          truncate -s 256M "${RUNNER_TEMP}/cxl-sdk-shm"
+          sed \
+            -e "s#/tmp/cxl-sdk-shm#${RUNNER_TEMP}/cxl-sdk-shm#" \
+            -e 's/mem_size=1024/mem_size=256/' \
+            tests/YCSB-C/config.local.ini > "${RUNNER_TEMP}/config.local.ini"
+
+          "${RUNNER_TEMP}/build-ycsb/ycsbc_nocc" \
+            -db bwtree \
+            -machinenum 1 \
+            -follower_list localhost \
+            -client_threads 1 \
+            -server_threads 2 \
+            -dbnum 1 \
+            -valuesize 8 \
+            -P tests/YCSB-C/workloads/workloada_small.spec \
+            -C "${RUNNER_TEMP}/config.local.ini" \
+            | tee "${RUNNER_TEMP}/ycsb-smoke.log"
+
+          grep -F $'total operations\t1000' "${RUNNER_TEMP}/ycsb-smoke.log"

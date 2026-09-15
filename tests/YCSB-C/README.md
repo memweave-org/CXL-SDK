@@ -29,11 +29,11 @@ The `cc` variant uses ordinary cache-coherent atomics. The `nocc` variant
 enables the paper's cache-bypassing implementation plus the G2/G3 optimization
 flags. Additional variants are declared in [`CMakeLists.txt`](CMakeLists.txt).
 
-For an isolated compile-only check that does not create local build directories,
-run the repository harness:
+For an isolated compile-only check, use a temporary build directory:
 
 ```bash
-../../tools/opensource-harness/run.sh --full
+cmake -S . -B /tmp/cxl-sdk-ycsb -DVARIANT=nocc
+cmake --build /tmp/cxl-sdk-ycsb --parallel
 ```
 
 ## Local smoke run

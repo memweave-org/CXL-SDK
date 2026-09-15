@@ -112,7 +112,7 @@ size_t LockFreeLogAllocator::get_segment_begin_offset() const {
 }
 
 int LockFreeLogAllocator::register_thread() {
-    int thread_id = clht_db->Pool);
+    int thread_id = clht_db->PoolThreadInit();
     return thread_id;
 }
 

@@ -5,7 +5,7 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_DIR="${SCRIPT_DIR}/build"
 
-echo "Building PCC Demos..."
+echo "Building STL..."
 
 # Create build directory
 mkdir -p "${BUILD_DIR}"
@@ -21,4 +21,3 @@ echo "To run examples:"
 echo "  cd ${BUILD_DIR}"
 echo "  ./simple_demo"
 echo "  ./multi_process_demo"
-

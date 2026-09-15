@@ -10,11 +10,11 @@
 void demo_btree() {
     std::cout << "\n=== BwTree Demo ===" << std::endl;
     
-    // Initialize shared memory (using DAX device)
+    // Initialize shared memory with a file-backed mapping
     pcc::ShmConfig config;
-    config.shm_path = "/dev/dax0.0";  // Use DAX device
+    config.shm_path = "/tmp/cxl-sdk-demo-btree";
     config.shm_id = "demo_btree";
-    config.shm_size = 1024ULL * 1024 * 1024; // 1GB (will be aligned to 2MB for DAX)
+    config.shm_size = 256ULL * 1024 * 1024; // 256 MiB
     config.thread_num = 2;
     config.is_creator = true;
     
@@ -78,11 +78,11 @@ void demo_btree() {
 void demo_clevelhash() {
     std::cout << "\n=== ClevelHash Demo ===" << std::endl;
     
-    // Initialize shared memory (using DAX device)
+    // Initialize shared memory with a file-backed mapping
     pcc::ShmConfig config;
-    config.shm_path = "/dev/dax0.0";  // Use DAX device
+    config.shm_path = "/tmp/cxl-sdk-demo-clevelhash";
     config.shm_id = "demo_clevelhash";
-    config.shm_size = 1024ULL * 1024 * 1024; // 1GB (will be aligned to 2MB for DAX)
+    config.shm_size = 256ULL * 1024 * 1024; // 256 MiB
     config.thread_num = 2;
     config.is_creator = true;
     
@@ -126,7 +126,7 @@ void demo_clevelhash() {
 }
 
 int main(int argc, char* argv[]) {
-    std::cout << "PCC Data Structures Demo" << std::endl;
+    std::cout << "Shared-Memory STL Example" << std::endl;
     std::cout << "========================" << std::endl;
     
     if (argc > 1 && std::string(argv[1]) == "clevelhash") {
@@ -137,4 +137,3 @@ int main(int argc, char* argv[]) {
     
     return 0;
 }
-

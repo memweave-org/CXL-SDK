@@ -1,0 +1,116 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 1040" role="img" aria-labelledby="title description">
+  <title id="title">CXL-SDK architecture</title>
+  <desc id="description">Applications above system libraries, data structures, synchronization, memory management, fault tolerance, and hardware capabilities.</desc>
+  <defs>
+    <style>
+      text { font-family: Inter, Arial, Helvetica, sans-serif; fill: #111827; }
+      .stage { stroke: #111827; stroke-width: 2; stroke-dasharray: 8 7; }
+      .box { fill: #fff; stroke: #111827; stroke-width: 2.5; }
+      .section-title { font-size: 43px; font-weight: 700; font-style: italic; }
+      .card-label { font-size: 31px; font-style: italic; }
+      .brand-name { font-size: 38px; font-weight: 700; fill: #fff; }
+      .arrow { fill: #fff; stroke: #111827; stroke-width: 2; stroke-linejoin: round; }
+    </style>
+  </defs>
+
+  <rect width="1600" height="1040" fill="#080b10"/>
+
+  <!-- Application and ecosystem names are editable vector text. -->
+  <g aria-label="Applications and ecosystems">
+    <path d="M78 86 L85 105 L105 105 L89 117 L95 137 L78 125 L61 137 L67 117 L51 105 L71 105 Z" fill="#ee6d26"/>
+    <text x="115" y="125" class="brand-name">Spark</text>
+
+    <g fill="none" stroke="#28a7e5" stroke-width="5">
+      <circle cx="312" cy="88" r="7"/><circle cx="287" cy="119" r="7"/><circle cx="338" cy="119" r="7"/><circle cx="312" cy="151" r="7"/>
+      <path d="M308 95 L291 112 M318 95 L334 112 M293 123 L307 145 M331 123 L317 145 M296 119 H329"/>
+    </g>
+    <text x="362" y="125" class="brand-name">Ray</text>
+
+    <path d="M533 131 C510 112 523 91 540 79 C538 98 561 94 557 112 C570 103 584 106 588 122 C576 137 552 145 533 131 Z" fill="#cc5ca6"/>
+    <path d="M539 126 C537 109 550 105 555 93 C565 106 572 113 578 124 C564 135 550 135 539 126 Z" fill="#f28b66"/>
+    <text x="604" y="125" class="brand-name">Flink</text>
+
+    <path d="M787 113 H817 M797 103 L787 113 L797 123 M817 103 L827 113 L817 123" fill="none" stroke="#2cc6d2" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+    <text x="842" y="125" class="brand-name">gRPC</text>
+
+    <g fill="none" stroke="#ef795b" stroke-width="4" stroke-linejoin="round">
+      <path d="M1065 82 L1103 101 L1065 120 L1027 101 Z M1027 115 L1065 134 L1103 115 M1027 129 L1065 148 L1103 129"/>
+    </g>
+    <text x="1120" y="125" class="brand-name" style="font-size:35px">Databricks</text>
+
+    <circle cx="1385" cy="114" r="29" fill="none" stroke="#fff" stroke-width="4" stroke-dasharray="9 5"/>
+    <circle cx="1385" cy="114" r="17" fill="none" stroke="#fff" stroke-width="3"/>
+    <text x="1428" y="125" class="brand-name" style="font-size:33px">Mooncake</text>
+  </g>
+
+  <path class="arrow" d="M246 226 H266 V185 H282 L256 162 L230 185 H246 Z"/>
+  <path class="arrow" d="M1290 226 H1310 V185 H1326 L1300 162 L1274 185 H1290 Z"/>
+
+  <!-- Libraries: three system-level modules in one horizontal layer. -->
+  <rect x="40" y="225" width="1520" height="130" fill="#eaf3ff" class="stage"/>
+  <text x="65" y="301" class="section-title">Libraries</text>
+  <rect x="382" y="242" width="340" height="94" class="box"/>
+  <rect x="750" y="242" width="340" height="94" class="box"/>
+  <rect x="1118" y="242" width="415" height="94" class="box"/>
+  <text x="552" y="300" text-anchor="middle" class="card-label">Object Store</text>
+  <text x="920" y="300" text-anchor="middle" class="card-label">File System</text>
+  <text x="1325" y="300" text-anchor="middle" class="card-label">RPC Framework</text>
+
+  <!-- Direction follows the original: lower layers enable the layers above. -->
+  <path class="arrow" d="M515 384 H535 V364 H545 L525 346 L505 364 H515 Z"/>
+  <path class="arrow" d="M883 384 H903 V364 H913 L893 346 L873 364 H883 Z"/>
+  <path class="arrow" d="M1288 384 H1308 V364 H1318 L1298 346 L1278 364 H1288 Z"/>
+
+  <!-- Broad shared data-structure layer. -->
+  <rect x="40" y="384" width="1520" height="82" fill="#fff" stroke="#111827" stroke-width="2"/>
+  <text x="800" y="437" text-anchor="middle" style="font-size:42px;font-weight:700;font-style:italic">Data Structures</text>
+  <text x="1058" y="437" style="font-size:30px;font-style:italic">(e.g., cxl::map like std::map)</text>
+
+  <!-- Three pillars beneath data structures. -->
+  <path class="arrow" d="M244 517 H264 V497 H274 L254 479 L234 497 H244 Z"/>
+  <path class="arrow" d="M790 517 H810 V497 H820 L800 479 L780 497 H790 Z"/>
+  <path class="arrow" d="M1336 517 H1356 V497 H1366 L1346 479 L1326 497 H1336 Z"/>
+
+  <rect x="40" y="517" width="432" height="314" fill="#fff4cd" class="stage"/>
+  <text x="256" y="571" text-anchor="middle" class="section-title">Synchronization</text>
+  <rect x="64" y="592" width="384" height="62" class="box"/>
+  <rect x="64" y="666" width="384" height="62" class="box"/>
+  <rect x="64" y="740" width="384" height="62" class="box"/>
+  <text x="256" y="633" text-anchor="middle" class="card-label">Lock</text>
+  <text x="256" y="707" text-anchor="middle" class="card-label">Lock-free</text>
+  <text x="256" y="781" text-anchor="middle" class="card-label">TX Memory</text>
+
+  <rect x="504" y="517" width="592" height="314" fill="#d8edc9" class="stage"/>
+  <text x="800" y="571" text-anchor="middle" class="section-title">Memory Management</text>
+  <rect x="529" y="592" width="542" height="62" class="box"/>
+  <rect x="529" y="666" width="542" height="62" class="box"/>
+  <rect x="529" y="740" width="542" height="62" class="box"/>
+  <text x="800" y="633" text-anchor="middle" class="card-label">Memory Allocator</text>
+  <text x="800" y="707" text-anchor="middle" class="card-label">Garbage Collection</text>
+  <text x="800" y="781" text-anchor="middle" class="card-label">Memory Leak Checker</text>
+
+  <rect x="1128" y="517" width="432" height="314" fill="#ff3928" class="stage"/>
+  <text x="1344" y="571" text-anchor="middle" class="section-title">Fault Tolerance</text>
+  <rect x="1152" y="592" width="384" height="62" class="box"/>
+  <rect x="1152" y="666" width="384" height="62" class="box"/>
+  <rect x="1152" y="740" width="384" height="62" class="box"/>
+  <text x="1344" y="633" text-anchor="middle" class="card-label">Fault Detection</text>
+  <text x="1344" y="707" text-anchor="middle" class="card-label">Replication / EC</text>
+  <text x="1344" y="781" text-anchor="middle" class="card-label">Recoverable Lock</text>
+
+  <path class="arrow" d="M790 880 H810 V860 H820 L800 842 L780 860 H790 Z"/>
+
+  <!-- Hardware instruction boxes. -->
+  <rect x="40" y="880" width="1520" height="138" fill="#f3f3f5" class="stage"/>
+  <rect x="62" y="895" width="430" height="50" class="box"/>
+  <rect x="62" y="954" width="430" height="50" class="box"/>
+  <rect x="522" y="895" width="525" height="50" class="box"/>
+  <rect x="522" y="954" width="525" height="50" class="box"/>
+  <rect x="1077" y="895" width="461" height="50" class="box"/>
+  <text x="277" y="930" text-anchor="middle" style="font-size:27px;font-style:italic">Cross-Host Atomics</text>
+  <text x="277" y="989" text-anchor="middle" style="font-size:27px;font-style:italic">Cacheline Control</text>
+  <text x="784" y="930" text-anchor="middle" style="font-size:27px;font-style:italic">Cacheable Memory</text>
+  <text x="784" y="989" text-anchor="middle" style="font-size:27px;font-style:italic">Uncacheable Memory</text>
+  <text x="1307" y="930" text-anchor="middle" style="font-size:27px;font-style:italic">Cross-host Interrupt</text>
+  <text x="1307" y="988" text-anchor="middle" style="font-size:33px;font-weight:700;font-style:italic">Hardware Instructions</text>
+</svg>

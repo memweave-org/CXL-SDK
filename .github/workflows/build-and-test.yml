@@ -43,6 +43,11 @@ jobs:
             -DBWTREE_MAPPING_TABLE_BITS=16
           cmake --build "${RUNNER_TEMP}/build-ycsb" --parallel
 
+          cmake -S tests/YCSB-C -B "${RUNNER_TEMP}/build-ycsb-cc" \
+            -DVARIANT=cc \
+            -DBWTREE_MAPPING_TABLE_BITS=16
+          cmake --build "${RUNNER_TEMP}/build-ycsb-cc" --parallel
+
       - name: Check allocator libraries and tests
         run: |
           cmake -S allocator/cxl-shm -B "${RUNNER_TEMP}/build-cxl-shm"
@@ -65,7 +70,7 @@ jobs:
             -e 's/mem_size=1024/mem_size=256/' \
             tests/YCSB-C/config.local.ini > "${RUNNER_TEMP}/config.local.ini"
 
-          "${RUNNER_TEMP}/build-ycsb/ycsbc_nocc" \
+          "${RUNNER_TEMP}/build-ycsb-cc/ycsbc_cc" \
             -db bwtree \
             -machinenum 1 \
             -follower_list localhost \

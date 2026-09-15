@@ -9,7 +9,7 @@ include:
 [shm/cacheable]
 mem_type=local
 device_path=/tmp/cxl-sdk-shm
-mmap_base_addr=0xcaffe0000000
+mmap_base_addr=0x400000000000
 mem_size=1024
 allocator_backend=memkind
 ```

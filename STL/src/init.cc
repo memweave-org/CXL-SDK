@@ -96,7 +96,7 @@ bool init_shm(const ShmConfig& config) {
             close(fd);
         }
         
-        void *base_addr = reinterpret_cast<void *>(0xcaffe0000000);
+        void *base_addr = reinterpret_cast<void *>(0x400000000000);
         CacheableInitParams p{};
         p.device_path = actual_path.c_str();
         p.mmap_base = base_addr;

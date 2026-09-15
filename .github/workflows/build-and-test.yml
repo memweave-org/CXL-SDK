@@ -80,6 +80,6 @@ jobs:
             -valuesize 8 \
             -P tests/YCSB-C/workloads/workloada_small.spec \
             -C "${RUNNER_TEMP}/config.local.ini" \
-            | tee "${RUNNER_TEMP}/ycsb-smoke.log"
+            2>&1 | tee "${RUNNER_TEMP}/ycsb-smoke.log"
 
           grep -F $'total operations\t1000' "${RUNNER_TEMP}/ycsb-smoke.log"

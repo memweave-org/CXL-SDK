@@ -5,6 +5,7 @@
 #include <numaif.h>
 #include <set>
 #include <unistd.h>
+#include <sched.h>
 #include <vector>
 #include <mutex>
 
@@ -44,12 +45,19 @@ public:
     next_cpu_idx_in_node.resize(max_node,
                                 0); // 初始化所有节点的下一个CPU索引为0
 
+    cpu_set_t allowed_cpus;
+    CPU_ZERO(&allowed_cpus);
+    const bool has_affinity =
+        sched_getaffinity(0, sizeof(allowed_cpus), &allowed_cpus) == 0;
+
     // 获取并存储每个节点的CPU信息
     for (int node = 0; node < max_node; ++node) {
       struct bitmask *cpumask = numa_allocate_cpumask();
       if (numa_node_to_cpus(node, cpumask) == 0) {
         for (uint32_t cpu = 0; cpu < cpumask->size; ++cpu) {
-          if (numa_bitmask_isbitset(cpumask, cpu)) {
+          if (numa_bitmask_isbitset(cpumask, cpu) &&
+              (!has_affinity ||
+               (cpu < CPU_SETSIZE && CPU_ISSET(cpu, &allowed_cpus)))) {
             node_cpus[node].push_back(cpu);
           }
         }
@@ -60,34 +68,28 @@ public:
 
   int allocate_cpu(int preferred_node) {
     std::unique_lock<std::mutex> lock(mtx);
-    // 从首选节点出发，寻找可用的CPU
-    for (int current_node_idx = preferred_node; current_node_idx < max_node;
-         ++current_node_idx) {
+    const int first =
+        (preferred_node >= 0 && preferred_node < max_node) ? preferred_node : 0;
 
-      if (node_cpus[current_node_idx].empty()) {
-        continue; // 如果此节点没有CPU，则跳过
+    // Prefer the requested NUMA node, then try every other available node.
+    for (int step = 0; step < max_node; ++step) {
+      const int node = (first + step) % max_node;
+      const int count = node_cpus[node].size();
+      if (count == 0) {
+        continue;
       }
 
-      int num_cpus_on_this_node = node_cpus[current_node_idx].size();
-      int current_search_start_offset = next_cpu_idx_in_node[current_node_idx];
-
-      // 从记录的起始偏移量开始，在此节点上迭代所有CPU
-      for (int j = 0; j < num_cpus_on_this_node; ++j) {
-        int cpu_list_idx =
-            (current_search_start_offset + j) % num_cpus_on_this_node;
-        int cpu_to_check = node_cpus[current_node_idx][cpu_list_idx];
-
-        if (allocated_cpus.find(cpu_to_check) == allocated_cpus.end()) {
-          allocated_cpus.insert(cpu_to_check);
-          // 更新此节点的下一个CPU起始搜索索引
-          next_cpu_idx_in_node[current_node_idx] =
-              (cpu_list_idx + 1) % num_cpus_on_this_node;
-          return cpu_to_check;
+      const int start = next_cpu_idx_in_node[node];
+      for (int offset = 0; offset < count; ++offset) {
+        const int idx = (start + offset) % count;
+        const int cpu = node_cpus[node][idx];
+        if (allocated_cpus.insert(cpu).second) {
+          next_cpu_idx_in_node[node] = (idx + 1) % count;
+          return cpu;
         }
       }
     }
 
-    // 如果所有CPU都已经分配，返回错误
     std::cerr << "All CPUs have been allocated." << std::endl;
     return -1;
   }

@@ -8,8 +8,8 @@
 
 ## Validation
 
-- [ ] `./tools/opensource-harness/run.sh`
-- [ ] `./tools/opensource-harness/run.sh --full`
+- [ ] Relevant component builds and tests pass locally.
+- [ ] GitHub Actions build-and-test workflow passes.
 - [ ] Hardware-specific checks are listed below or marked not applicable.
 
 ## Reproduction environment

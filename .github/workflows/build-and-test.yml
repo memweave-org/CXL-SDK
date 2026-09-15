@@ -28,7 +28,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             build-essential cmake \
-            libboost-all-dev libcityhash-dev libibverbs-dev \
+            libboost-all-dev libibverbs-dev \
             libjemalloc-dev libmemkind-dev libnuma-dev libssh-dev libtbb-dev
 
       - name: Check shared-memory STL build

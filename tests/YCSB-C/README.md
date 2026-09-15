@@ -12,7 +12,7 @@ On Ubuntu or Debian:
 
 ```bash
 sudo apt-get install -y \
-  build-essential cmake libboost-all-dev libcityhash-dev \
+  build-essential cmake libboost-all-dev \
   libibverbs-dev libjemalloc-dev libmemkind-dev libnuma-dev \
   libssh-dev libtbb-dev
 ```

@@ -8,10 +8,10 @@ yet published a stable release; entries currently describe the evolving
 
 ### Added
 
-- Open-source readiness harness and CI checks.
-- Root-level contribution, conduct, security, support, and third-party notices.
+- CI checks for YCSB-C, demos, and memory allocators.
+- Root-level contribution guide.
 
 ### Changed
 
 - Project branding is now CXL-SDK.
-- Documentation and build instructions are validated from a clean checkout.
+- Build and test instructions match the automated CI checks.

@@ -5,7 +5,7 @@ labels: [bug]
 body:
   - type: markdown
     attributes:
-      value: Do not report vulnerabilities here; follow SECURITY.md instead.
+      value: Do not report vulnerabilities here; use private vulnerability reporting instead.
   - type: input
     id: commit
     attributes:

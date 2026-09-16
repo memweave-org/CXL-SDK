@@ -1,3 +1,12 @@
+Scope of this license
+=====================
+
+The MIT terms below apply to original CXL-SDK contributions only, to the extent
+their copyright holders have authorized these terms. Bundled third-party code
+retains its own license and copyright notices. See the license files alongside
+those components. This file does not relicense
+third-party code.
+
 MIT License
 
 Copyright (c) 2024-2026 CXL-SDK Contributors
@@ -19,12 +28,3 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
-
----
-
-Third-Party Licenses
-====================
-
-This project includes third-party software components. Please refer to
-THIRD_PARTY_NOTICES.md in the repository root for license and attribution
-information.

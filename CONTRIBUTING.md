@@ -17,13 +17,8 @@ easiest to review and reproduce.
 1. Fork the repository and create a focused branch from `master`.
 2. Keep third-party changes separate from CXL-SDK-owned changes when possible.
 3. Add or update tests and documentation with the implementation.
-4. Run the open-source readiness harness:
-
-   ```bash
-   ./tools/opensource-harness/run.sh
-   ./tools/opensource-harness/run.sh --full
-   ```
-
+4. Run the builds and tests relevant to your change. The commands used by CI
+   are recorded in `.github/workflows/build-and-test.yml`.
 5. Describe hardware, kernel, NUMA topology, CXL device, compiler, and workload
    assumptions needed to reproduce experimental results.
 
@@ -36,22 +31,19 @@ easiest to review and reproduce.
 - Mark behavior or performance changes explicitly and include before/after data
   when making performance claims.
 - Confirm that new dependencies and copied code include their license and
-  attribution information in [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
+  attribution information alongside the component.
 
 ## Testing expectations
 
-At minimum, run the harness quick checks. For changes to `shm-lib`, also run the
-full harness, which configures and builds the core library in a clean temporary
-directory. Hardware-specific tests may be skipped when the required platform is
-unavailable, but the pull request must state what was not run and why.
+At minimum, build the component you changed. For runtime and data-structure
+changes, also run the YCSB-C file-backed smoke test used by CI. Hardware-specific
+tests may be skipped when the required platform is unavailable, but the pull
+request must state what was not run and why.
 
 Additional component-specific commands are documented in the
-[developer guide](https://shm-sdk.github.io/docs/zh/developer-guide.html).
+[developer guide](https://memweave-org.github.io/docs/zh/developer-guide.html).
 
 ## Reporting security issues
 
-Do not open public issues for vulnerabilities. Follow [`SECURITY.md`](SECURITY.md)
-instead.
-
-By participating, you agree to follow the
-[`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md).
+Do not open public issues for vulnerabilities. Use GitHub's
+[private vulnerability reporting](https://github.com/memweave-org/CXL-SDK/security/advisories/new).

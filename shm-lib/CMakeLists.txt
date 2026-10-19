@@ -108,3 +108,13 @@ endif()
 
 # 公开头文件目录
 target_include_directories(shm-lib PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+
+option(WITH_UB "Enable Huawei UB Memlink shared-memory mapping" OFF)
+if(WITH_UB)
+  set(UB_MEMLINK_LIBRARY "" CACHE FILEPATH "Vendor Memlink client library")
+  if(NOT EXISTS "${UB_MEMLINK_LIBRARY}")
+    message(FATAL_ERROR "WITH_UB requires -DUB_MEMLINK_LIBRARY=/absolute/path/to/vendor/library.so")
+  endif()
+  target_compile_definitions(shm-lib PUBLIC SHM_LIB_WITH_UB)
+  target_link_libraries(shm-lib PUBLIC "${UB_MEMLINK_LIBRARY}")
+endif()

@@ -1,6 +1,5 @@
 #pragma once
 
-#include <immintrin.h>
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
@@ -16,6 +15,7 @@
 #include <new>
 #include <thread>
 
+#include "shm/cxl_type.h"
 #include "utils/atomic_pointer.h"
 #include "utils/atomic_variable.h"
 #include "utils/bypass_cache.h"
@@ -440,10 +440,17 @@ public:
     }
   }
 
+  static void destroy_shared_value(value_type *value) {
+    if (value) {
+      value->~value_type();
+      cacheable.free(value);
+    }
+  }
+
   static void allocate_KV_copy_construct(value_type *&KV_ptr,
                                          const void *param) {
     const value_type *tmp_value = static_cast<const value_type *>(param);
-    value_type *real_value = new value_type(*tmp_value);
+    value_type *real_value = new (cacheable.malloc(sizeof(value_type))) value_type(*tmp_value);
     KV_ptr = real_value;
   }
 
@@ -565,7 +572,7 @@ public:
     for (size_type i = 0; i < thread_num; i++) {
       meta_replicas[i].store(meta.load());
     }
-    help_update = new HelpUpdate<level_meta>(meta, meta_replicas, thread_num);
+    help_update = new (cacheable.malloc(sizeof(HelpUpdate<level_meta>))) HelpUpdate<level_meta>(meta, meta_replicas, thread_num);
 #endif
   }
 
@@ -596,7 +603,7 @@ public:
 
   level_meta_ptr_t meta;
 #ifdef OPT_CLEVEL_ROOT_READ
-  std::vector<level_meta_ptr_t> meta_replicas;
+  cxl_vector<level_meta_ptr_t> meta_replicas;
   HelpUpdate<level_meta> *help_update;
 #endif
 
@@ -621,9 +628,9 @@ public:
   atomic_type<size_type> thread_num;
   atomic_type<char> run_expand_thread;
   // Array for each thread
-  std::vector<level_meta *> tmp_meta;
-  std::vector<level_bucket *> tmp_level;
-  std::vector<value_type *> tmp_entry;
+  cxl_vector<level_meta *> tmp_meta;
+  cxl_vector<level_bucket *> tmp_level;
+  cxl_vector<value_type *> tmp_entry;
 
   std::thread expand_thread;
 
@@ -751,7 +758,7 @@ void clevel_hash<Key, T, Hash, KeyEqual, HashPower>::del_dup(
       uint64_t expected = e2.p;
       bool ret = p2->p.compare_exchange_strong(expected, 0);
       if (ret) {
-        delete e2.addr();
+        destroy_shared_value(e2.addr());
       }
     }
   }
@@ -1145,7 +1152,7 @@ clevel_hash<Key, T, Hash, KeyEqual, HashPower>::generic_insert(
     }
 
     if (result == FOUND_IN_LEFT || result == FOUND_IN_RIGHT) {
-      delete tmp_entry[t_id];
+      destroy_shared_value(tmp_entry[t_id]);
       return ret(level_num, 0, 0);
     } else if ((result == VACANCY_IN_LEFT || result == VACANCY_IN_RIGHT) &&
                (level_num > 0 || !m->is_resizing)) {
@@ -1219,7 +1226,7 @@ clevel_hash<Key, T, Hash, KeyEqual, HashPower>::erase(const key_type &key,
             if (f_b.slots[j].p.compare_exchange_strong(expected, 0)) {
               succ_deletion = true;
 
-              delete tmp.addr(true);
+              destroy_shared_value(tmp.addr(true));
 
               // Instead of redoing the delete to
               // guarantee the deletion is successful,
@@ -1262,7 +1269,7 @@ clevel_hash<Key, T, Hash, KeyEqual, HashPower>::erase(const key_type &key,
             bool ret = s_b.slots[j].p.compare_exchange_strong(expected, 0);
             if (ret) {
               succ_deletion = true;
-              delete tmp.addr(true);
+              destroy_shared_value(tmp.addr(true));
               // Instead of redoing the delete to
               // guarantee the deletion is
               // successful, we apply context checking
@@ -1386,7 +1393,7 @@ clevel_hash<Key, T, Hash, KeyEqual, HashPower>::generic_update(
       }
     } else {
       if (!succ_update) {
-        delete tmp_entry[t_id];
+        destroy_shared_value(tmp_entry[t_id]);
       }
       // Even the updated item is deleted by other threads, our update
       // succeeds anyway.

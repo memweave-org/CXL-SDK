@@ -1,3 +1,4 @@
+#include "shm/cxl_type.h"
 //===----------------------------------------------------------------------===//
 //
 //                         PelotonDB
@@ -3011,7 +3012,7 @@ class BwTree : public BwTreeBase {
 #ifdef OPT_ROOT_READ
     // FreeNodeByNodeID() resolves the root through GetRootPtr(), so the
     // replicated-pointer helper must outlive the node teardown.
-    delete root_help_update;
+    if (root_help_update) { root_help_update->~HelpUpdate<BaseNode>(); cacheable.free(root_help_update); }
     root_help_update = nullptr;
 #endif
 
@@ -3454,7 +3455,7 @@ class BwTree : public BwTreeBase {
   }
 
   void ConfigureRootPointerReplicas() {
-    delete root_help_update;
+    if (root_help_update) { root_help_update->~HelpUpdate<BaseNode>(); cacheable.free(root_help_update); }
     root_help_update = nullptr;
     root_node_replicas.clear();
     root_node_replicas.resize(thread_num);
@@ -3469,7 +3470,7 @@ class BwTree : public BwTreeBase {
     for (size_t i = 0; i < thread_num; ++i) {
       root_node_replicas[i].store(const_cast<BaseNode *>(root_p));
     }
-    root_help_update = new HelpUpdate<BaseNode>(
+    root_help_update = new (cacheable.malloc(sizeof(HelpUpdate<BaseNode>))) HelpUpdate<BaseNode>(
         global_root_node_p, root_node_replicas, thread_num);
   }
 
@@ -9030,7 +9031,7 @@ class BwTree : public BwTreeBase {
   // frequently-read root pointer and are updated with the same cooperative
   // protocol used by CLevelHash's replicated meta pointer.
   nt_pointer<BaseNode> global_root_node_p{nullptr};
-  std::vector<nt_pointer<BaseNode>> root_node_replicas;
+  cxl_vector<nt_pointer<BaseNode>> root_node_replicas;
   HelpUpdate<BaseNode> *root_help_update{nullptr};
 #endif
 

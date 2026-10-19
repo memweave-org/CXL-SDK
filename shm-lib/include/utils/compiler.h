@@ -1191,3 +1191,13 @@ struct uninitialized_type {};
 
 #endif
 #endif
+
+#if defined(__aarch64__) && !defined(SHM_ARM_COMPILER_FENCES_H)
+#define SHM_ARM_COMPILER_FENCES_H
+#include <atomic>
+inline void fence() { std::atomic_signal_fence(std::memory_order_seq_cst); }
+inline void acquire_fence() { std::atomic_thread_fence(std::memory_order_acquire); }
+inline void release_fence() { std::atomic_thread_fence(std::memory_order_release); }
+inline void memory_fence() { std::atomic_thread_fence(std::memory_order_seq_cst); }
+inline void relax_fence() { asm volatile("yield" ::: "memory"); }
+#endif

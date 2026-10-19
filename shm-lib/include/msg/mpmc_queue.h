@@ -90,7 +90,7 @@ class MPMCQueue {
 #endif
     size_t current_head = head.fetch_add(1);
     auto& slot = buffer[idx(current_head)];
-#ifdef USE_MWAIT
+#if defined(USE_MWAIT) && defined(__x86_64__) && defined(__WAITPKG__)
     while (turn(current_head) * 2 + 1 !=
            slot.turn.load(std::memory_order_acquire)) {
       _umonitor(&slot.turn);

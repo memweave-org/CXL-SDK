@@ -1,6 +1,6 @@
 #ifndef MSG_QUEUE_HH
 #define MSG_QUEUE_HH
-#if defined(__i386__) || defined(__x86_64__) || defined(_M_IX86) || defined(_M_X64)
+#if defined(__i386__) || defined(__x86_64__) || defined(_M_IX86) || defined(_M_X64) || defined(__aarch64__)
 #include <unistd.h>
 
 #include <cstddef>

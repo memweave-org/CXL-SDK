@@ -1,3 +1,5 @@
+// Legacy message-queue arena; matches the architecture guard in mempool.cc.
+#if defined(__i386__) || defined(__x86_64__) || defined(_M_IX86) || defined(_M_X64) || defined(__aarch64__)
 #include "shm/memkind.h"
 
 #include <fcntl.h>
@@ -49,3 +51,5 @@ static char shm_path[PATH_MAX] = "/dev/shm/cxl";
 //   std::cout << "initialize uncache memory finished" << std::endl;
 // #endif
 // }
+
+#endif

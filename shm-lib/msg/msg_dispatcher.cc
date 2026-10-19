@@ -1,5 +1,5 @@
 #include "msg/msg_dispatcher.h"
-#if defined(__i386__) || defined(__x86_64__) || defined(_M_IX86) || defined(_M_X64)
+#if defined(__i386__) || defined(__x86_64__) || defined(_M_IX86) || defined(_M_X64) || defined(__aarch64__)
 #include <cstdlib>
 
 MsgDispatcher* g_dispatcher[MSG_TYPE_NUM][NUM_CLIENTS];

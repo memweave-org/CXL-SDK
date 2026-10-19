@@ -2,6 +2,8 @@
 #define BYPASS_CACHE_HH
 
 #include <cassert>
+#include <cstdint>
+#include <cstring>
 #include <utility>
 
 #include <iostream>
@@ -209,6 +211,19 @@ static inline void memcpy_nt_read(char* dst, const char* src, size_t size) {
   for (; i + 16 <= size; i += 16) {
     READ_NT_128((__m128i*)(src + i), *(__m128i*)(dst + i));
   }
+}
+#elif defined(__aarch64__)
+// ARM has no direct equivalent of x86 streaming copies. Use the existing
+// cache-maintenance policy, then order completion before publishing pointers.
+static inline void memcpy_nt_write(char* dst, const char* src, size_t size) {
+  std::memcpy(dst, src, size);
+  clwb(dst, size);
+  mfence();
+}
+static inline void memcpy_nt_read(char* dst, const char* src, size_t size) {
+  clflush(src, size);
+  std::memcpy(dst, src, size);
+  mfence();
 }
 #endif
 

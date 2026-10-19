@@ -1,6 +1,6 @@
 #ifndef MSG_DISPATCHER_H
 #define MSG_DISPATCHER_H
-#if defined(__i386__) || defined(__x86_64__) || defined(_M_IX86) || defined(_M_X64)
+#if defined(__i386__) || defined(__x86_64__) || defined(_M_IX86) || defined(_M_X64) || defined(__aarch64__)
 #include <pthread.h>
 
 #include <functional>

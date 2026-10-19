@@ -57,7 +57,7 @@ class DB {
   template <typename Func, typename... Args>
   int SyncExecute(Func func, Args &&...args) {
 #ifdef USE_MSG_QUEUE
-    int finish = false;
+    std::atomic<int> finish{false};
     int result = 0;
     auto task = [this, &finish, &result, func, &args...]() {
       result = func(std::forward<Args>(args)...);
@@ -77,23 +77,19 @@ class DB {
 
   template <typename Func, typename... Args>
   int AsyncExecute(Func func, std::atomic<int> &finish, int &result, Args &&...args) {
-    auto tmp_result = (std::remove_reference_t<decltype(result)>*)cacheable.malloc(sizeof(std::remove_reference_t<decltype(result)>));
-
-    auto task = [tmp_result, &finish, func, args...]() mutable {
+    // Caller keeps result/finish alive until it observes completion with acquire.
+    auto task = [&result, &finish, func, args...]() mutable {
     #ifdef MSG_FUNC_TIMING
       TimerAverage timer("msg_timing_func");
       timer.Start();
     #endif
-      *tmp_result = func(std::forward<Args>(args)...);
+      result = func(args...);
     #ifdef MSG_FUNC_TIMING
       timer.Stop();
     #endif
       finish.store(1, std::memory_order_release);
     };
-    result = *tmp_result;
-    cacheable.free(tmp_result);
-    // simulate 8 machine
-    pool->enqueue(SimThreadInfo::dispatcher_thread_id % (SimThreadInfo::worker_thread_count / 8), task);
+    pool->enqueue(SimThreadInfo::dispatcher_thread_id, task);
     return DB::kOK;
   }
 
@@ -126,8 +122,8 @@ class DB {
   virtual int AsyncRead(uint64_t key, uintptr_t &value, std::atomic<int> &finish,
                         int &result) {
     return AsyncExecute(
-        [this](uint64_t k, uintptr_t &v) { return ReadInternal(k, v); }, finish,
-        result, key, value);
+        [this, &value](uint64_t k) { return ReadInternal(k, value); }, finish,
+        result, key);
   }
 
   virtual int ReadInternal(uint64_t key, uintptr_t &value) {
@@ -274,8 +270,8 @@ class DB {
     return -1;
   }
 
-  void Poll(int *poll_pos) {
-#ifdef USE_MWAIT
+  void Poll(std::atomic<int> *poll_pos) {
+#if defined(USE_MWAIT) && defined(__x86_64__) && defined(__WAITPKG__)
     _umonitor(poll_pos);
     while (*poll_pos != true) {
       _umwait(0, 1);

@@ -199,7 +199,7 @@ private:
       finish_flag[pos].store(0, std::memory_order_relaxed);
       oks += client.DoTransaction(ops[i], finish_flag[pos], result[last_pos],
                                   read_value[last_pos]);
-      #ifdef USE_MWAIT
+      #if defined(USE_MWAIT) && defined(__x86_64__) && defined(__WAITPKG__)
       _umonitor(&finish_flag[pos]);
       while (finish_flag[pos].load(std::memory_order_acquire) == 0) {
         _umwait(0, 1);

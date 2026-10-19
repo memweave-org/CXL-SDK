@@ -1,6 +1,6 @@
 #ifndef MEMPOOL_HH
 #define MEMPOOL_HH
-#if defined(__i386__) || defined(__x86_64__) || defined(_M_IX86) || defined(_M_X64)
+#if defined(__i386__) || defined(__x86_64__) || defined(_M_IX86) || defined(_M_X64) || defined(__aarch64__)
 #include "memkind.h"
 #include "msg/msg_dispatcher.h"
 // #include "shm/lock/shm_lock_base.h"

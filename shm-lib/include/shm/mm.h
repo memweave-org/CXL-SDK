@@ -31,8 +31,12 @@ public:
   virtual ~SystemMemoryMmapper();
 };
 
+void *map_ub_memory(const char *name, void *base, size_t size);
+void unmap_ub_memory(void *base, size_t size);
+
 class CXLSystemMemoryMmapper : public SystemMemoryMmapper {
 public:
+  CXLSystemMemoryMmapper() = default;
   CXLSystemMemoryMmapper(const char *path, int num_machines, int machine_no);
   void *per_machine_base;
   size_t per_machine_size;
@@ -81,12 +85,19 @@ public:
   int clalign(void **memptr, size_t size);
   void free(void *ptr);
 
+  void require_shared_allocations(bool retain_until_exit = false) {
+    strict_shared_ = true;
+    retain_shared_ = retain_until_exit;
+  }
+
   bool is_cxlalloc_backend() const {
     return backend_ == CacheableAllocatorBackend::Cxlalloc;
   }
 
   memkind_t memkind_pool;
 private:
+  bool strict_shared_ = false;
+  bool retain_shared_ = false;
   bool owns_memkind_pointer(const void *ptr) const;
 
   CacheableAllocatorBackend backend_;

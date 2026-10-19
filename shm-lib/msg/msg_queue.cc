@@ -1,9 +1,6 @@
-#if defined(__i386__) || defined(__x86_64__) || defined(_M_IX86) || defined(_M_X64)
+#if defined(__i386__) || defined(__x86_64__) || defined(_M_IX86) || defined(_M_X64) || defined(__aarch64__)
 #include "msg/msg_queue.h"
-#include <emmintrin.h>
-#include <immintrin.h>
 #include <unistd.h>
-#include <xmmintrin.h>
 
 #include <atomic>
 #include <cstring>
@@ -57,7 +54,7 @@ int MsgQueue::enqueue_msg(msg_node_t* node_to_enqueue) {
 
     // Set tail pointer to the start of the queue if it reaches the end
     adjust_tail(&tmp_tail);
-    _mm_sfence();
+    mfence();
     queue->tail = tmp_tail;
     return 0;
 }
@@ -91,7 +88,7 @@ msg_node_t* MsgQueue::dequeue_msg(int blocking) {
     } 
     // Set head pointer to the start of the queue if it reaches the end
     adjust_head(&tmp_head);
-    _mm_mfence();
+    mfence();
     queue->head = tmp_head;
     return result;
 }

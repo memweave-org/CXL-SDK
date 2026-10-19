@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstring>
 #include <vector>
+#include "shm/mm.h"
 
 #include "utils/bypass_cache.h"
 #include "utils/sim_id.h"
@@ -186,7 +187,12 @@ class nt_pointer<T[]> {
 
   template <typename... Args> void allocate(size_t size, Args &&...args) {
     this->size = size;
-    ptr = (T*)malloc(sizeof(T) * size);
+    #ifdef USE_CXL
+    ptr = static_cast<T*>(cacheable.malloc(sizeof(T) * size));
+#else
+    ptr = static_cast<T*>(malloc(sizeof(T) * size));
+#endif
+    if (!ptr) throw std::bad_alloc();
     for (size_t i = 0; i < size; i++) {
       if constexpr (is_nt_pointer<T>::value) {
         new (&ptr[i]) T();
@@ -198,7 +204,7 @@ class nt_pointer<T[]> {
     }
   }
 
-  void flush_elements(size_t size) { clwb((void *)&ptr, sizeof(T) * size); }
+  void flush_elements(size_t size) { clwb((void *)ptr, sizeof(T) * size); }
 
   T *load(std::memory_order __m = std::memory_order_seq_cst,
 #if defined(NO_CC) || defined(USE_NO_CC_QUEUE)
@@ -252,7 +258,11 @@ class nt_pointer<T[]> {
       ptr[i].~T(); // 显式调用析构函数
     }
     if (size != 0) {
-      ::free(ptr); // 释放内存
+#ifdef USE_CXL
+      cacheable.free(ptr);
+#else
+      ::free(ptr);
+#endif
     }
     store(nullptr);
     size = 0;

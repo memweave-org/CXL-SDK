@@ -138,7 +138,7 @@ void CLevelHashDB::PoolThreadClose(int thread_id) {
 [[deprecated("Use ReadInternal instead.")]]
 int CLevelHashDB::Read(uint64_t key, uint64_t &value) {
 #ifdef USE_MSG_QUEUE
-  int finish = false;
+  std::atomic<int> finish{false};
   auto task = [this, key, &value, &finish]() {
     int ret = this->ReadInternal(key, value);
 #ifdef RETURN_SYNC
@@ -148,7 +148,7 @@ int CLevelHashDB::Read(uint64_t key, uint64_t &value) {
   };
 #ifdef RETURN_SYNC
   pool->enqueue(utils::RandomValueNum(), task);
-#ifdef USE_MWAIT
+#if defined(USE_MWAIT) && defined(__x86_64__) && defined(__WAITPKG__)
   _umonitor(&finish);
   while (finish != true) {
     _umwait(0, 1);
@@ -169,7 +169,7 @@ int CLevelHashDB::Read(uint64_t key, uint64_t &value) {
 [[deprecated("Use UpdateInternal instead.")]]
 int CLevelHashDB::Update(uint64_t key, uint64_t value) {
 #ifdef USE_MSG_QUEUE
-  int finish = false;
+  std::atomic<int> finish{false};
   auto task = [this, key, value, &finish]() {
     int ret = this->UpdateInternal(key, value);
 #ifdef RETURN_SYNC
@@ -179,7 +179,7 @@ int CLevelHashDB::Update(uint64_t key, uint64_t value) {
   };
 #ifdef RETURN_SYNC
   pool->enqueue(utils::RandomValueNum(), task);
-#ifdef USE_MWAIT
+#if defined(USE_MWAIT) && defined(__x86_64__) && defined(__WAITPKG__)
   _umonitor(&finish);
   while (finish != true) {
     _umwait(0, 1);
@@ -200,7 +200,7 @@ int CLevelHashDB::Update(uint64_t key, uint64_t value) {
 [[deprecated("Use InsertInternal instead.")]]
 int CLevelHashDB::Insert(uint64_t key, uint64_t value) {
 #ifdef USE_MSG_QUEUE
-  int finish = false;
+  std::atomic<int> finish{false};
   auto task = [this, key, value, &finish]() {
     int ret = this->InsertInternal(key, value);
 #ifdef RETURN_SYNC
@@ -210,7 +210,7 @@ int CLevelHashDB::Insert(uint64_t key, uint64_t value) {
   };
 #ifdef RETURN_SYNC
   pool->enqueue(utils::RandomValueNum(), task);
-#ifdef USE_MWAIT
+#if defined(USE_MWAIT) && defined(__x86_64__) && defined(__WAITPKG__)
   _umonitor(&finish);
   while (finish != true) {
     _umwait(0, 1);
@@ -231,7 +231,7 @@ int CLevelHashDB::Insert(uint64_t key, uint64_t value) {
 [[deprecated("Use DeleteInternal instead.")]]
 int CLevelHashDB::Delete(uint64_t key) {
 #ifdef USE_MSG_QUEUE
-  int finish = false;
+  std::atomic<int> finish{false};
   auto task = [this, key, &finish]() {
     int ret = this->DeleteInternal(key);
 #ifdef RETURN_SYNC
@@ -241,7 +241,7 @@ int CLevelHashDB::Delete(uint64_t key) {
   };
 #ifdef RETURN_SYNC
   pool->enqueue(utils::RandomValueNum(), task);
-#ifdef USE_MWAIT
+#if defined(USE_MWAIT) && defined(__x86_64__) && defined(__WAITPKG__)
   _umonitor(&finish);
   while (finish != true) {
     _umwait(0, 1);

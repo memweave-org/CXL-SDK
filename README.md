@@ -92,3 +92,5 @@ runtime APIs. Build and test instructions also live beside each component.
 See [CONTRIBUTING.md](CONTRIBUTING.md) for development steps. Original CXL-SDK
 work is offered under the [MIT License](LICENSE); bundled components retain
 their own licenses and copyright notices in their respective directories.
+
+Two-process YCSB-B on x86-64/AArch64: [runner and workload matrix](tests/two-process-ycsb/README.md), [platform validation](tests/platform/README.md). Deft is excluded because UB does not support its required 128-bit CAS.

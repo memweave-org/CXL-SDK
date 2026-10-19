@@ -141,7 +141,7 @@ CXLSystemMemoryMmapper::CXLSystemMemoryMmapper(const char *path, int num_machine
 void CXLSystemMemoryMmapper::allocate(void *base, size_t size) {
   this->mmap_size = size;
   this->mmap_base = mmap(base, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-  if (this->mmap_base == MAP_FAILED) {
+  if (this->mmap_base == MAP_FAILED || (base && this->mmap_base != base)) {
     throw std::runtime_error("Failed to mmap.");
   }
   per_machine_size = size / num_machines;
@@ -175,16 +175,8 @@ MemoryManager::MemoryManager(SystemMemoryMmapper *allocator, void *b, size_t s)
   std::cout << "[MemoryManager] Creating memkind pool: base=" << base 
             << ", size=" << size << ", requested_base=" << b << std::endl;
   
-  // memkind_create_fixed requires the actual mmap base address, not the requested one
-  // If mmap failed to use MAP_FIXED, we need to use the actual mmap address
-  void* actual_base = allocator->get_mmap_base();
-  if (actual_base != base && actual_base != nullptr) {
-    std::cout << "[MemoryManager] WARNING: mmap base (" << actual_base 
-              << ") differs from requested base (" << b << ")" << std::endl;
-    std::cout << "[MemoryManager] Using actual mmap base for memkind pool" << std::endl;
-    base = actual_base;
-  }
-  
+  // get_mempool_base()/size() describe this process's allocation slice;
+  // get_mmap_base() describes the whole region and must not replace that slice.
   if (memkind_create_fixed(base, size, &memkind_pool) != 0) {
     std::cerr << "[MemoryManager] ERROR: Failed to create memkind pool. base=" 
               << base << ", size=" << size << std::endl;
@@ -201,6 +193,8 @@ MemoryManager::MemoryManager(MemoryManager &&other) noexcept
       base(other.base),
       size(other.size),
       allocator(other.allocator) {
+  strict_shared_ = other.strict_shared_;
+  retain_shared_ = other.retain_shared_;
   other.base = nullptr;
   other.size = 0;
   other.memkind_pool = nullptr;
@@ -219,6 +213,8 @@ MemoryManager &MemoryManager::operator=(MemoryManager &&other) noexcept {
     delete allocator;
   }
 
+  strict_shared_ = other.strict_shared_;
+  retain_shared_ = other.retain_shared_;
   base = other.base;
   size = other.size;
   memkind_pool = other.memkind_pool;
@@ -270,12 +266,14 @@ void *MemoryManager::malloc(size_t size) {
 #ifdef USE_CXL
   if (memkind_pool == nullptr) {
     std::cerr << "[MemoryManager::malloc] ERROR: memkind_pool is nullptr!" << std::endl;
+    if (strict_shared_) throw std::bad_alloc();
     return ::malloc(size); // Fallback to heap
   }
   void* ptr = memkind_malloc(memkind_pool, size);
   if (ptr == nullptr) {
     std::cerr << "[MemoryManager::malloc] ERROR: memkind_malloc returned nullptr; "
               << "falling back to heap for " << size << " bytes" << std::endl;
+    if (strict_shared_) throw std::bad_alloc();
     return ::malloc(size); // Fallback to heap
   }
   // Debug: Check if allocated address is in expected range
@@ -332,6 +330,7 @@ int MemoryManager::posix_memalign(void **memptr, size_t alignment,
     std::cerr << "[MemoryManager::posix_memalign] ERROR: memkind_pool is nullptr; "
               << "falling back to heap for " << size << " bytes" << std::endl;
   }
+  if (strict_shared_) return ENOMEM;
   return ::posix_memalign(memptr, alignment, size);
 #else
   return ::posix_memalign(memptr, alignment, size);
@@ -367,6 +366,7 @@ int MemoryManager::clalign(void **memptr, size_t size) {
     std::cerr << "[MemoryManager::clalign] ERROR: memkind_pool is nullptr; "
               << "falling back to heap for " << size << " bytes" << std::endl;
   }
+  if (strict_shared_) return ENOMEM;
   return ::posix_memalign(memptr, CACHE_LINE_SIZE, size);
 #else
   return ::posix_memalign(memptr, CACHE_LINE_SIZE, size);
@@ -374,6 +374,8 @@ int MemoryManager::clalign(void **memptr, size_t size) {
 }
 
 void MemoryManager::free(void *ptr) {
+  // Explicit benchmark lifetime policy: no cross-process allocator frees.
+  if (retain_shared_) return;
   if (ptr == nullptr) {
     return;
   }

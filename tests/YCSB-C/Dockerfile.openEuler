@@ -1,11 +1,17 @@
-FROM openeuler/openeuler:24.03
+FROM openeuler/openeuler:24.03 AS dependencies
 
 # Install development tools and dependencies using dnf (openEuler package manager)
 RUN dnf update -y && \
     dnf install -y --setopt=install_weak_deps=False \
-      gcc \
-      gcc-c++ \
+      gcc-12.3.1 \
+      gcc-c++-12.3.1 \
       make \
+      bison \
+      gawk \
+      python3 \
+      xz \
+      diffutils \
+      texinfo \
       cmake \
       git \
       pkgconfig \
@@ -32,6 +38,38 @@ RUN dnf update -y && \
       libstdc++-devel && \
     dnf clean all
 
+# Build in a separate stage: copying the installed tree avoids replacing libc
+# underneath the package manager or an executing make install process.
+FROM dependencies AS glibc-builder
+ARG BUILD_JOBS=8
+RUN curl --fail --location --retry 3 \
+      https://ftp.gnu.org/gnu/glibc/glibc-2.39.tar.xz -o /tmp/glibc.tar.xz && \
+    mkdir /tmp/glibc-src /tmp/glibc-build && \
+    tar -xJf /tmp/glibc.tar.xz -C /tmp/glibc-src --strip-components=1 && \
+    cd /tmp/glibc-build && \
+    /tmp/glibc-src/configure --prefix=/usr --libdir=/usr/lib64 \
+      --disable-werror --enable-kernel=4.19 \
+      libc_cv_slibdir=/usr/lib64 libc_cv_rtlddir=/usr/lib64 && \
+    make -j"${BUILD_JOBS}" && \
+    make install DESTDIR=/glibc-root
+
+# ARM executables in openEuler request /lib/ld-linux-aarch64.so.1, while
+# libraries live under /usr/lib64. Replace that loader along with libc.
+RUN if [ -f /glibc-root/usr/lib64/ld-linux-aarch64.so.1 ]; then \
+      mkdir -p /glibc-root/usr/lib && \
+      cp /glibc-root/usr/lib64/ld-linux-aarch64.so.1 /glibc-root/usr/lib/; \
+    fi
+
+FROM dependencies
+COPY --from=glibc-builder /glibc-root/usr/ /usr/
+# openEuler uses /sbin -> /usr/sbin; do not overwrite that symlink.
+COPY --from=glibc-builder /glibc-root/sbin/ /usr/sbin/
+COPY --from=glibc-builder /glibc-root/etc/ /etc/
+RUN ldconfig && \
+    test "$(getconf GNU_LIBC_VERSION)" = "glibc 2.39" && \
+    test "$(gcc -dumpfullversion)" = "12.3.1" && \
+    test "$(g++ -dumpfullversion)" = "12.3.1"
+
 # Set up openEuler specific configurations
 RUN echo "LANG=en_US.UTF-8" >> /etc/environment && \
     echo "LC_ALL=en_US.UTF-8" >> /etc/environment
@@ -44,7 +82,8 @@ RUN echo "Installing cityhash from source..."; \
     cd /tmp && \
     git clone https://github.com/google/cityhash.git && \
     cd cityhash && \
-    ./configure --prefix=/usr --build=x86_64-unknown-linux-gnu && \
+    autoreconf -fi && \
+    ./configure --prefix=/usr --build="$(gcc -dumpmachine)" && \
     make -j"$(nproc)" && \
     make install && \
     ldconfig && \
@@ -79,9 +118,16 @@ RUN if [ "$MEMKIND_FROM_SOURCE" = "1" ]; then \
       cd / && rm -rf /tmp/memkind; \
     else \
       echo "Installing memkind from openEuler repository"; \
-      dnf install -y memkind-devel || echo "memkind-devel not available in repository, will build from source if needed"; \
+      dnf install -y memkind-devel; \
     fi
 
+# Verify the runtime actually loaded by new C/C++ executables, not just RPM metadata.
+RUN printf '#include <gnu/libc-version.h>\n#include <string.h>\nint main(void) { return strcmp(gnu_get_libc_version(), "2.39") != 0; }\n' > /tmp/libc-check.c && \
+    gcc /tmp/libc-check.c -o /tmp/libc-check && /tmp/libc-check && \
+    g++ -x c++ /tmp/libc-check.c -o /tmp/libc-check-cxx && /tmp/libc-check-cxx && \
+    test "$(gcc -dumpfullversion)" = "12.3.1" && \
+    test "$(g++ -dumpfullversion)" = "12.3.1" && \
+    test "$(getconf GNU_LIBC_VERSION)" = "glibc 2.39" && \
+    rm /tmp/libc-check.c /tmp/libc-check /tmp/libc-check-cxx
+
 CMD ["bash"]
-
-

@@ -19,6 +19,40 @@ sudo apt-get install -y \
 
 ## Build
 
+### UB Docker toolchain
+
+`Dockerfile.openEuler` uses openEuler GCC/G++ 12.3.1 and builds glibc 2.39
+in a separate stage before copying it into the image. Build-time C/C++ checks
+verify the loaded libc version. This changes only the container, not the host.
+The installed glibc comes from source; the base image's RPM database still
+records its distribution glibc. Do not upgrade glibc inside this image with dnf;
+rebuild the Dockerfile and retain its version checks instead.
+
+From any directory, invoke the script by its path (example from repository root):
+
+```bash
+bash tests/YCSB-C/docker_run_build.sh -b -r cc nocc
+# Open an interactive shell in the same environment:
+bash tests/YCSB-C/docker_run_build.sh -r
+```
+
+Default image: `shm-pcc-sdk:ub-glibc2.39-gcc12.3.1`. The script checks versions
+even when reusing an existing image or specifying `-i`. It builds for the Docker
+host architecture by default; build natively on the ARM UB machine for ARM
+binaries. Cross-platform builds require Docker emulation support, for example
+with `DOCKER_DEFAULT_PLATFORM=linux/arm64`. Both architectures share the same
+local tag, so rebuild with `-b` when changing target architecture.
+
+```bash
+docker run --rm shm-pcc-sdk:ub-glibc2.39-gcc12.3.1 getconf GNU_LIBC_VERSION
+docker run --rm shm-pcc-sdk:ub-glibc2.39-gcc12.3.1 gcc -dumpfullversion
+```
+
+This is a compilation environment. Vendor Memlink/UBSM SDK libraries and UB
+runtime devices/services must still be supplied separately for hardware runs.
+
+### Native build
+
 Build one or more variants. The final variant becomes the `./ycsbc` symlink.
 
 ```bash

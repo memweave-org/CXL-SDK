@@ -35,9 +35,25 @@ python3 tests/two-process-ycsb/run.py --threads 1 2 \
   --output build/platform-ycsb-smoke
 ```
 
-已在 x86-64 本机以及 arm-0 的 `shm-pcc-sdk:ub-glibc2.39-gcc12.3.1`
-容器中原生运行通过：Deft、Sherman、RPC、BwTree/ClevelHash OPT OFF/ON 和 CC，
-此前共九种配置。当前默认矩阵已移除 Deft，仅保留八种配置，且禁止 128 位 CAS。ARM GCC 12.3.1、glibc 2.39。测试使用普通文件的共享映射。
+2026-10-19 对代码提交 `0aef814a` 进行了 Intel / ARM 原生验证：
+
+| 配置 | Intel Xeon Gold 6418H | arm-0 Docker |
+| --- | --- | --- |
+| Sherman | PASS | PASS |
+| RPC（BwTree） | PASS | PASS |
+| BwTree OPT OFF / ON / CC | 3/3 PASS | 3/3 PASS |
+| ClevelHash OPT OFF / ON / CC | 3/3 PASS | 3/3 PASS |
+
+两边均使用上面的参数：1000 条初始数据，两个独立进程，线程数分别为 1、2；
+直访模式每进程完成 2000 次操作，RPC 客户端完成 2000 次操作。所有配置错误数为零，
+并通过对方写入数据的校验。Deft 不在矩阵中，测试目标禁止 128 位 CAS。
+Intel 的八个测试二进制均未包含 `cmpxchg16b` 指令。
+ARM 在原仓库 `/home/wfn/shm-pcc-sdk` 执行 `git pull --ff-only origin master` 后，
+使用 `shm-pcc-sdk:ub-glibc2.39-gcc12.3.1` 原生编译运行（GCC 12.3.1、glibc 2.39）。
+Intel 结果位于构建目录 `build/no-deft-intel/results.json`；
+arm-0 结果位于 `build/no-deft-arm-post-pull/results.json`。
+测试均使用普通文件的共享映射。
+
 旧 YCSB 入口的 RPC 完成标志也改为原子变量，避免轮询数据竞争导致提前返回和悬空引用；
 异步结果改为完成后发布，修复排队前释放结果缓冲区的问题，并取消少于八个 worker 时可能除零的队列编号公式。
 旧入口的 BwTree/ClevelHash RPC 模式在 ARM 与 x86 上均完成 1000 条加载、2000 次操作。

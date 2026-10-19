@@ -24,6 +24,20 @@ python3 tests/two-process-ycsb/run.py \
 - 输出目录必须是新目录。保留每个进程的日志、PID、完成数、错误数、验证数、耗时、二进制 SHA256 和退出码；任一进程失败、超时、结果缺失或验证失败都会使脚本失败。
 - 本地共享文件由脚本独占创建，结束后只删除本次创建的文件。不会清零或删除用户提供的整块 CXL/UB 区域；运行时会初始化并覆盖该区域中的控制信息和数据，所以目标区域必须专用于本次实验，不可同时运行另一组测试。
 
+## ARM Docker 中运行
+
+在 arm-0 的仓库根目录执行（镜像已预先构建或导入）：
+
+```sh
+docker run --rm --user "$(id -u):$(id -g)" \
+  -v "$PWD:/src" -w /src shm-pcc-sdk:ub-glibc2.39-gcc12.3.1 \
+  python3 tests/two-process-ycsb/run.py --threads 1 2 \
+  --records 1000 --ops 2000 --size-mb 1024 --mapping-bits 16 \
+  --output build/ycsb-arm-check
+```
+
+首次运行会编译八种配置；每次选择新的输出目录。该命令使用同机共享文件，验证 ARM 上的两个进程。
+
 ## 两台机器
 
 在两个同架构、兼容 CPU/依赖环境的主机上，准备同路径的仓库、相同二进制、相同 workload 文件。
@@ -120,7 +134,7 @@ python3 tests/two-process-ycsb/scale.py \
   --output build/two-ycsb-scaling
 ```
 
-默认只编译和运行 9 个组合：Sherman、RPC（BwTree），以及
+默认只编译和运行 8 个组合：Sherman、RPC（BwTree），以及
 BwTree / ClevelHash 各自的 OPT、NOOPT、CC。`on` 对应 OPT，`off` 对应
 NOOPT；`bwtree-cc`、`clevelhash-cc` 使用硬件一致性，不定义 NO_CC、
 QUEUE_SIM_CAS 或 OPT 宏。每个组合独立构建，后续线程数/重复次数复用二进制。

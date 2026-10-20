@@ -33,7 +33,11 @@ static inline void mfence() {
 #ifdef __x86_64__
     asm volatile("mfence" ::: "memory");
 #elif defined(__aarch64__)
+    #ifdef SHM_LIB_WITH_UBSM
+    asm volatile("dmb sy" ::: "memory");
+#else
     asm volatile("dmb ish" ::: "memory");
+#endif
 #endif
 }
 
@@ -41,7 +45,10 @@ static inline void mfence() {
 #ifdef __x86_64__
 // x86_64 implementations
 static inline void clflush(const void* data, size_t len, bool fence = true) {
-#ifdef NO_CLFLUSH
+#if defined(SHM_LIB_WITH_UBSM)
+    if (fence) mfence();
+    return;
+#elif defined(NO_CLFLUSH)
     return;
 #else
     volatile char* ptr = (char*)((unsigned long)data & (~(CACHE_LINE_SIZE - 1)));
@@ -58,7 +65,10 @@ static inline void clflush(const void* data, size_t len, bool fence = true) {
 }
 
 static inline void clwb(const void* data, size_t len, bool fence = true) {
-#ifdef NO_CLFLUSH
+#if defined(SHM_LIB_WITH_UBSM)
+    if (fence) mfence();
+    return;
+#elif defined(NO_CLFLUSH)
   return;
 #else
   volatile char* ptr = (char*)((unsigned long)data & (~(CACHE_LINE_SIZE - 1)));
@@ -79,7 +89,10 @@ static inline void clwb(const void* data, size_t len, bool fence = true) {
 #elif defined(__aarch64__)
 // ARM64 implementations
 static inline void clflush(const void* data, size_t len, bool fence = true) {
-#ifdef NO_CLFLUSH
+#if defined(SHM_LIB_WITH_UBSM)
+    if (fence) mfence();
+    return;
+#elif defined(NO_CLFLUSH)
   return;
 #else
     volatile char* ptr = (char*)((unsigned long)data & (~(CACHE_LINE_SIZE - 1)));
@@ -93,7 +106,10 @@ static inline void clflush(const void* data, size_t len, bool fence = true) {
 }
 
 static inline void clwb(const void* data, size_t len, bool fence = true) {
-#ifdef NO_CLFLUSH
+#if defined(SHM_LIB_WITH_UBSM)
+    if (fence) mfence();
+    return;
+#elif defined(NO_CLFLUSH)
   return;
 #else
     volatile char* ptr = (char*)((unsigned long)data & (~(CACHE_LINE_SIZE - 1)));
@@ -108,7 +124,38 @@ static inline void clwb(const void* data, size_t len, bool fence = true) {
 #endif
 
 // Non-temporal memory operations
+#ifdef SHM_LIB_WITH_UBSM
+static inline void memcpy_nt_write(char* dst, const char* src, size_t size) {
+  auto* out = reinterpret_cast<volatile char*>(dst);
+  auto* in = reinterpret_cast<const volatile char*>(src);
+  for (size_t i=0; i<size; ++i) out[i]=in[i];
+  mfence();
+}
+static inline void memcpy_nt_read(char* dst, const char* src, size_t size) {
+  memcpy_nt_write(dst, src, size);
+}
+template<class T> static inline uint32_t READ_NT_32(T* p) {
+  static_assert(sizeof(T)==4); return __atomic_load_n(p, __ATOMIC_SEQ_CST);
+}
+template<class T> static inline uint64_t READ_NT_64(T* p) {
+  static_assert(sizeof(T)==8); return __atomic_load_n(p, __ATOMIC_SEQ_CST);
+}
+template<class T, class D> static inline void WRITE_NT_32(T* p, D&& v) {
+  static_assert(sizeof(T)==4); __atomic_store_n(p, v, __ATOMIC_SEQ_CST);
+}
+template<class T, class D> static inline void WRITE_NT_64(T* p, D&& v) {
+  static_assert(sizeof(T)==8); __atomic_store_n(p, v, __ATOMIC_SEQ_CST);
+}
 #ifdef __x86_64__
+// Copy only: these legacy helpers never promise 128-bit atomicity.
+template<class T> static inline void READ_NT_128(T* p, __m128i& v) {
+  memcpy_nt_read(reinterpret_cast<char*>(&v), reinterpret_cast<const char*>(p), 16);
+}
+template<class T> static inline void WRITE_NT_128(__m128i* p, T&& v) {
+  memcpy_nt_write(reinterpret_cast<char*>(p), reinterpret_cast<const char*>(&v), 16);
+}
+#endif
+#elif defined(__x86_64__)
 // TODO: every memory ordering need to be further examined if no cache coherence
 // Can be substituted with memcpy or direct load/store if cache coherent
 

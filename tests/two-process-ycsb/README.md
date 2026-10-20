@@ -54,41 +54,13 @@ python3 tests/two-process-ycsb/run.py \
 当前支持两端使用同一设备路径字符串；本地执行端是进程 0，SSH 端是进程 1。
 脚本不自动配置 CXL 交换机、UB 网络或复制设备数据。远端命令带独立超时，避免本地控制端断开后无限运行。
 
-## UB / Memlink
+## UB：全局切换 Memlink / 最新 UBSM
 
-用户提供的 `ubs-mem-two-node.zip` 使用另一套 **UBS Memory (`ubsmem_*`)** API。
-当前 `--memory ub` 仅表示下面的 Memlink 后端，不能直接链接 `libubsm_sdk.so`。
-双机分配流程、接入缺口和附件通路验证命令见 [UBSM 接入分析](UBSM.md)。
-
-检查时 GitHub `origin` HEAD 与本地 HEAD 均为 `72757a92ca3847e11bf10abd5cd1c961b7e01034`。
-仓库原已有 `shm-lib/shm/matrix_wrapper.cc`、Memlink 头文件和
-`tests/YCSB-C/init_ub_env.sh`，但原 YCSB 初始化只接受 `mem_type=local/cxl`，
-原 CMake 没有 UB 选项，也没有链接 Memlink。当时 Sherman 移植代码另存在于本地工作树中，本次已纳入仓库。
-
-新增运行入口使用：
-
-```sh
-python3 tests/two-process-ycsb/run.py \
-  --host user@host2 --memory ub --shared-path pcc-shm-250 \
-  --ub-library /absolute/path/to/vendor/libmemlink.so \
-  --threads 24 24 --records 1000000 --ops 1000000 \
-  --size-mb 65536 --output build/ycsb-ub
-```
-
-`--memory ub` 自动设置 `-DWITH_UB=ON`，必须同时提供真实的厂商库路径。
-两端需事先通过厂商工具创建/导入同名、同一物理 backing 的共享对象，并配置好访问权限。
-仓库原有创建命令示例为 `memlink mem_create_shm_test pcc-shm-250 65536 0`；
-远端导入及部署按实际厂商环境配置。这里不会猜测厂商库文件名或静默替换成文件映射。
-
-具体路径是 **MemlinkMemShmMmap → UB 共享映射 → 每进程 memkind 固定分区 → cacheable 分配接口**。
-这保证该入口的共享分配落在 UB 返回的区域，但不是把每次小对象分配改为
-`MemlinkMemMalloc`，也不是启用现有 `cxlalloc` Rust 分配器。
-要求映射精确返回 `0x400000000000`；失败会退出，绝不回退到普通文件或私有内存。
-此开关接入本目录新入口，不会自动改写旧 `tests/YCSB-C/config.ini` 的运行路径。
-
-当前移植版支持 x86-64 和 AArch64；ARM 普通共享映射已通过两进程测试。平台实现与验证范围见 [ARM 支持](../platform/README.md)。ARM 非临时拷贝采用普通拷贝加缓存维护，不能视为与 x86 streaming 指令性能相同。
-因此 **UB 不仅需要 flag，还需要厂商运行库、正确的共享对象、可用硬件及兼容的指令/原子语义**。
-本地验证不证明真实 UB 上的原子性、缓存一致性或性能。
+`SHM_UB_API=none|memlink|ubsm`（CMake 为 `UB_API`）统一选择后端。
+新接口已接入 `ubsmem_*`；完整 Docker 编译、双机启动和对象生命周期见 [UBSM 指南](UBSM.md)。
+`--memory ub --ub-api memlink` 使用旧 Memlink 和用户预先创建的对象；
+`--memory ub --ub-api ubsm` 使用最新 SDK，由 runner 为各 case 创建独占对象。
+不要混用两套 SDK 的头文件或库。未启用后端、SDK 缺失或映射失败均报错，不会回退到文件。
 
 ## 工作负载和结果边界
 

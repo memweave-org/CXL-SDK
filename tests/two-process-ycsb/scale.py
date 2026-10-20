@@ -3,6 +3,7 @@
 import argparse
 import csv
 import json
+import os
 from pathlib import Path
 import statistics
 import subprocess
@@ -29,9 +30,14 @@ def main():
     p.add_argument('--timeout', type=int, default=600)
     p.add_argument('--skip-build', action='store_true')
     p.add_argument('--host', help='second machine via SSH (same paths and binaries)')
-    p.add_argument('--memory', choices=['file', 'cxl', 'ub'], default='file')
+    p.add_argument('--memory', choices=['file', 'cxl', 'ub'], default='ub' if os.getenv('SHM_UB_API', 'none') != 'none' else 'file')
     p.add_argument('--shared-path')
     p.add_argument('--ub-library')
+    p.add_argument('--ub-api', choices=['none','memlink','ubsm'], default=os.getenv('SHM_UB_API'))
+    p.add_argument('--ub-include')
+    p.add_argument('--provider-host', default=os.getenv('UBSM_PROVIDER_HOST'))
+    p.add_argument('--provider-numa', default=os.getenv('UBSM_PROVIDER_NUMA'))
+    p.add_argument('--worker-prefix')
     p.add_argument('--output', type=Path, required=True)
     a = p.parse_args()
     if a.repeats < 1 or any(t < 1 or t > 192 for t in a.threads):
@@ -44,6 +50,7 @@ def main():
         p.error('two hosts require truly shared CXL/UB memory')
     if a.memory != 'file' and not a.shared_path:
         p.error('--shared-path is required for CXL/UB')
+    a.ub_library = a.ub_library or os.getenv('UBSM_LIBRARY' if a.ub_api == 'ubsm' else 'UB_MEMLINK_LIBRARY')
     if a.memory == 'ub' and not a.ub_library:
         p.error('--memory ub requires --ub-library')
     out = a.output.resolve()
@@ -59,7 +66,7 @@ def main():
                    '--output', str(run_out)]
             for key in ('records', 'ops', 'size_mb', 'mapping_bits', 'jobs', 'timeout'):
                 cmd += ['--' + key.replace('_', '-'), str(getattr(a, key))]
-            for key in ('host', 'memory', 'shared_path', 'ub_library'):
+            for key in ('host', 'memory', 'shared_path', 'ub_library', 'ub_api', 'ub_include', 'provider_host', 'provider_numa', 'worker_prefix'):
                 if getattr(a, key):
                     cmd += ['--' + key.replace('_', '-'), str(getattr(a, key))]
             if built:
@@ -68,7 +75,7 @@ def main():
             subprocess.run(cmd, check=True)
             built = True
             for event in json.loads((run_out / 'results.json').read_text()):
-                if event['status'] != 'passed' or event['memlink_test_stub']:
+                if event['status'] != 'passed' or event['memlink_test_stub'] or event.get('ubsm_test_stub', False):
                     raise RuntimeError('Only validated real-process results may be plotted')
                 results = event['results']
                 # RPC counts only client work/time; direct modes use both workers

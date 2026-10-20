@@ -31,8 +31,7 @@ public:
   virtual ~SystemMemoryMmapper();
 };
 
-void *map_ub_memory(const char *name, void *base, size_t size);
-void unmap_ub_memory(void *base, size_t size);
+#include "shm/ub.h"
 
 class CXLSystemMemoryMmapper : public SystemMemoryMmapper {
 public:

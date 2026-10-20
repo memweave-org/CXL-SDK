@@ -63,7 +63,13 @@ struct CopyWriteGuard {
 // use scalar copies; callers must provide non-overlapping ranges. atomic_pairs
 // preserves Deft's 16-byte publication unit while still streaming the output.
 void nt_memcpy(void* dst, const void* src, size_t n, bool atomic_pairs) {
-#ifdef __x86_64__
+#ifdef SHM_LIB_WITH_UBSM
+  if (atomic_pairs) throw std::runtime_error("UBSM does not support 128-bit snapshots");
+  auto* out = static_cast<volatile unsigned char*>(dst);
+  auto* in = static_cast<const volatile unsigned char*>(src);
+  for (size_t i=0; i<n; ++i) out[i]=in[i];
+  shm_platform::full_fence();
+#elif defined(__x86_64__)
   auto* out = static_cast<unsigned char*>(dst);
   auto* in = static_cast<const unsigned char*>(src);
   size_t i = 0;

@@ -9,7 +9,12 @@
 
 namespace cxl_transport::nt_copy {
 inline void stream_copy(void* dst, const void* src, size_t bytes) {
-#ifdef __x86_64__
+#ifdef SHM_LIB_WITH_UBSM
+  auto* out=static_cast<volatile unsigned char*>(dst);
+  auto* in=static_cast<const volatile unsigned char*>(src);
+  for(size_t i=0;i<bytes;++i) out[i]=in[i];
+  shm_platform::full_fence();
+#elif defined(__x86_64__)
   auto* out = static_cast<unsigned char*>(dst);
   const auto* in = static_cast<const unsigned char*>(src);
   size_t i = 0;

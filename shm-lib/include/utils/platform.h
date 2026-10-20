@@ -13,12 +13,12 @@ inline void pause() {
 #error Unsupported CPU architecture
 #endif
 }
-inline void full_fence() { std::atomic_thread_fence(std::memory_order_seq_cst); }
+inline void full_fence() { mfence(); }
 inline void store_fence() {
 #if defined(__x86_64__) || defined(__i386__)
   asm volatile("sfence" ::: "memory");
 #else
-  std::atomic_thread_fence(std::memory_order_seq_cst);
+  mfence();
 #endif
 }
 }

@@ -15,7 +15,13 @@ for variant in "$@"; do
     esac
     build_dir="build_$lower_variant"
     mkdir -p "$build_dir" || { echo "Failed to create directory $build_dir"; exit 1; }
-    cmake -B "$build_dir" -DVARIANT="$lower_variant" -DBUILD_EXTRA_INDEXES=OFF -DCMAKE_EXPORT_COMPILE_COMMANDS=ON || { echo "CMake configuration failed for $variant ($lower_variant)"; exit 1; }
+    # Environment selection overrides a cached API; SDK paths remain explicit.
+    set --
+    [ -z "${SHM_UB_API:-}" ] || set -- "$@" "-DUB_API=$SHM_UB_API" "-DWITH_UB=OFF"
+    [ -z "${UBSM_INCLUDE_DIR:-}" ] || set -- "$@" "-DUBSM_INCLUDE_DIR=$UBSM_INCLUDE_DIR"
+    [ -z "${UBSM_LIBRARY:-}" ] || set -- "$@" "-DUBSM_LIBRARY=$UBSM_LIBRARY"
+    [ -z "${UB_MEMLINK_LIBRARY:-}" ] || set -- "$@" "-DUB_MEMLINK_LIBRARY=$UB_MEMLINK_LIBRARY"
+    cmake -B "$build_dir" "$@" -DVARIANT="$lower_variant" -DBUILD_EXTRA_INDEXES=OFF -DCMAKE_EXPORT_COMPILE_COMMANDS=ON || { echo "CMake configuration failed for $variant ($lower_variant)"; exit 1; }
     cmake --build "$build_dir" --parallel "${JOBS:-8}" || { echo "Make failed for $variant"; exit 1; }
     ln -sf "$build_dir/ycsbc_$lower_variant" ycsbc || { echo "Failed to create symlink for $variant"; exit 1; }
     ln -sf "$build_dir" build || { echo "Failed to create symlink for build_$lower_variant"; exit 1; }

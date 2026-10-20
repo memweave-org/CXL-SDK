@@ -40,3 +40,6 @@ add_executable(bench ${SOURCES})
 target_include_directories(bench PRIVATE ${INDEX_INCLUDE} ../YCSB-C/include)
 target_link_libraries(bench PRIVATE transport pthread numa memkind atomic cityhash boost_coroutine boost_context)
 target_compile_definitions(bench PRIVATE BENCH_SYSTEM="${SYSTEM}" BENCH_OPT=$<AND:$<BOOL:${OPT}>,$<NOT:$<BOOL:${CC}>>> BENCH_CC=$<BOOL:${CC}>)
+
+add_executable(ub_admin ub_admin.cc)
+target_link_libraries(ub_admin PRIVATE shm-lib)

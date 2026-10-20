@@ -56,7 +56,13 @@ public:
     per_machine_size=((n-header_bytes)/2)&~size_t((2ul<<20)-1);
     per_machine_base=(char*)mmap_base+header_bytes+machine_no*per_machine_size;
   }
-  ~Mapper() override { if(ub && mmap_base) {unmap_ub_memory(mmap_base,mmap_size); mmap_base=nullptr;} }
+  void close_ub() {
+    if (ub && mmap_base) { unmap_ub_memory(mmap_base, mmap_size); mmap_base=nullptr; }
+  }
+  ~Mapper() override {
+    // The benchmark explicitly closes after both workers stop all access.
+    // Do not throw or infer peer quiescence from destruction on an error path.
+  }
 };
 void wait_for(nt<uint64_t>& x,uint64_t value) {
   auto until=std::chrono::steady_clock::now()+std::chrono::minutes(20);
@@ -222,5 +228,8 @@ int main(int argc,char** argv) try {
   shared->validated[id].store(token); wait_for(shared->validated[1-id],token);
   // Shared data remains alive until both workers finish; do not run a shared
   // object's std::thread/memkind destructor in another process.
+  index_close();
+  mapper->close_ub();
+  std::cout << "UB_CLOSED api=" << ub_api_name() << " id=" << id << std::endl;
   std::cout.flush(); std::cerr.flush(); _Exit(errors?1:0);
-} catch(const std::exception& e) { std::cerr<<"ERROR "<<e.what()<<std::endl; return 1; }
+} catch(const std::exception& e) { std::cerr<<"ERROR "<<e.what()<<std::endl; std::cerr.flush(); _Exit(1); }

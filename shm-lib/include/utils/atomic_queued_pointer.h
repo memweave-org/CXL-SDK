@@ -41,7 +41,11 @@ class nt_pointer {
     if (nt) {
       AtomicRequestQueue::pend_load_req(&ptr);     
     }
+#ifdef SHM_LIB_WITH_UBSM
+    return __atomic_load_n(&ptr, (int)__m);
+#else
     return ptr;
+#endif
   }
 
   void store(T *value, std::memory_order __m = std::memory_order_seq_cst,
@@ -51,7 +55,11 @@ class nt_pointer {
              bool nt = false
 #endif
              ) {
+#ifdef SHM_LIB_WITH_UBSM
+    __atomic_store_n(&ptr, value, (int)__m);
+#else
     ptr = value;
+#endif
     if (nt) {
       AtomicRequestQueue::pend_store_req(&ptr);
     }
@@ -217,7 +225,11 @@ class nt_pointer<T[]> {
       AtomicRequestQueue::pend_load_req(&ptr);
 
     }
+#ifdef SHM_LIB_WITH_UBSM
+    return __atomic_load_n(&ptr, (int)__m);
+#else
     return ptr;
+#endif
   }
 
   void store(T *newValue,
@@ -227,7 +239,11 @@ class nt_pointer<T[]> {
              bool nt = false
 #endif
              ) {
+#ifdef SHM_LIB_WITH_UBSM
+    __atomic_store_n(&ptr, newValue, __ATOMIC_SEQ_CST);
+#else
     ptr = newValue;
+#endif
     if (nt) {
       AtomicRequestQueue::pend_store_req(&ptr);
 

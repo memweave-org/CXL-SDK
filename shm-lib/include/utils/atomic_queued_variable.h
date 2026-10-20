@@ -1,5 +1,6 @@
 #pragma once
 #include "compiler.h"
+#include "bypass_cache.h"
 #include <array>
 #include <atomic>
 #include <cstdint>
@@ -64,6 +65,10 @@ public:
 private:
   template <time_point ProcessTime>
   static inline void pend_req(const void *addr) {
+#ifdef SHM_LIB_WITH_UBSM
+    // Real UBSM memory: preserve ordering, never charge simulated CXL latency.
+    mfence();
+#else
     uint32_t bidx = bucket_hash(addr);
     time_point cur = get_time();
 
@@ -87,6 +92,7 @@ private:
 
     // After processing and a halftrip, the request finished.
     wait_until(until_time + c2c_halftrip);
+#endif
   }
 };
 

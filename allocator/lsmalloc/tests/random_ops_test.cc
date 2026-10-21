@@ -28,7 +28,6 @@ const size_t MAX_TEST_OBJECTS = 100;
 template <typename T>
 void perform_operation(lsmallocimpl::cid_t thread_id) {
     tid = thread_id;
-    int gc_thread_id = global_allocator->register_thread();
 
     thread_local std::mt19937 gen(std::random_device{}());
     std::uniform_int_distribution<> object_id_dist(1, MAX_TEST_OBJECTS - 1);
@@ -47,9 +46,7 @@ void perform_operation(lsmallocimpl::cid_t thread_id) {
         T val = *read_val;
         (void)val;
     }
-
     global_allocator->release<int>(object_id, tid);
-    global_allocator->unregister_thread(gc_thread_id);
 }
 
 TEST(RandomOpsTest, IntTest) {

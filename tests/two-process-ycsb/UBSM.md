@@ -76,8 +76,8 @@ ownership 再 unmap。实际 SDK 是否允许目标部署中各进程同时取�
 跨机缓存维护是否有效，必须在真实 UB 上验证；替身不能证明这些硬件语义。
 
 UBSM 构建不模拟 CAS 延迟。其他后端和 `--ub-layout legacy` 保留原布局。
-`run.py` 默认 `--ub-layout auto`：仅 BwTree/ClevelHash OPT/NOOPT 使用混合布局；
-Sherman、RPC、CC case 继续使用旧路径。可显式 `--ub-layout split`，不支持的 case
+`run.py` 默认 `--ub-layout auto`：Sherman、RPC 和 BwTree/ClevelHash OPT/NOOPT 使用混合布局；
+CC case 继续使用旧路径。可显式 `--ub-layout split`，不支持的 case
 会报错，不会偷偷改成 legacy。单机脚本显式指定 split。
 
 也可以直接指定镜像，脚本自动创建临时容器、编译并运行，结束后删除容器：

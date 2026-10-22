@@ -12,7 +12,9 @@ int remote_lock_numa_node = -1;
 void init_global_lock_table() {
   if (global_lock_table) return;
   const size_t bytes = define::kNumOfLock * sizeof(nt<uint64_t>);
-#ifdef SHERMAN_UC
+#if defined(SHM_UB_SPLIT)
+  global_lock_table = static_cast<nt<uint64_t>*>(cxl_transport::allocate_atomic(bytes));
+#elif defined(SHERMAN_UC)
   if (remote_lock_numa_node < 0 || remote_lock_numa_node >= 64)
     throw std::runtime_error("Remote lock NUMA node not configured");
   const size_t page = size_t(sysconf(_SC_PAGESIZE));

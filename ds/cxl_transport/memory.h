@@ -7,6 +7,8 @@ void nt_memcpy(void* dst, const void* src, size_t bytes, bool atomic_pairs = fal
 void configure_shared_sequences(void* storage);
 size_t shared_sequences_bytes();
 void* allocate(size_t bytes);
+// Shared CAS/lock storage: NC in split UB, original allocator otherwise.
+void* allocate_atomic(size_t bytes);
 void release(void* p);
 void read(void* local, const void* shared, size_t bytes, bool atomic_pairs = false);
 void write(void* shared, const void* local, size_t bytes);

@@ -143,7 +143,7 @@ int main(int argc,char** argv) try {
     }
     index_open(shared->handles,true,total_threads);
 #ifdef TWO_PROCESS_RPC
-    shared->requests=new (cacheable.malloc(sizeof(MPMCQueue<uint32_t>))) MPMCQueue<uint32_t>(4096);
+    shared->requests=new (shared_atomic_memory().malloc(sizeof(MPMCQueue<uint32_t>))) MPMCQueue<uint32_t>(4096);
 #endif
     SimThreadInfo::setup_worker_ids(0,total_threads); index_thread(total_threads);
     for(uint64_t k=1;k<=records;++k) index_put(k,allocate_value(k));

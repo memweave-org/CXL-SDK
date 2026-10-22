@@ -199,7 +199,7 @@ class nt_pointer<T[]> {
   template <typename... Args> void allocate(size_t size, Args &&...args) {
     this->size = size;
     #ifdef USE_CXL
-    ptr = static_cast<T*>(cacheable.malloc(sizeof(T) * size));
+    ptr = static_cast<T*>(shared_atomic_memory().malloc(sizeof(T) * size));
 #else
     ptr = static_cast<T*>(malloc(sizeof(T) * size));
 #endif
@@ -281,7 +281,7 @@ class nt_pointer<T[]> {
     }
     if (size != 0) {
 #ifdef USE_CXL
-      cacheable.free(ptr);
+      shared_atomic_memory().free(ptr);
 #else
       ::free(ptr);
 #endif

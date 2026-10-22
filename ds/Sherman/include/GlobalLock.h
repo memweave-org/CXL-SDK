@@ -18,7 +18,7 @@ inline void init_root_ptr() {
 //   root_ptr_list =
 //       (nt<void *> *)cacheable.malloc(sizeof(void *) * define::kMaxTree);
 // #else
-  root_ptr_list = (nt<void *> *)cxl_transport::allocate(sizeof(nt<void *>) * define::kMaxTree);
+  root_ptr_list = (nt<void *> *)cxl_transport::allocate_atomic(sizeof(nt<void *>) * define::kMaxTree);
 // #endif
   for (auto i = 0UL; i < define::kMaxTree; i++)
     new (&root_ptr_list[i]) nt<void *>(nullptr);

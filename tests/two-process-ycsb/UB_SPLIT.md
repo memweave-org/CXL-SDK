@@ -1,6 +1,6 @@
 # UBSM 混合缓存布局
 
-在支持的 BwTree/ClevelHash OPT、NOOPT case 中，将普通数据和共享原子目标分别放到
+在 Sherman、RPC 和 BwTree/ClevelHash OPT、NOOPT case 中，将普通数据和共享原子目标分别放到
 两个对象。此布局只在 UBSM 的 `UB_SPLIT` 构建中启用，不改变 file/CXL/Memlink 算法路径。
 
 | 对象 | 创建 flag | 固定地址 | 内容 |
@@ -13,6 +13,10 @@
 只有双方成功校验、停止后台线程并完成全部 unmap 后才销毁对象；失败则保留现场。
 
 ## 元数据分离
+
+- Sherman 的全局锁表、根指针表以及共享复制序列计数器在 NC；树节点在 CACHE。
+  节点读操作在每次快照重试时失效缓存，写操作在释放锁/序列计数器前写回。
+- RPC 的队列头尾、槽位状态及请求/响应控制区在 NC，后端 BwTree 使用相同混合布局。
 
 - BwTree 的索引对象（含映射表、根、统计/epoch 原子）、复制数组和 GC 元数据在 NC。
   Cacheable 节点中的 AllocationMeta tail/next、ElasticNode 状态位改为引用 NC 单元。
@@ -44,8 +48,11 @@ SIZE_MB=1024 ATOMIC_SIZE_MB=512 \
 ./tests/two-process-ycsb/run_ub_single.sh 内存提供机器的UB拓扑主机名 2 4
 ```
 
+通过单机 Docker 脚本测试 Sherman/RPC：设置 `CASES="sherman rpc"`；
+不设置时仍默认测试 BwTree OPT 和 ClevelHash OPT。
+
 直接运行 run.py 时：`--ub-layout split --atomic-size-mb 512`。
-默认 auto 仅对 UBSM BwTree/ClevelHash OPT/NOOPT 选择 split；其他 case 保留 legacy。
+默认 auto 对 UBSM Sherman、RPC、BwTree/ClevelHash OPT/NOOPT 选择 split；其他 case 保留 legacy。
 构建目录带 `-ubsm-split` 后缀，与旧二进制隔离。
 
 ClevelHash 默认预分配桶和后台扩容需要较多 NC 容量，小规模测试也不能仅按记录数
@@ -67,3 +74,7 @@ map 后调用 ownership(RW)，整个测试期间持有它，结束且所有线�
 均通过两个进程（2/4 线程）、10,000 条记录、每进程 20,000 次操作的运行与校验。
 另通过 NOOPT、非 UB file 后端回归、分配契约与 UB 不注入模拟延迟检查。
 这些结果不代表已在真实 UB 硬件验证。
+
+Sherman/RPC 扩展回归：x86 本机及 ARM Docker 的 SDK 替身测试均通过，
+两个进程分别 2/4 线程，10,000 条记录、20,000 次操作（RPC 仅客户端计操作）。
+另通过 Sherman/RPC 非 UB file 后端回归。真实 UB 缓存/原子语义仍需现场验证。

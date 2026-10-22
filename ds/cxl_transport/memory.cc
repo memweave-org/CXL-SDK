@@ -121,6 +121,11 @@ void* allocate(size_t n) {
   if (cacheable.posix_memalign(&p, 64, (n+63)&~size_t(63)) || !p) throw std::bad_alloc();
   return p;
 }
+void* allocate_atomic(size_t n) {
+  void* p = nullptr;
+  if (shared_atomic_memory().posix_memalign(&p, 64, (n+63)&~size_t(63)) || !p) throw std::bad_alloc();
+  return p;
+}
 void release(void* p) { cacheable.free(p); }
 namespace {
 int dma_fd = -1;
@@ -181,6 +186,9 @@ retry_snapshot:
     if(v&1) { shm_platform::pause(); goto retry_snapshot; }
     versions[j]=v;
   }
+#ifdef SHM_UB_SPLIT
+  clflush(src,n);
+#endif
   if constexpr (dma_copy) dma_transfer(dst, src, n, false);
   else if constexpr (plain_copy) std::memcpy(dst, src, n);
   else if constexpr (nt_only) nt_copy::stream_copy(dst, src, n);
@@ -232,10 +240,19 @@ void write_plain(void* dst, const void* src, size_t n) {
 }
 void write_nt(void* dst, const void* src, size_t n) {
   CopyWriteGuard snapshot_guard(dst,n);
+#ifdef SHM_UB_SPLIT
+  clflush(dst,n);
+#endif
   nt_copy::stream_copy(dst, src, n);
+#ifdef SHM_UB_SPLIT
+  clwb(dst,n);
+#endif
 }
 void write(void* dst, const void* src, size_t n) {
   CopyWriteGuard snapshot_guard(dst,n);
+#ifdef SHM_UB_SPLIT
+  clflush(dst,n);
+#endif
   nt_memcpy(dst, src, n);
 #ifdef NO_CC
   clwb(dst,n);
@@ -257,6 +274,9 @@ void store64(void* p, uint64_t v) {
   __atomic_store_n((uint64_t*)p, v, __ATOMIC_RELEASE);
 }
 bool cas64(void* p, uint64_t& expected, uint64_t desired) {
+#ifdef SHM_UB_SPLIT
+  ub_assert_atomic_target(p);
+#endif
   bool ok = __atomic_compare_exchange_n((uint64_t*)p, &expected, desired, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
 #ifdef QUEUE_SIM_CAS
   AtomicRequestQueue::pend_cas_req(p);

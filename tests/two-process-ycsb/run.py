@@ -78,9 +78,9 @@ def main():
     results = []
     for case in a.cases:
         system, _, opt = case.partition('-')
-        split = a.ub_api == 'ubsm' and a.ub_layout != 'legacy' and system in ('bwtree','clevelhash') and opt != 'cc'
+        split = a.ub_api == 'ubsm' and a.ub_layout != 'legacy' and system in ('bwtree','clevelhash','sherman','rpc') and opt != 'cc'
         if a.ub_layout == 'split' and not split:
-            p.error('split supports BwTree/ClevelHash OPT/NOOPT only')
+            p.error('split supports Sherman/RPC/BwTree/ClevelHash NO_CC/OPT only')
         build = ROOT / 'build/two-ycsb' / (case + ('-' + a.ub_api if a.memory == 'ub' else '') + ('-split' if split else ''))
         exe = build / 'bench'
         if not a.skip_build:

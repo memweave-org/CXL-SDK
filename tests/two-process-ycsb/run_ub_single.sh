@@ -9,10 +9,12 @@ Usage: ./tests/two-process-ycsb/run_ub_single.sh [PROVIDER_HOST [THREADS0 [THREA
 Build and run BwTree OPT and ClevelHash OPT, each with two local processes.
 PROVIDER_HOST is the memory provider's UB topology name (local OR remote); alternatively
 set UBSM_PROVIDER_HOST. Both worker processes run here, not on the provider.
-Remote provider means NonCacheable imports with the current flags.
+Data uses CACHE; shared atomic targets use a separate NONCACHE object.
 Default threads: 2 per process.
 
 Optional environment:
+  CASES               Space-separated cases (default: bwtree-on clevelhash-on).
+                      Example: "sherman rpc bwtree-on clevelhash-on".
   UB_IMAGE            Docker image: automatically create/run/remove a container.
   UB_SDK_ROOT         Host SDK directory (default /usr/local/ubs_mem).
                       Auto-detect lib/lib64, including a sole versioned library.
@@ -73,7 +75,7 @@ fi
 if [[ -n ${UB_CONTAINER:-} || -n ${UB_IMAGE:-} ]]; then
   env_args=(-e UB_CONTAINER= -e UB_IMAGE=)
   for name in UBSM_PROVIDER_HOST UBSM_PROVIDER_NUMA UBSM_INCLUDE_DIR UBSM_LIBRARY \
-      LD_LIBRARY_PATH UBSM_RUNTIME_LIBRARY_DIR UB_SDK_TEST_MODE HCOM_CONNECTION_RETRY_TIMES RECORDS OPS SIZE_MB ATOMIC_SIZE_MB JOBS TIMEOUT OUTPUT; do
+      LD_LIBRARY_PATH UBSM_RUNTIME_LIBRARY_DIR UB_SDK_TEST_MODE HCOM_CONNECTION_RETRY_TIMES CASES RECORDS OPS SIZE_MB ATOMIC_SIZE_MB JOBS TIMEOUT OUTPUT; do
     if [[ -v $name ]]; then env_args+=(-e "$name=${!name}"); fi
   done
   if [[ -n ${UB_IMAGE:-} ]]; then
@@ -180,8 +182,9 @@ echo "UBSM: workers_host=$(uname -n), memory_provider=$provider, provider_numa=$
 echo "Mapping policy: CACHE data + NONCACHE atomics; atomic arena=${ATOMIC_SIZE_MB:-512} MiB."
 echo "Build logs, worker logs and results.json: $output"
 trap 'rc=$?; if (( rc != 0 )); then echo "Failed; inspect logs in $output. If a UB object was created, confirm workers stopped before manual cleanup." >&2; fi' EXIT
+read -r -a cases <<< "${CASES:-bwtree-on clevelhash-on}"
 python3 tests/two-process-ycsb/run.py \
-  --cases bwtree-on clevelhash-on --memory ub --ub-api ubsm --ub-layout split \
+  --cases "${cases[@]}" --memory ub --ub-api ubsm --ub-layout split \
   --atomic-size-mb "${ATOMIC_SIZE_MB:-512}" \
   --ub-library "$UBSM_LIBRARY" --ub-include "$UBSM_INCLUDE_DIR" \
   --provider-host "$provider" --provider-numa "${UBSM_PROVIDER_NUMA:-4294967295}" \

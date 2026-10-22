@@ -39,6 +39,46 @@ export UB_MEMLINK_LIBRARY=/实际路径/libmemlink.so
 
 ## Docker 编译
 
+### 单机先试 BwTree OPT 和 ClevelHash OPT
+
+在具备厂商 SDK、UB 服务及访问权限的环境中，从仓库根目录执行：
+
+```sh
+./tests/two-process-ycsb/run_ub_single.sh 实际本机UB拓扑主机名 2 4
+```
+
+脚本自动编译并依次运行这两个 OPT case；每个 case 有两个本地进程，以上线程数为
+2 和 4（不填默认各 2）。默认加载 10000 条记录、每进程执行 10000 次 YCSB-B 操作，
+分配 1024 MiB，使用 16-bit BwTree 映射表，适合小规模功能检查。成功后自动释放 UB
+对象；失败时保留对象并提示检查日志。输出位于 `build/ub-single-*`。
+单机结果不验证跨机导入、远端 NC 映射或跨机一致性。
+
+单机测试必须在指定 provider 本机运行。`ONLY_IMPORT_NONCACHE | WR_DELAY_COMP`
+在提供方给出 cacheable 映射，两个本地进程共用这块 UB 对象；全局 `cacheable`
+分配器的两个分区均来自该映射，BwTree 映射表和 ClevelHash 桶等共享 CAS 目标也
+从中分配，不需要另建普通 DRAM 池。UB 严格分配模式检查返回地址及长度，越界即失败。
+每个 worker 启动时还会对同一个 UB 分配的 64-bit 字做 CAS，确认最终值为 2，打印
+`UB_CAS_PROBE ... simulated_latency=off`；协调器要求双方均通过此检查。
+
+API 中另有 `UBSM_FLAG_CACHE`，但文档要求它配合 `ubsmem_shmem_set_ownership`
+并禁用 BIOS snoop，不能直接替换当前模式来实现跨主机 cacheable 并发 CAS。
+双机时远端仍为 NC，不能由变量名 `cacheable` 推断远端页属性。
+UBSM 和 Memlink 构建均跳过 CAS/load/store 的模拟排队延迟；非 UB 构建保留原模拟逻辑。
+
+若已启动具备 UB 设备、服务 socket、组权限和 SDK 依赖的容器 `ub-ycsb`，且仓库
+挂载在相同绝对路径，宿主机一条命令即可在容器里完成编译和运行：
+
+```sh
+UB_CONTAINER=ub-ycsb ./tests/two-process-ycsb/run_ub_single.sh 实际本机UB拓扑主机名 2 4
+```
+
+容器应使用前述 GCC 12.3.1/glibc 2.39 镜像；脚本复用容器的 SDK 环境，不负责创建
+具有厂商设备访问配置的容器。可用 `UBSM_PROVIDER_NUMA=0` 指定实际内存 NUMA，
+`RECORDS`、`OPS`、`SIZE_MB`、`JOBS`、`TIMEOUT`、`OUTPUT` 覆盖默认参数。
+`--help` 查看说明。必须提供真实 SDK 路径；不会自动退回普通文件或测试替身。
+
+### 双机实验的构建
+
 在机器 A 的仓库根目录执行，仓库在两机应使用相同绝对路径。下面要求厂商 SDK 安装
 于 `/usr/local/ubs_mem`，其传递依赖也已经在镜像中可用；若出现缺库，先根据 SDK 的
 `ldd` 输出补齐对应厂商库，不要把宿主机整个 `/usr/lib64` 覆盖到容器中。

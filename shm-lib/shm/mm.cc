@@ -276,6 +276,12 @@ void *MemoryManager::malloc(size_t size) {
     if (strict_shared_) throw std::bad_alloc();
     return ::malloc(size); // Fallback to heap
   }
+#if defined(SHM_LIB_WITH_UBSM) || defined(SHM_LIB_WITH_UB)
+  // UB shared indexes must never receive CAS storage outside their arena.
+  if (strict_shared_ && (!owns_memkind_pointer(ptr) ||
+      size > this->size - (reinterpret_cast<uintptr_t>(ptr) - reinterpret_cast<uintptr_t>(base))))
+    throw std::runtime_error("UB allocation escaped the shared arena");
+#endif
   // Debug: Check if allocated address is in expected range
   uintptr_t ptr_val = reinterpret_cast<uintptr_t>(ptr);
   uintptr_t base_val = reinterpret_cast<uintptr_t>(base);
@@ -321,6 +327,13 @@ int MemoryManager::posix_memalign(void **memptr, size_t alignment,
   if (memkind_pool != nullptr) {
     int rc = memkind_posix_memalign(memkind_pool, memptr, alignment, size);
     if (rc == 0) {
+#if defined(SHM_LIB_WITH_UBSM) || defined(SHM_LIB_WITH_UB)
+      if (strict_shared_ && (!owns_memkind_pointer(*memptr) ||
+          size > this->size - (reinterpret_cast<uintptr_t>(*memptr) - reinterpret_cast<uintptr_t>(base)))) {
+        *memptr = nullptr;
+        return ENOMEM;
+      }
+#endif
       return 0;
     }
     std::cerr << "[MemoryManager::posix_memalign] ERROR: memkind_posix_memalign "
@@ -357,6 +370,13 @@ int MemoryManager::clalign(void **memptr, size_t size) {
   if (memkind_pool != nullptr) {
     int rc = memkind_posix_memalign(memkind_pool, memptr, CACHE_LINE_SIZE, size);
     if (rc == 0) {
+#if defined(SHM_LIB_WITH_UBSM) || defined(SHM_LIB_WITH_UB)
+      if (strict_shared_ && (!owns_memkind_pointer(*memptr) ||
+          size > this->size - (reinterpret_cast<uintptr_t>(*memptr) - reinterpret_cast<uintptr_t>(base)))) {
+        *memptr = nullptr;
+        return ENOMEM;
+      }
+#endif
       return 0;
     }
     std::cerr << "[MemoryManager::clalign] ERROR: memkind_posix_memalign "

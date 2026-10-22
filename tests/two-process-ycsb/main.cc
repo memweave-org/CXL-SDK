@@ -31,6 +31,7 @@ struct alignas(64) Mailbox {
 struct Shared {
   nt<uint64_t> initialized{0}, ready[2], done[2], validated[2], start{0};
   Handles handles;
+  uint64_t* ub_cas_probe{};
 #ifdef TWO_PROCESS_RPC
   MPMCQueue<uint32_t>* requests{};
 #endif
@@ -115,6 +116,10 @@ int main(int argc,char** argv) try {
   if(!id) { new (shared) Shared(); memset(sequences,0,cxl_transport::shared_sequences_bytes()); }
   cxl_transport::configure_shared_sequences(sequences);
   if(!id) {
+    if (std::string(argv[7]) == "ub") {
+      shared->ub_cas_probe = static_cast<uint64_t*>(cacheable.malloc(sizeof(uint64_t)));
+      __atomic_store_n(shared->ub_cas_probe, 0, __ATOMIC_SEQ_CST);
+    }
     index_open(shared->handles,true,total_threads);
 #ifdef TWO_PROCESS_RPC
     shared->requests=new (cacheable.malloc(sizeof(MPMCQueue<uint32_t>))) MPMCQueue<uint32_t>(4096);
@@ -128,6 +133,29 @@ int main(int argc,char** argv) try {
   } else {
     wait_for(shared->initialized,token);
     index_open(shared->handles,false,total_threads);
+  }
+  if (std::string(argv[7]) == "ub") {
+    // Both processes CAS the same word allocated from the mapped UB arena.
+    auto* probe = shared->ub_cas_probe;
+    const auto addr = reinterpret_cast<uintptr_t>(probe);
+    if (addr < mapping_address + header_bytes || addr > mapping_address + bytes - sizeof(*probe))
+      throw std::runtime_error("CAS probe is outside the UB arena");
+    uint64_t expected = id;
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    while (!__atomic_compare_exchange_n(probe, &expected, id + 1, false,
+                                        __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
+      expected = id;
+      if (std::chrono::steady_clock::now() > deadline)
+        throw std::runtime_error("shared UB CAS probe timed out");
+      std::this_thread::yield();
+    }
+    while (__atomic_load_n(probe, __ATOMIC_SEQ_CST) != 2) {
+      if (std::chrono::steady_clock::now() > deadline)
+        throw std::runtime_error("shared UB CAS probe peer timed out");
+      std::this_thread::yield();
+    }
+    std::cout << "UB_CAS_PROBE id=" << id << " address=" << probe
+              << " value=2 simulated_latency=off" << std::endl;
   }
   shared->pid[id]=getpid(); publish(&shared->pid[id],sizeof(uint64_t));
   std::cout<<"PROCESS id="<<id<<" pid="<<getpid()<<" threads="<<threads<<" shared="<<(void*)shared<<" backend="<<argv[7]<<std::endl;

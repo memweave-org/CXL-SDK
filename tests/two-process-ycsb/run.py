@@ -165,6 +165,8 @@ def main():
                 ubsm_stub |= 'UBSM_TEST_STUB' in text
                 if a.memory == 'ub' and f'UB_CLOSED api={a.ub_api} id={i}' not in text:
                     raise RuntimeError('Worker did not confirm UB unmap/finalize; retain object')
+                if a.memory == 'ub' and f'UB_CAS_PROBE id={i} ' not in text:
+                    raise RuntimeError('Worker did not validate shared UB CAS storage')
                 lines = [line for line in text.splitlines() if line.startswith('RESULT ')]
                 if len(lines) != 1:
                     raise RuntimeError(f'{case}: missing RESULT for worker {i}')

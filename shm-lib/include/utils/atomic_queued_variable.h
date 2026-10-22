@@ -65,8 +65,8 @@ public:
 private:
   template <time_point ProcessTime>
   static inline void pend_req(const void *addr) {
-#ifdef SHM_LIB_WITH_UBSM
-    // Real UBSM memory: preserve ordering, never charge simulated CXL latency.
+#if defined(SHM_LIB_WITH_UBSM) || defined(SHM_LIB_WITH_UB)
+    // Real UB (UBSM or Memlink): preserve ordering without simulated latency.
     mfence();
 #else
     uint32_t bidx = bucket_hash(addr);

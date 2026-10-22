@@ -36,3 +36,8 @@ failure_checks 注入 map/unmap/finalize 失败，验证结果失败且原对象
 均通过八种 UBSM fixture 配置（两个进程，线程数 1/2，各 2000 次操作，1000 条初始数据）。
 所有成功 case 均完成 unmap/finalize 后才释放对象；另通过 Memlink 替身和普通文件模式回归。
 错误注入覆盖 map、unmap、finalize；错误结果均保留对象。以上均不是真实双机 UB 测试。
+
+`python3 tests/ub-api/latency_check.py` 编译三种后端的原子请求探针并检查目标文件：
+UBSM/Memlink 不引用模拟用的 `clock_gettime`，非 UB 仍保留此依赖。
+单机 UB 入口的两个 OPT case 另检查双方的 `UB_CAS_PROBE` 标记。
+这验证代码路径，不证明真实 UB 页属性或硬件原子语义。

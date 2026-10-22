@@ -66,3 +66,15 @@ c++ -std=c++17 -O0 -g -I/usr/local/ubs_mem/include \
 使用明确打印 `UBSM_TEST_STUB` 的文件映射替身验证三个模式、写入读回、ownership
 调用和成功清理；替身的 flag 数值不是厂商 ABI。不代表已经通过真实 UB 的
 初始化、缓存属性或 ownership 硬件测试。
+
+## 定位卡住的调用
+
+每个 SDK 调用前打印并刷新 `BEGIN 接口名`，返回后打印 `END 接口名 rc=...`。
+最后一个没有对应 END 的 BEGIN 标记就是未返回的调用；写入、屏障和读回也有标记。
+默认运行超时为 60 秒，可用 `TIMEOUT=30` 覆盖；超时先发 TERM，5 秒后仍未退出则 KILL。
+超时返回非零状态，可能来不及清理已创建对象；按 CREATE 行中的精确名字检查，不能
+在仍有使用者时释放。驱动调用若处于不可中断内核等待，信号不能保证立即结束它。
+
+先运行 `TIMEOUT=30 ./tests/ub-api/run_sdk_smoke.sh init`。
+如果 init 成功，再运行 noncache，以区分初始化通信与分配/映射阶段。
+不要根据 SDK 的最后一条内部 debug 日志猜测卡住的位置。

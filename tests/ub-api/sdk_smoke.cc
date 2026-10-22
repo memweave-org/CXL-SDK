@@ -12,9 +12,16 @@
 #include <ctime>
 
 static void check(const char* op, int rc) {
-  std::cout << op << " rc=" << rc << std::endl;
   if (rc) throw std::runtime_error(std::string(op) + " failed: " + std::to_string(rc));
 }
+template<class F> static int trace(const char* op, F action) {
+  std::cout << "BEGIN " << op << std::endl;
+  const int rc = action();
+  std::cout << "END " << op << " rc=" << rc << std::endl;
+  return rc;
+}
+#define SDK_CALL(op, expression) check(op, trace(op, [&] { return (expression); }))
+
 static void fence() {
 #if defined(__aarch64__)
   asm volatile("dmb sy" ::: "memory");
@@ -49,50 +56,54 @@ int main(int argc, char** argv) {
     }
     std::cout << "MODE=" << mode << " (real SDK unless explicitly linked to a test stub)" << std::endl;
     // Match the supplied example, but keep debug output for diagnosis.
-    check("ubsmem_set_logger_level(debug)", ubsmem_set_logger_level(0));
+    SDK_CALL("ubsmem_set_logger_level(debug)", ubsmem_set_logger_level(0));
     ubsmem_options_t options{};
-    check("ubsmem_init_attributes", ubsmem_init_attributes(&options));
-    check("ubsmem_initialize", ubsmem_initialize(&options));
+    SDK_CALL("ubsmem_init_attributes", ubsmem_init_attributes(&options));
+    SDK_CALL("ubsmem_initialize", ubsmem_initialize(&options));
     initialized = true;
     if (mode != "init") {
       const uint64_t flags = mode == "cache" ? UBSM_FLAG_CACHE :
           UBSM_FLAG_NONCACHE | UBSM_FLAG_WR_DELAY_COMP;
       std::cout << "CREATE name=" << name << " provider=" << provider.host_name
                 << " bytes=" << bytes << " flags=" << flags << std::endl;
-      check("ubsmem_shmem_allocate_with_provider",
+      SDK_CALL("ubsmem_shmem_allocate_with_provider",
             ubsmem_shmem_allocate_with_provider(&provider, name.c_str(), bytes, 0660, flags));
       created = true;
-      check("ubsmem_shmem_map", ubsmem_shmem_map(nullptr, bytes, PROT_READ | PROT_WRITE,
+      SDK_CALL("ubsmem_shmem_map", ubsmem_shmem_map(nullptr, bytes, PROT_READ | PROT_WRITE,
                                                 MAP_SHARED, name.c_str(), 0, &address));
       if (!address || address == MAP_FAILED) throw std::runtime_error("invalid mapped address");
       std::cout << "MAPPED address=" << address << std::endl;
       if (mode == "cache") {
-        check("ubsmem_shmem_set_ownership(RW)",
+        SDK_CALL("ubsmem_shmem_set_ownership(RW)",
               ubsmem_shmem_set_ownership(name.c_str(), address, bytes, PROT_READ | PROT_WRITE));
         owned = true;
       }
       // Scalar volatile accesses avoid compiler-generated vector stores on NC.
       auto* words = static_cast<volatile uint64_t*>(address);
+      std::cout << "BEGIN write_4096" << std::endl;
       for (size_t i = 0; i < 512; ++i) words[i] = 0x1234567800000000ULL ^ i;
+      std::cout << "END write_4096\nBEGIN fence" << std::endl;
       fence();
+      std::cout << "END fence" << std::endl;
       if (mode == "cache")
-        check("ubsmem_shmem_set_ownership(READ)",
+        SDK_CALL("ubsmem_shmem_set_ownership(READ)",
               ubsmem_shmem_set_ownership(name.c_str(), address, bytes, PROT_READ));
+      std::cout << "BEGIN readback_4096" << std::endl;
       for (size_t i = 0; i < 512; ++i)
         if (words[i] != (0x1234567800000000ULL ^ i))
           throw std::runtime_error("readback mismatch at word " + std::to_string(i));
-      std::cout << "WRITE_READBACK_PASS bytes=4096" << std::endl;
+      std::cout << "END readback_4096\nWRITE_READBACK_PASS bytes=4096" << std::endl;
       if (owned) {
-        check("ubsmem_shmem_set_ownership(NONE)",
+        SDK_CALL("ubsmem_shmem_set_ownership(NONE)",
               ubsmem_shmem_set_ownership(name.c_str(), address, bytes, PROT_NONE));
         owned = false;
       }
-      check("ubsmem_shmem_unmap", ubsmem_shmem_unmap(address, bytes));
+      SDK_CALL("ubsmem_shmem_unmap", ubsmem_shmem_unmap(address, bytes));
       address = nullptr;
-      check("ubsmem_shmem_deallocate", ubsmem_shmem_deallocate(name.c_str()));
+      SDK_CALL("ubsmem_shmem_deallocate", ubsmem_shmem_deallocate(name.c_str()));
       created = false;
     }
-    check("ubsmem_finalize", ubsmem_finalize());
+    SDK_CALL("ubsmem_finalize", ubsmem_finalize());
     initialized = false;
     std::cout << "PASS mode=" << mode << std::endl;
     return 0;
@@ -100,21 +111,22 @@ int main(int argc, char** argv) {
     std::cerr << "FAIL: " << e.what() << std::endl;
     // Never deallocate a region whose unmap failed. Print every cleanup result.
     if (owned) {
-      const int rc = ubsmem_shmem_set_ownership(name.c_str(), address, bytes, PROT_NONE);
+      const int rc = trace("cleanup ownership(NONE)", [&] {
+        return ubsmem_shmem_set_ownership(name.c_str(), address, bytes, PROT_NONE); });
       std::cerr << "cleanup ownership(NONE) rc=" << rc << std::endl;
     }
     if (address && address != MAP_FAILED) {
-      const int rc = ubsmem_shmem_unmap(address, bytes);
+      const int rc = trace("cleanup unmap", [&] { return ubsmem_shmem_unmap(address, bytes); });
       std::cerr << "cleanup unmap rc=" << rc << std::endl;
       if (!rc) address = nullptr;
     }
     if (created && !address) {
-      const int rc = ubsmem_shmem_deallocate(name.c_str());
+      const int rc = trace("cleanup deallocate", [&] { return ubsmem_shmem_deallocate(name.c_str()); });
       std::cerr << "cleanup deallocate rc=" << rc << std::endl;
       if (!rc) created = false;
     }
     if (initialized && !address)
-      std::cerr << "cleanup finalize rc=" << ubsmem_finalize() << std::endl;
+      trace("cleanup finalize", [&] { return ubsmem_finalize(); });
     if (created) std::cerr << "OBJECT_MAY_REMAIN name=" << name << std::endl;
     return 1;
   }

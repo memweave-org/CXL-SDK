@@ -151,6 +151,7 @@ cd "$ROOT"
 output=${OUTPUT:-build/ub-single-$(date +%Y%m%d-%H%M%S)-$$}
 if [[ $output != /* ]]; then output="$ROOT/$output"; fi
 if [[ -n ${UB_SDK_TEST_MODE:-} ]]; then
+  [[ ${TIMEOUT:-60} =~ ^[1-9][0-9]*$ ]] || { echo 'TIMEOUT must be positive seconds' >&2; exit 2; }
   mkdir -p "$output"
   link_args=(-Wl,-rpath,"$(dirname -- "$UBSM_LIBRARY")")
   if [[ -n ${UBSM_RUNTIME_LIBRARY_DIR:-} ]]; then
@@ -160,9 +161,19 @@ if [[ -n ${UB_SDK_TEST_MODE:-} ]]; then
   "${CXX:-c++}" -std=c++17 -O0 -g -I"$UBSM_INCLUDE_DIR" \
     "$ROOT/tests/ub-api/sdk_smoke.cc" "$UBSM_LIBRARY" "${link_args[@]}" \
     -o "$output/ub_sdk_smoke" 2>&1 | tee "$output/build.log"
-  "$output/ub_sdk_smoke" "$UB_SDK_TEST_MODE" "$provider" "${SIZE_MB:-128}" \
+  set +e
+  timeout --signal=TERM --kill-after=5 "${TIMEOUT:-60}" \
+    "$output/ub_sdk_smoke" "$UB_SDK_TEST_MODE" "$provider" "${SIZE_MB:-128}" \
     2>&1 | tee "$output/run.log"
-  exit 0
+  statuses=("${PIPESTATUS[@]}")
+  set -e
+  rc=${statuses[0]}
+  if (( rc == 124 || rc == 137 )); then
+    echo "SDK test timed out/killed. Last BEGIN without END in $output/run.log identifies the blocked stage." >&2
+    echo "If CREATE was printed, the named UB object may remain; confirm all users stopped before cleanup." >&2
+  fi
+  if (( rc == 0 )); then rc=${statuses[1]}; fi
+  exit "$rc"
 fi
 echo "UBSM: workers_host=$(hostname), memory_provider=$provider, provider_numa=${UBSM_PROVIDER_NUMA:-4294967295}, threads=${2:-2}/${3:-${2:-2}}"
 echo "Mapping policy: provider=cacheable, importer=noncacheable (ONLY_IMPORT_NONCACHE)."

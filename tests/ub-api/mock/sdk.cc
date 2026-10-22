@@ -16,6 +16,8 @@ static std::string root() { const char* p=getenv("UBSM_TEST_DIRECTORY"); return 
 static std::string path(const char* n) { return root()+"/"+n; }
 static int event(const char* op) {
   fprintf(stderr,"UBSM_TEST_STUB %s pid=%ld\n",op,long(getpid()));
+  const char* hang=getenv("UBSM_TEST_HANG");
+  if(hang && !strcmp(hang,op)) for(;;) pause();
   const char* fail=getenv("UBSM_TEST_FAIL");
   return fail && !strcmp(fail,op) ? 6001 : 0;
 }

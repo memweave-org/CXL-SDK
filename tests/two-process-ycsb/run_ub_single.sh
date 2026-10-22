@@ -53,7 +53,7 @@ if [[ -n ${UB_CONTAINER:-} || -n ${UB_IMAGE:-} ]]; then
     fi
     # OBMM creates /dev/obmm_shmdev* after allocation; a static --device list
     # cannot expose those future nodes. Keep host UID/groups and share /dev.
-    run_args=(--rm --init --network host --uts host
+    run_args=(--rm --network host --uts host
       --user "$(id -u):$(id -g)" --device-cgroup-rule 'c *:* rw'
       -v "$ROOT:$ROOT" -w "$ROOT"
       -v /dev:/dev -v /run:/run:ro -v "$sdk_root:$sdk_root:ro")

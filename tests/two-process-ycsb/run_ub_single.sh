@@ -13,6 +13,9 @@ set UBSM_PROVIDER_HOST. Default threads: 2 per process.
 Optional environment:
   UB_IMAGE            Docker image: automatically create/run/remove a container.
   UB_SDK_ROOT         Host SDK directory (default /usr/local/ubs_mem).
+                      Auto-detect lib/lib64, including a sole versioned library.
+  UB_EXTRA_LIBRARIES  Colon-separated SDK plugin paths (for dlopen dependencies).
+  UB_EXTRA_LIBRARY_DIRS Additional colon-separated dependency search directories.
   UB_DOCKER_ARGS_FILE Optional Docker arguments, one argument per line (no eval).
   UB_CONTAINER        Existing UB-enabled Docker container; build/run inside it.
                       The repository must be mounted at the same absolute path.
@@ -31,6 +34,33 @@ if (( $# > 3 )); then
   echo 'Too many arguments; use --help' >&2; exit 2
 fi
 
+# Resolve on the host before docker run, or inside an existing container.
+resolve_sdk() {
+  sdk_root=${UB_SDK_ROOT:-/usr/local/ubs_mem}
+  export UBSM_INCLUDE_DIR=${UBSM_INCLUDE_DIR:-$sdk_root/include}
+  if [[ -z ${UBSM_LIBRARY:-} ]]; then
+    for dir in "$sdk_root/lib" "$sdk_root/lib64"; do
+      if [[ -r $dir/libubsm_sdk.so ]]; then UBSM_LIBRARY=$dir/libubsm_sdk.so; break; fi
+    done
+    if [[ -z ${UBSM_LIBRARY:-} ]]; then
+      declare -A candidates=()
+      for file in "$sdk_root"/lib/libubsm_sdk.so.* "$sdk_root"/lib64/libubsm_sdk.so.*; do
+        [[ ! -f $file ]] || candidates["$(readlink -f -- "$file")"]=1
+      done
+      if (( ${#candidates[@]} == 1 )); then
+        for file in "${!candidates[@]}"; do UBSM_LIBRARY=$file; done
+      else
+        echo "Cannot select libubsm_sdk under $sdk_root/lib or lib64; set UBSM_LIBRARY to its exact path." >&2
+        return 2
+      fi
+    fi
+  fi
+  for file in "$UBSM_INCLUDE_DIR/ubs_mem.h" "$UBSM_INCLUDE_DIR/ubs_mem_def.h" "$UBSM_LIBRARY"; do
+    if [[ ! -r $file ]]; then echo "Missing UBSM SDK file: $file" >&2; return 2; fi
+  done
+  export UBSM_LIBRARY
+}
+
 if [[ -n ${UB_IMAGE:-} && -n ${UB_CONTAINER:-} ]]; then
   echo 'Use UB_IMAGE or UB_CONTAINER, not both.' >&2; exit 2
 fi
@@ -40,7 +70,7 @@ fi
 if [[ -n ${UB_CONTAINER:-} || -n ${UB_IMAGE:-} ]]; then
   env_args=(-e UB_CONTAINER= -e UB_IMAGE=)
   for name in UBSM_PROVIDER_HOST UBSM_PROVIDER_NUMA UBSM_INCLUDE_DIR UBSM_LIBRARY \
-      LD_LIBRARY_PATH HCOM_CONNECTION_RETRY_TIMES RECORDS OPS SIZE_MB JOBS TIMEOUT OUTPUT; do
+      LD_LIBRARY_PATH UBSM_RUNTIME_LIBRARY_DIR HCOM_CONNECTION_RETRY_TIMES RECORDS OPS SIZE_MB JOBS TIMEOUT OUTPUT; do
     if [[ -v $name ]]; then env_args+=(-e "$name=${!name}"); fi
   done
   if [[ -n ${UB_IMAGE:-} ]]; then
@@ -58,12 +88,28 @@ if [[ -n ${UB_CONTAINER:-} || -n ${UB_IMAGE:-} ]]; then
       -v "$ROOT:$ROOT" -w "$ROOT"
       -v /dev:/dev -v /run:/run:ro -v "$sdk_root:$sdk_root:ro")
     for gid in $(id -G); do run_args+=(--group-add "$gid"); done
-    env_args+=(-e "UBSM_INCLUDE_DIR=${UBSM_INCLUDE_DIR:-$sdk_root/include}"
-               -e "UBSM_LIBRARY=${UBSM_LIBRARY:-$sdk_root/lib/libubsm_sdk.so}")
-    # Mount the known vendor dependencies individually, never replace /usr/lib64.
-    for lib in /usr/lib64/libubse-client.so* /usr/lib64/libobmm.so*; do
-      if [[ -f $lib ]]; then run_args+=(-v "$lib:$lib:ro"); fi
+    resolve_sdk
+    # Explicit headers/library may be outside the SDK root. Mount just the
+    # selected files/directories, not the host's complete system library tree.
+    include_real=$(readlink -f -- "$UBSM_INCLUDE_DIR")
+    library_real=$(readlink -f -- "$UBSM_LIBRARY")
+    run_args+=(-v "$include_real:$include_real:ro" -v "$library_real:$library_real:ro")
+    env_args+=(-e "UBSM_INCLUDE_DIR=$include_real" -e "UBSM_LIBRARY=$library_real")
+    # Copy the full resolved vendor dependency closure into an isolated bundle.
+    # Do not overlay host glibc/GCC libraries onto the compilation image.
+    mkdir -p "$ROOT/build/ub-runtime"
+    bundle_parent=$(mktemp -d "$ROOT/build/ub-runtime/run-XXXXXX")
+    bundle="$bundle_parent/lib"
+    extra_args=()
+    IFS=: read -r -a extra_libs <<< "${UB_EXTRA_LIBRARIES:-}"
+    for lib in "${extra_libs[@]}"; do
+      [[ -z $lib ]] || extra_args+=(--extra "$lib")
     done
+    LD_LIBRARY_PATH="$(dirname -- "$library_real"):$sdk_root/lib:$sdk_root/lib64${UB_EXTRA_LIBRARY_DIRS:+:$UB_EXTRA_LIBRARY_DIRS}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+      python3 "$ROOT/tests/two-process-ycsb/collect_ub_runtime.py" \
+        --library "$library_real" --output "$bundle" "${extra_args[@]}"
+    run_args+=(-v "$bundle:$bundle:ro")
+    env_args+=(-e "UBSM_RUNTIME_LIBRARY_DIR=$bundle")
     if [[ -n ${UB_DOCKER_ARGS_FILE:-} ]]; then
       [[ -r $UB_DOCKER_ARGS_FILE ]] || { echo "Cannot read $UB_DOCKER_ARGS_FILE" >&2; exit 2; }
       while IFS= read -r arg || [[ -n $arg ]]; do
@@ -83,12 +129,21 @@ if [[ -z $provider ]]; then
   echo 'Specify the local UB topology hostname as argument 1 or UBSM_PROVIDER_HOST; see --help.' >&2
   exit 2
 fi
-export UBSM_INCLUDE_DIR=${UBSM_INCLUDE_DIR:-/usr/local/ubs_mem/include}
-export UBSM_LIBRARY=${UBSM_LIBRARY:-/usr/local/ubs_mem/lib/libubsm_sdk.so}
-for file in "$UBSM_INCLUDE_DIR/ubs_mem.h" "$UBSM_INCLUDE_DIR/ubs_mem_def.h" "$UBSM_LIBRARY"; do
-  if [[ ! -r $file ]]; then echo "Missing UBSM SDK file: $file" >&2; exit 2; fi
-done
-export LD_LIBRARY_PATH="$(dirname -- "$UBSM_LIBRARY")${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+resolve_sdk
+export LD_LIBRARY_PATH="${UBSM_RUNTIME_LIBRARY_DIR:+$UBSM_RUNTIME_LIBRARY_DIR:}$(dirname -- "$UBSM_LIBRARY")${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+echo "UBSM headers: $UBSM_INCLUDE_DIR"
+echo "UBSM library: $UBSM_LIBRARY"
+# Show missing transitive libraries before starting a build with redirected logs.
+if ! sdk_deps=$(ldd -r "$UBSM_LIBRARY" 2>&1); then
+  printf '%s\n' "$sdk_deps" >&2
+  echo 'Cannot load UBSM SDK in this environment; check its architecture and dependencies.' >&2
+  exit 2
+fi
+if [[ $sdk_deps == *"not found"* || $sdk_deps == *"undefined symbol"* ]]; then
+  printf '%s\n' "$sdk_deps" >&2
+  echo 'Unresolved UBSM dependency/symbol above; verify matching SDK dependency versions. Host glibc/GCC are intentionally not copied.' >&2
+  exit 2
+fi
 export HCOM_CONNECTION_RETRY_TIMES=${HCOM_CONNECTION_RETRY_TIMES:-2}
 cd "$ROOT"
 output=${OUTPUT:-build/ub-single-$(date +%Y%m%d-%H%M%S)-$$}

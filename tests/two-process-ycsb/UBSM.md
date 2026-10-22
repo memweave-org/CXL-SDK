@@ -76,8 +76,27 @@ UB_IMAGE=shm-pcc-sdk:ub-glibc2.39-gcc12.3.1 \
 UID/GID、附加组、网络及 hostname，挂载 `/run`（只读，连接宿主机服务 socket）和
 `/dev`。OBMM 在创建对象后动态生成设备节点，因此允许字符设备读写访问；实际设备
 文件权限仍由宿主机用户/组控制。宿主机需要已安装 SDK、启动 UB 服务，用户具备
-`ubsmd` 组权限。脚本自动单独挂载 `/usr/lib64` 下的 `libubse-client.so*` 和
-`libobmm.so*`（存在时），不会覆盖整个系统库目录。
+`ubsmd` 组权限。脚本自动解析宿主机 `libubsm_sdk.so` 的动态依赖链，将 SDK 及
+配套依赖复制到 `build/ub-runtime/run-*/lib`，只读挂载进容器；清单保存在其中的
+`manifest.json`。镜像继续使用自己的 glibc、动态加载器、libstdc++ 和 libgcc，
+不会用宿主机系统库覆盖它们。容器内先执行 `ldd -r`，缺库或未解析符号会直接打印
+到终端，检查通过后再编译。缺少 `memset_s`、HCOM 符号时，应检查配套依赖是否
+被解析及其版本是否与 SDK 匹配；不能仅凭库名相同判断 ABI 兼容。
+
+SDK 默认路径为 `/usr/local/ubs_mem`，同时支持 `lib`、`lib64`，以及只有一个实际
+版本库文件、没有无版本 `.so` 链接的情况。CMake 使用完整文件路径链接，并配置
+SDK 与依赖目录的链接时和运行时搜索路径。需要额外库搜索目录时，可设置：
+
+```sh
+UB_EXTRA_LIBRARY_DIRS=/实际HCOM目录/lib:/实际安全C库目录/lib \
+UB_IMAGE=shm-pcc-sdk:ub-glibc2.39-gcc12.3.1 \
+./tests/two-process-ycsb/run_ub_single.sh 实际本机UB拓扑主机名 2 4
+```
+
+通过 `dlopen` 加载、没有声明在 ELF 依赖中的插件不能自动推断，可用
+`UB_EXTRA_LIBRARIES=/完整插件路径.so:/另一个插件.so` 显式收集其依赖。
+这些选项不强行预加载库，不会掩盖 SDK 未正确链接依赖或版本不匹配的问题。
+宿主机无法解析的依赖会在创建容器前报错。
 
 如果现场服务 socket 位于其他目录，或 SDK 还有额外依赖，可设置
 `UB_DOCKER_ARGS_FILE=/绝对路径/docker-args.txt`；文件每行是一个完整 Docker 参数，

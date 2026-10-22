@@ -23,12 +23,28 @@ if(UB_API STREQUAL "memlink")
   target_link_libraries(shm-lib PUBLIC "${UB_MEMLINK_LIBRARY}")
 elseif(UB_API STREQUAL "ubsm")
   find_path(UBSM_INCLUDE_DIR NAMES ubs_mem.h HINTS /usr/local/ubs_mem/include)
-  find_library(UBSM_LIBRARY NAMES ubsm_sdk HINTS /usr/local/ubs_mem/lib)
+  find_library(UBSM_LIBRARY NAMES ubsm_sdk HINTS /usr/local/ubs_mem/lib /usr/local/ubs_mem/lib64)
   if(NOT EXISTS "${UBSM_INCLUDE_DIR}/ubs_mem.h" OR
      NOT EXISTS "${UBSM_INCLUDE_DIR}/ubs_mem_def.h" OR NOT EXISTS "${UBSM_LIBRARY}")
     message(FATAL_ERROR "UB_API=ubsm requires matching UBSM_INCLUDE_DIR and UBSM_LIBRARY; no fallback")
   endif()
   target_include_directories(shm-lib PRIVATE "${UBSM_INCLUDE_DIR}")
   target_compile_definitions(shm-lib PUBLIC SHM_LIB_WITH_UBSM SHM_DISABLE_CAS128)
-  target_link_libraries(shm-lib PUBLIC "${UBSM_LIBRARY}")
+  # Keep the exact vendor file even when it has no SONAME or only a versioned
+  # filename. CMake may otherwise turn a shared-library path into -lubsm_sdk.
+  get_filename_component(_ubsm_library "${UBSM_LIBRARY}" REALPATH)
+  get_filename_component(_ubsm_library_dir "${_ubsm_library}" DIRECTORY)
+  add_library(shm_ubsm_sdk UNKNOWN IMPORTED)
+  set_target_properties(shm_ubsm_sdk PROPERTIES IMPORTED_LOCATION "${_ubsm_library}")
+  target_link_libraries(shm-lib PUBLIC shm_ubsm_sdk)
+  target_link_options(shm-lib INTERFACE
+    "LINKER:-rpath,${_ubsm_library_dir}"
+    "LINKER:-rpath-link,${_ubsm_library_dir}")
+  if(NOT "$ENV{UBSM_RUNTIME_LIBRARY_DIR}" STREQUAL "")
+    target_link_options(shm-lib INTERFACE
+      "LINKER:-rpath-link,$ENV{UBSM_RUNTIME_LIBRARY_DIR}"
+      "LINKER:-rpath,$ENV{UBSM_RUNTIME_LIBRARY_DIR}")
+  endif()
+  message(STATUS "UBSM headers: ${UBSM_INCLUDE_DIR}")
+  message(STATUS "UBSM library: ${_ubsm_library}")
 endif()

@@ -7,7 +7,7 @@ static bool owner;
 void index_open(Handles& h, bool create, int threads) {
   owner = create;
   if (create) {
-    tree = new (cacheable.malloc(sizeof(Index))) Index();
+    tree = new (shared_atomic_memory().malloc(sizeof(Index))) Index();
     tree->set_thread_num(threads + 1); h.object=tree;
   } else tree=static_cast<Index*>(h.object);
 }

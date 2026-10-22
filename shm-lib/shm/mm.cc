@@ -21,6 +21,10 @@
 #endif
 
 MemoryManager cacheable;
+MemoryManager ub_atomic_memory(true);
+MemoryManager::MemoryManager(bool atomic)
+  : memkind_pool(nullptr), backend_(atomic ? CacheableAllocatorBackend::UbAtomic : CacheableAllocatorBackend::UbCache),
+    base(nullptr), size(0), allocator(nullptr) {}
 #ifdef ENABLE_UNCACHE_MEM
 MemoryManager uncacheable;
 #endif
@@ -249,6 +253,8 @@ bool MemoryManager::owns_memkind_pointer(const void *ptr) const {
 }
 
 void *MemoryManager::malloc(size_t size) {
+  if (backend_ == CacheableAllocatorBackend::UbCache || backend_ == CacheableAllocatorBackend::UbAtomic)
+    return ub_arena_allocate(backend_ == CacheableAllocatorBackend::UbAtomic, size);
   if (backend_ == CacheableAllocatorBackend::Cxlalloc) {
 #ifdef SHM_LIB_WITH_CXLALLOC
     ensure_cxlalloc_thread_for_current();
@@ -307,6 +313,10 @@ void *MemoryManager::malloc(size_t size) {
 
 int MemoryManager::posix_memalign(void **memptr, size_t alignment,
                                   size_t size) {
+  if (backend_ == CacheableAllocatorBackend::UbCache || backend_ == CacheableAllocatorBackend::UbAtomic) {
+    try { *memptr = ub_arena_allocate(backend_ == CacheableAllocatorBackend::UbAtomic, size, alignment); return 0; }
+    catch (const std::bad_alloc&) { *memptr = nullptr; return ENOMEM; }
+  }
   if (backend_ == CacheableAllocatorBackend::Cxlalloc) {
 #ifdef SHM_LIB_WITH_CXLALLOC
     ensure_cxlalloc_thread_for_current();
@@ -351,6 +361,8 @@ int MemoryManager::posix_memalign(void **memptr, size_t alignment,
 }
 
 int MemoryManager::clalign(void **memptr, size_t size) {
+  if (backend_ == CacheableAllocatorBackend::UbCache || backend_ == CacheableAllocatorBackend::UbAtomic)
+    return posix_memalign(memptr, 64, size);
   if (backend_ == CacheableAllocatorBackend::Cxlalloc) {
 #ifdef SHM_LIB_WITH_CXLALLOC
     ensure_cxlalloc_thread_for_current();
@@ -394,6 +406,7 @@ int MemoryManager::clalign(void **memptr, size_t size) {
 }
 
 void MemoryManager::free(void *ptr) {
+  if (backend_ == CacheableAllocatorBackend::UbCache || backend_ == CacheableAllocatorBackend::UbAtomic) return;
   // Explicit benchmark lifetime policy: no cross-process allocator frees.
   if (retain_shared_) return;
   if (ptr == nullptr) {

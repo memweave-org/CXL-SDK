@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <new>
+#include <utility>
 
 #ifndef CACHE_LINE_SIZE
 #define CACHE_LINE_SIZE (64)
@@ -52,6 +53,8 @@ struct CxlallocCacheableTag {};
 enum class CacheableAllocatorBackend {
   Memkind = 0,
   Cxlalloc = 1,
+  UbCache = 2,
+  UbAtomic = 3,
 };
 
 struct CacheableInitParams {
@@ -71,6 +74,7 @@ struct CacheableInitParams {
 class MemoryManager {
 public:
   MemoryManager();
+  explicit MemoryManager(bool ub_atomic);
   MemoryManager(SystemMemoryMmapper *allocator, void *base, size_t size);
   explicit MemoryManager(CxlallocCacheableTag, size_t reported_size_bytes);
   MemoryManager(const MemoryManager &other) = delete;
@@ -106,6 +110,17 @@ private:
 };
 
 extern MemoryManager cacheable;
+extern MemoryManager ub_atomic_memory;
+inline MemoryManager& shared_atomic_memory(MemoryManager& fallback = cacheable) {
+#ifdef SHM_UB_SPLIT
+  return ub_atomic_memory;
+#else
+  return fallback;
+#endif
+}
+template<class T, class... Args> T& make_shared_atomic(Args&&... args) {
+  return *new (shared_atomic_memory().malloc(sizeof(T))) T(std::forward<Args>(args)...);
+}
 #ifdef ENABLE_UNCACHE_MEM
 extern MemoryManager uncacheable;
 #endif
@@ -121,14 +136,14 @@ public:
     if (n > std::numeric_limits<size_t>::max() / sizeof(T)) {
       throw std::bad_alloc();
     }
-    T *ptr = static_cast<T *>(cacheable.malloc(n * sizeof(T)));
+    T *ptr = static_cast<T *>(shared_atomic_memory().malloc(n * sizeof(T)));
     if (ptr == nullptr) {
       throw std::bad_alloc();
     }
     return ptr;
   }
 
-  void deallocate(T *p, size_t n) { cacheable.free(p); }
+  void deallocate(T *p, size_t n) { shared_atomic_memory().free(p); }
 };
 
 template <typename T, typename U>

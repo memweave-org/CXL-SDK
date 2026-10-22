@@ -202,8 +202,11 @@ public:
 
 #ifdef NO_CC
     inline value_type *addr(bool nt = true) {
-      return (value_type *)(p.load(std::memory_order_seq_cst, nt) &
-                            0xFFFFFFFFFFFF);
+      auto* value = (value_type *)(p.load(std::memory_order_seq_cst, nt) & 0xFFFFFFFFFFFF);
+#ifdef SHM_UB_SPLIT
+      if (value) clflush(value, sizeof(value_type));
+#endif
+      return value;
     }
 
     inline partial_t partial(bool nt = true) {
@@ -260,7 +263,11 @@ public:
     ~KV_entry_ptr_s() {}
 
     inline value_type *addr(bool nt = true) {
-      return (value_type *)(p & 0xFFFFFFFFFFFF);
+      auto* value = (value_type *)(p & 0xFFFFFFFFFFFF);
+#ifdef SHM_UB_SPLIT
+      if (value) clflush(value, sizeof(value_type));
+#endif
+      return value;
     }
 
     inline partial_t partial(bool nt = true) { return p >> 48; }
@@ -292,7 +299,7 @@ public:
 
     void allocate(uint64_t capacity) {
 #ifdef USE_CXL
-      this->buckets = new (cacheable.malloc(capacity * sizeof(bucket))) bucket[capacity];
+      this->buckets = new (shared_atomic_memory().malloc(capacity * sizeof(bucket))) bucket[capacity];
       if (this->buckets == nullptr) {
         printf("Failed to allocate memory for level_bucket, size=%lu\n", capacity);
         exit(1);
@@ -304,7 +311,7 @@ public:
 
     void clear() {
 #ifdef USE_CXL
-      cacheable.free(buckets);
+      shared_atomic_memory().free(buckets);
 #else
       delete[] buckets;
 #endif
@@ -384,7 +391,7 @@ public:
   }
 
 #ifdef USE_CXL
-  clevel_hash() : meta(new (cacheable.malloc(sizeof(level_meta))) level_meta()), thread_num(0) {
+  clevel_hash() : meta(new (shared_atomic_memory().malloc(sizeof(level_meta))) level_meta()), thread_num(0) {
 #else
   clevel_hash() : meta(new level_meta()), thread_num(0) {
 #endif
@@ -407,7 +414,7 @@ public:
     size_t capacity;
 
 #ifdef USE_CXL
-    tmp = new (cacheable.malloc(sizeof(level_bucket))) level_bucket();
+    tmp = new (shared_atomic_memory().malloc(sizeof(level_bucket))) level_bucket();
 #else
     tmp = new level_bucket();
 #endif
@@ -418,7 +425,7 @@ public:
     m->first_level = tmp;
 
 #ifdef USE_CXL
-    tmp = new (cacheable.malloc(sizeof(level_bucket))) level_bucket();
+    tmp = new (shared_atomic_memory().malloc(sizeof(level_bucket))) level_bucket();
 #else
     tmp = new level_bucket();
 #endif
@@ -443,7 +450,7 @@ public:
   static void destroy_shared_value(value_type *value) {
     if (value) {
       value->~value_type();
-      cacheable.free(value);
+      shared_atomic_memory().free(value);
     }
   }
 
@@ -451,6 +458,9 @@ public:
                                          const void *param) {
     const value_type *tmp_value = static_cast<const value_type *>(param);
     value_type *real_value = new (cacheable.malloc(sizeof(value_type))) value_type(*tmp_value);
+#ifdef SHM_UB_SPLIT
+    clwb(real_value, sizeof(value_type));
+#endif
     KV_ptr = real_value;
   }
 
@@ -572,7 +582,7 @@ public:
     for (size_type i = 0; i < thread_num; i++) {
       meta_replicas[i].store(meta.load());
     }
-    help_update = new (cacheable.malloc(sizeof(HelpUpdate<level_meta>))) HelpUpdate<level_meta>(meta, meta_replicas, thread_num);
+    help_update = new (shared_atomic_memory().malloc(sizeof(HelpUpdate<level_meta>))) HelpUpdate<level_meta>(meta, meta_replicas, thread_num);
 #endif
   }
 
@@ -1411,7 +1421,7 @@ void clevel_hash<Key, T, Hash, KeyEqual, HashPower>::expand(
 
   if (cl->up.load() == nullptr) {
 #ifdef USE_CXL
-    tmp_level[t_id] = new (cacheable.malloc(sizeof(struct level_bucket))) level_bucket();
+    tmp_level[t_id] = new (shared_atomic_memory().malloc(sizeof(struct level_bucket))) level_bucket();
     if (tmp_level[t_id] == nullptr) {
       printf("Thread-%lu: Failed to allocate memory for level_bucket\n", thread_id);
       exit(1);
@@ -1441,7 +1451,7 @@ void clevel_hash<Key, T, Hash, KeyEqual, HashPower>::expand(
       // Ohter threads finished expanding
       tmp_level[t_id]->clear();
 #ifdef USE_CXL
-      cacheable.free(tmp_level[t_id]);
+      shared_atomic_memory().free(tmp_level[t_id]);
 #else
       delete tmp_level[t_id];
 #endif
@@ -1453,7 +1463,7 @@ void clevel_hash<Key, T, Hash, KeyEqual, HashPower>::expand(
         // Help updating meta
 #ifdef USE_CXL
         tmp_meta[t_id] =
-            new (cacheable.malloc(sizeof(level_meta))) level_meta(m_copy->first_level, m_copy->last_level, true);
+            new (shared_atomic_memory().malloc(sizeof(level_meta))) level_meta(m_copy->first_level, m_copy->last_level, true);
 #else
         tmp_meta[t_id] = new level_meta(m_copy->first_level, m_copy->last_level, true);
 #endif
@@ -1461,7 +1471,7 @@ void clevel_hash<Key, T, Hash, KeyEqual, HashPower>::expand(
 #ifdef USE_CXL
         assert(cl->up.load() != nullptr);
         tmp_meta[t_id] =
-            new (cacheable.malloc(sizeof(level_meta))) level_meta(cl->up.load(), m_copy->last_level, true);
+            new (shared_atomic_memory().malloc(sizeof(level_meta))) level_meta(cl->up.load(), m_copy->last_level, true);
 #else
         tmp_meta[t_id] = new level_meta(cl->up.load(), m_copy->last_level, true);
 #endif
@@ -1494,7 +1504,7 @@ void clevel_hash<Key, T, Hash, KeyEqual, HashPower>::expand(
           // CAS fails because other threads help updating
           // meta
 #ifdef USE_CXL
-          cacheable.free(tmp_meta[t_id]);
+          shared_atomic_memory().free(tmp_meta[t_id]);
 #else
           delete tmp_meta[t_id];
 #endif
@@ -1518,14 +1528,14 @@ void clevel_hash<Key, T, Hash, KeyEqual, HashPower>::expand(
         if (cl->capacity >= new_capacity) {
 #ifdef USE_CXL  
           tmp_meta[t_id] =
-              new (cacheable.malloc(sizeof(level_meta))) level_meta(m_copy->first_level, m_copy->last_level, true);
+              new (shared_atomic_memory().malloc(sizeof(level_meta))) level_meta(m_copy->first_level, m_copy->last_level, true);
 #else
         tmp_meta[t_id] = new level_meta(m_copy->first_level, m_copy->last_level, true);
 #endif
         } else {
           assert(cl->up != nullptr);
 #ifdef USE_CXL
-          tmp_meta[t_id] = new (cacheable.malloc(sizeof(level_meta))) level_meta(cl->up, m_copy->last_level, true);
+          tmp_meta[t_id] = new (shared_atomic_memory().malloc(sizeof(level_meta))) level_meta(cl->up, m_copy->last_level, true);
 #else
           tmp_meta[t_id] = new level_meta(cl->up, m_copy->last_level, true);
 #endif
@@ -1556,7 +1566,7 @@ void clevel_hash<Key, T, Hash, KeyEqual, HashPower>::expand(
             // CAS fails because other threads help
             // updating meta
 #ifdef USE_CXL
-            cacheable.free(tmp_meta[t_id]);
+            shared_atomic_memory().free(tmp_meta[t_id]);
 #else
             delete tmp_meta[t_id];
 #endif
@@ -1669,7 +1679,7 @@ void clevel_hash<Key, T, Hash, KeyEqual, HashPower>::resize() {
             li = li->up;
           }
 #ifdef USE_CXL
-          tmp_meta[t_id] = new (cacheable.malloc(sizeof(level_meta))) level_meta(m->first_level, bl->up, levels_left != 2);
+          tmp_meta[t_id] = new (shared_atomic_memory().malloc(sizeof(level_meta))) level_meta(m->first_level, bl->up, levels_left != 2);
 #else
           tmp_meta[t_id] = new level_meta(m->first_level, bl->up, levels_left != 2);
 #endif
@@ -1694,7 +1704,7 @@ void clevel_hash<Key, T, Hash, KeyEqual, HashPower>::resize() {
             break;
           } else {
 #ifdef USE_CXL
-            cacheable.free(tmp_meta[t_id]);
+            shared_atomic_memory().free(tmp_meta[t_id]);
 #else
             delete tmp_meta[t_id];
 #endif

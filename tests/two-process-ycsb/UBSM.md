@@ -58,23 +58,27 @@ A 的两个进程映射同名对象并访问 B 的内存。B 需要 UB 服务及
 启动 benchmark worker 或 SSH 登录。`UBSM_PROVIDER_NUMA` 指 B 的内存 NUMA。
 两台机器上的进程各运行一个是另一种实验，需要使用下文的 `--host`。
 
-当前 `ONLY_IMPORT_NONCACHE | WR_DELAY_COMP` 在 provider 上给出 cacheable 映射，
-在 importer 上给出 NonCacheable 映射。因此 A 运行、B 供内存时，A 的两个进程
-都使用 NC 映射；本配置并不提供远端 cacheable CAS 内存。若填 A，则是本地
-cacheable UB 映射，不能用于验证远端导入。真实远端 NC 上的 CAS/分配器行为仍需
-硬件验证，不能由本地测试替身结果证明。`results.json` 记录的是请求的 provider，
-不是 SDK 查询确认的物理落点。
+### Cacheable 数据与 NC 原子区域
 
-两个进程共用这块 UB 对象；全局 `cacheable`
-分配器的两个分区均来自该映射，BwTree 映射表和 ClevelHash 桶等共享 CAS 目标也
-从中分配，不需要另建普通 DRAM 池。UB 严格分配模式检查返回地址及长度，越界即失败。
-每个 worker 启动时还会对同一个 UB 分配的 64-bit 字做 CAS，确认最终值为 2，打印
-`UB_CAS_PROBE ... simulated_latency=off`；协调器要求双方均通过此检查。
+单机入口现在默认使用混合布局：数据对象以 `UBSM_FLAG_CACHE` 创建，另一个
+`名字-nc` 对象以 `UBSM_FLAG_NONCACHE | UBSM_FLAG_WR_DELAY_COMP` 创建。
+两端都映射这两个对象；数据可在两端缓存且依赖软件显式缓存维护，原子目标不缓存。
+这与之前的 ONLY_IMPORT_NONCACHE 布局不同。
 
-API 中另有 `UBSM_FLAG_CACHE`，但文档要求它配合 `ubsmem_shmem_set_ownership`
-并禁用 BIOS snoop，不能直接替换当前模式来实现跨主机 cacheable 并发 CAS。
-双机时远端仍为 NC，不能由变量名 `cacheable` 推断远端页属性。
-UBSM 和 Memlink 构建均跳过 CAS/load/store 的模拟排队延迟；非 UB 构建保留原模拟逻辑。
+默认数据区 1024 MiB（`SIZE_MB`），NC 区 512 MiB（`ATOMIC_SIZE_MB`）。每个对象
+划分两个进程各自的分配区。BwTree 节点、ClevelHash KV 和 value 在数据区；共享
+索引头、映射表、桶槽、同步变量、复制元数据，以及节点内拆出的原子字段在 NC 区。
+详细放置、ownership、验证边界见 [UB_SPLIT.md](UB_SPLIT.md)。
+
+CACHE 模式仍需遵守厂商的 BIOS/ownership 条件（API 要求 BIOS 不配置 snoop）。
+每个进程 map 后申请本地 RW ownership，所有 worker 和扩容线程停止访问后释放
+ownership 再 unmap。实际 SDK 是否允许目标部署中各进程同时取得 RW 映射，以及
+跨机缓存维护是否有效，必须在真实 UB 上验证；替身不能证明这些硬件语义。
+
+UBSM 构建不模拟 CAS 延迟。其他后端和 `--ub-layout legacy` 保留原布局。
+`run.py` 默认 `--ub-layout auto`：仅 BwTree/ClevelHash OPT/NOOPT 使用混合布局；
+Sherman、RPC、CC case 继续使用旧路径。可显式 `--ub-layout split`，不支持的 case
+会报错，不会偷偷改成 legacy。单机脚本显式指定 split。
 
 也可以直接指定镜像，脚本自动创建临时容器、编译并运行，结束后删除容器：
 
@@ -178,8 +182,9 @@ python3 tests/two-process-ycsb/run.py \
 
 `--shared-path` 在 UBSM 模式是名称前缀，不是已有对象名。每个 case 会追加随机后缀，
 准确名字实时打印并写入 results.json。A 是 provider，B 不分配第二个对象。两端映射
-相同物理对象到 `0x400000000000`；前 8 MiB 是控制区，剩余内存划为两个独立 memkind
-分区。B 的分配分区仍物理位于 A，不能解释为对称 NUMA 实验。
+相同物理对象到 `0x400000000000`；混合布局另有固定地址 `0x500000000000` 的 NC 对象，其中前 8 MiB 是控制区。
+两个对象均由指定 provider 提供，不是对称 NUMA 实验；混合布局使用按进程划分的
+只增分配区，legacy 使用原 memkind 分区。
 
 宿主机运行必须具备与 Docker 产物兼容的 glibc/依赖。若需要也在 Docker 内运行，
 在两机预先启动同名且具备厂商规定设备、UDS、组权限和 SDK 依赖的容器，例如 `ub-ycsb`，
@@ -198,9 +203,9 @@ HCOM_CONNECTION_RETRY_TIMES；普通 SSH 不保证传递本地环境变量。超
 - 最新 API 路径：init_attributes → initialize → allocate_with_provider（仅管理进程）/
   map（两个 worker）→ unmap → finalize；双方成功且确认 unmap 后，管理进程 deallocate。
 - map 请求整个对象、offset=0、MAP_SHARED | MAP_FIXED_NOREPLACE；返回错误地址直接失败。
-- 固定创建 flag 为 ONLY_IMPORT_NONCACHE | WR_DELAY_COMP：owner cacheable、remote NC。
-  此构建关闭软件缓存维护和模拟 CXL 延迟，保留屏障；ARM 屏障使用 dmb sy。
-  禁止 128 位 CAS/快照，不能切换 flag 绕过硬件要求。
+- 混合布局：CACHE 数据 + NONCACHE/WR_DELAY_COMP 原子；数据区执行缓存维护，NC 区跳过。
+  legacy 布局继续 ONLY_IMPORT_NONCACHE/WR_DELAY_COMP。两种布局都关闭模拟延迟，
+  保留屏障并禁止 128 位 CAS/快照。
 - ClevelHash 创建方先停止并 join 后台扩容线程，再 unmap。测试保持进程生命周期分配策略，
   不启用跨进程 memkind free/BwTree 后台 GC；这不是完整论文性能复现。
 - 任一创建、worker、映射、解除映射或 finalize 失败，均不自动释放/复用对象。

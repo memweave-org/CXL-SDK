@@ -1,5 +1,6 @@
 #pragma once
 #include "compiler.h"
+#include "shm/ub.h"
 #include "bypass_cache.h"
 #include <array>
 #include <atomic>
@@ -66,6 +67,9 @@ private:
   template <time_point ProcessTime>
   static inline void pend_req(const void *addr) {
 #if defined(SHM_LIB_WITH_UBSM) || defined(SHM_LIB_WITH_UB)
+#ifdef SHM_UB_SPLIT
+    ub_assert_atomic_target(addr);
+#endif
     // Real UB (UBSM or Memlink): preserve ordering without simulated latency.
     mfence();
 #else
@@ -172,6 +176,9 @@ public:
   void flush() { AtomicRequestQueue::pend_store_req(&value); }
 
   T fetch_add(T i, bool nt = true) {
+#ifdef SHM_UB_SPLIT
+    ub_assert_atomic_target(&value);
+#endif
     T old_value;
     old_value = __atomic_fetch_add(&value, i, __ATOMIC_SEQ_CST);
     if (nt) {
@@ -181,6 +188,9 @@ public:
   }
 
   T fetch_sub(T i, bool nt = true) {
+#ifdef SHM_UB_SPLIT
+    ub_assert_atomic_target(&value);
+#endif
     T old_value;
     old_value = __atomic_fetch_sub(&value, i, __ATOMIC_SEQ_CST);
     if (nt) {
@@ -190,6 +200,9 @@ public:
   }
 
   T fetch_xor(T i, bool nt = true) {
+#ifdef SHM_UB_SPLIT
+    ub_assert_atomic_target(&value);
+#endif
     T old_value;
     old_value = __atomic_fetch_xor(&value, i, __ATOMIC_SEQ_CST);
     if (nt) {
@@ -203,6 +216,9 @@ public:
                           std::memory_order __m = std::memory_order_seq_cst,
                           bool nt = true) {
 
+#ifdef SHM_UB_SPLIT
+    ub_assert_atomic_target(&value);
+#endif
     bool equal =
         __atomic_compare_exchange_n(&value, &expected, desired, 0, (int)__m,
                                     (int)std::__cmpexch_failure_order(__m));
@@ -288,6 +304,9 @@ public:
   }
 
   T fetch_add(T i, bool nt = true) {
+#ifdef SHM_UB_SPLIT
+    ub_assert_atomic_target(&value);
+#endif
     T old_value;
     old_value = __atomic_add_fetch(&value, i, __ATOMIC_SEQ_CST);
     if (nt) {
@@ -297,6 +316,9 @@ public:
   }
 
   T fetch_sub(T i, bool nt = true) {
+#ifdef SHM_UB_SPLIT
+    ub_assert_atomic_target(&value);
+#endif
     T old_value;
     old_value = __atomic_fetch_sub(&value, i, __ATOMIC_SEQ_CST);
     if (nt) {
@@ -306,6 +328,9 @@ public:
   }
 
   T fetch_xor(T i, bool nt = true) {
+#ifdef SHM_UB_SPLIT
+    ub_assert_atomic_target(&value);
+#endif
     T old_value;
     old_value = __atomic_fetch_xor(&value, i, __ATOMIC_SEQ_CST);
     if (nt) {
@@ -318,6 +343,9 @@ public:
   compare_exchange_strong(T &expected, T desired,
                           std::memory_order __m = std::memory_order_seq_cst,
                           bool nt = true) {
+#ifdef SHM_UB_SPLIT
+    ub_assert_atomic_target(&value);
+#endif
     bool equal =
         __atomic_compare_exchange_n(&value, &expected, desired, 0, (int)__m,
                                     (int)std::__cmpexch_failure_order(__m));

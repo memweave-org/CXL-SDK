@@ -76,6 +76,9 @@ class nt_pointer {
       bool nt = false
 #endif
       ) {
+#ifdef SHM_UB_SPLIT
+    ub_assert_atomic_target(&ptr);
+#endif
     bool equal =
         __atomic_compare_exchange_n(&ptr, &expected, desired, 0, (int)__m,
                                     (int)std::__cmpexch_failure_order(__m));
@@ -259,6 +262,9 @@ class nt_pointer<T[]> {
       bool nt = false
 #endif
       ) {
+#ifdef SHM_UB_SPLIT
+    ub_assert_atomic_target(&ptr);
+#endif
     bool equal =
         __atomic_compare_exchange_n(&ptr, &expected, desired, 0, (int)__m,
                                     (int)std::__cmpexch_failure_order(__m));

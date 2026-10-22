@@ -28,6 +28,8 @@ def main():
     p.add_argument('--memory', choices=['file', 'cxl', 'ub'], default='ub' if os.getenv('SHM_UB_API', 'none') != 'none' else 'file')
     p.add_argument('--shared-path', help='CXL device / existing Memlink object / UBSM unique-name prefix')
     p.add_argument('--ub-api', choices=['none', 'memlink', 'ubsm'], default=os.getenv('SHM_UB_API'))
+    p.add_argument('--ub-layout', choices=['auto','split','legacy'], default='auto')
+    p.add_argument('--atomic-size-mb', type=int, default=512)
     p.add_argument('--ub-library', help='matching vendor library for the selected API')
     p.add_argument('--ub-include', default=os.getenv('UBSM_INCLUDE_DIR'), help='directory containing latest UBSM headers')
     p.add_argument('--provider-host', default=os.getenv('UBSM_PROVIDER_HOST'), help='owner hostname from UBS Engine topology')
@@ -45,6 +47,10 @@ def main():
         p.error('--memory ub requires --ub-api memlink|ubsm; file/cxl require --ub-api none')
     a.ub_library = a.ub_library or os.getenv('UBSM_LIBRARY' if a.ub_api == 'ubsm' else 'UB_MEMLINK_LIBRARY')
     prefix = shlex.split(a.worker_prefix)
+    if a.atomic_size_mb < 128 or a.atomic_size_mb % 4:
+        p.error("atomic-size-mb must be >=128 and a multiple of 4")
+    if a.ub_layout == "split" and a.ub_api != "ubsm":
+        p.error("split layout requires UBSM")
     if a.timeout < 1 or not 0 <= a.provider_numa <= 4294967295:
         p.error('timeout must be positive and provider-numa must fit uint32')
     if len(a.threads) not in (1, 2):
@@ -64,22 +70,25 @@ def main():
             p.error('UBSM requires --provider-host (the physical owner in the UB topology)')
         if a.size_mb % 4:
             p.error('UBSM size-mb must be a multiple of 4')
-        if not a.shared_path.isascii() or len(a.shared_path) > 35 or not all(c.isalnum() or c in '-_' for c in a.shared_path):
-            p.error('UBSM shared-path is a unique-name prefix: 1..35 ASCII letters/digits/-/_')
+        if not a.shared_path.isascii() or len(a.shared_path) > 31 or not all(c.isalnum() or c in '-_' for c in a.shared_path):
+            p.error('UBSM shared-path is a unique-name prefix: 1..31 ASCII letters/digits/-/_')
     out = a.output.resolve()
     out.mkdir(parents=True, exist_ok=False)
     spec = ROOT / 'tests/YCSB-C/workloads/workloadb_zipfian.spec'
     results = []
     for case in a.cases:
         system, _, opt = case.partition('-')
-        build = ROOT / 'build/two-ycsb' / (case + ('-' + a.ub_api if a.memory == 'ub' else ''))
+        split = a.ub_api == 'ubsm' and a.ub_layout != 'legacy' and system in ('bwtree','clevelhash') and opt != 'cc'
+        if a.ub_layout == 'split' and not split:
+            p.error('split supports BwTree/ClevelHash OPT/NOOPT only')
+        build = ROOT / 'build/two-ycsb' / (case + ('-' + a.ub_api if a.memory == 'ub' else '') + ('-split' if split else ''))
         exe = build / 'bench'
         if not a.skip_build:
             configure = ['cmake', '-S', str(ROOT/'tests/two-process-ycsb'), '-B', str(build),
                          f'-DSYSTEM={system}', f'-DOPT={"OFF" if opt in ("off", "cc") else "ON"}',
                          f'-DCC={"ON" if opt == "cc" else "OFF"}',
                          f'-DBWTREE_MAPPING_TABLE_BITS={a.mapping_bits}',
-                         '-DWITH_UB=OFF', f'-DUB_API={a.ub_api}']
+                         '-DWITH_UB=OFF', f'-DUB_API={a.ub_api}', f'-DUB_SPLIT={"ON" if split else "OFF"}']
             if a.ub_library:
                 configure += [f'-D{"UBSM_LIBRARY" if a.ub_api == "ubsm" else "UB_MEMLINK_LIBRARY"}={Path(a.ub_library).resolve()}']
             if a.ub_api == 'ubsm' and a.ub_include:
@@ -96,7 +105,7 @@ def main():
             required = {'SYSTEM': system, 'OPT': 'OFF' if opt in ('off', 'cc') else 'ON',
                         'CC': 'ON' if opt == 'cc' else 'OFF',
                         'BWTREE_MAPPING_TABLE_BITS': str(a.mapping_bits),
-                        'WITH_UB': 'OFF', 'UB_API': a.ub_api}
+                        'WITH_UB': 'OFF', 'UB_API': a.ub_api, 'UB_SPLIT': 'ON' if split else 'OFF'}
             if a.memory == 'ub':
                 required['UBSM_LIBRARY' if a.ub_api == 'ubsm' else 'UB_MEMLINK_LIBRARY'] = str(Path(a.ub_library).resolve())
             if a.ub_api == 'ubsm' and a.ub_include:
@@ -124,7 +133,7 @@ def main():
         commands = []
         for i in range(2):
             cmd = [str(exe), str(i), ','.join(map(str,a.threads)), str(a.records), str(a.ops),
-                   str(a.size_mb), path, 'ub' if a.memory == 'ub' else 'file', str(spec), str(token), a.updates]
+                   str(a.size_mb), path, 'ub' if a.memory == 'ub' else 'file', str(spec), str(token), a.updates, str(a.atomic_size_mb)]
             cmd = [*prefix, 'timeout', '--signal=TERM', '--kill-after=5', str(a.timeout), *cmd]
             if i and a.host:
                 # exec preserves the worker's exit status and avoids a masking tee pipeline.
@@ -133,6 +142,7 @@ def main():
         logs, procs = [], []
         event = dict(case=case, commands=commands, executable_sha256=digest,
                      memory=a.memory, ub_api=a.ub_api, shared_object=path, host=a.host, updates=a.updates, mapping_bits=a.mapping_bits,
+                     ub_layout='split' if split else 'legacy', atomic_size_mb=a.atomic_size_mb if split else None,
                      requested_provider_host=a.provider_host if a.ub_api == 'ubsm' else None,
                      requested_provider_numa=a.provider_numa if a.ub_api == 'ubsm' else None,
                      workload_sha256=hashlib.sha256(spec.read_bytes()).hexdigest(), status='running', run_token=token)
@@ -141,10 +151,16 @@ def main():
                 print(f'UBSM object: {path}', flush=True)
                 event['object_state'] = 'creation-attempted'
                 (out/'results.json').write_text(json.dumps([*results, event], indent=2)+'\n')
+                objects = [(path,a.size_mb,['cache']) , (path+'-nc',a.atomic_size_mb,['noncache'])] if split else [(path,a.size_mb,[])]
+                event['objects'] = [dict(name=n, size_mb=sz, mode=mode[0] if mode else 'legacy', state='pending') for n,sz,mode in objects]
                 with (out/f'{case}-admin.log').open('w') as log:
-                    subprocess.run([*prefix, 'timeout', str(a.timeout), str(build/'ub_admin'), 'create',
-                                    path, str(a.size_mb), a.provider_host, str(a.provider_numa)],
-                                   check=True, stdout=log, stderr=subprocess.STDOUT, timeout=a.timeout+10)
+                    for obj,(name,sz,mode) in zip(event['objects'],objects):
+                        obj['state']='creation-attempted'
+                        (out/'results.json').write_text(json.dumps([*results,event],indent=2)+'\n')
+                        subprocess.run([*prefix, 'timeout', str(a.timeout), str(build/'ub_admin'), 'create',
+                                        name, str(sz), a.provider_host, str(a.provider_numa), *mode],
+                                       check=True, stdout=log, stderr=subprocess.STDOUT, timeout=a.timeout+10)
+                        obj['state']='created'
                 event['object_state'] = 'created'
             for i, cmd in enumerate(commands):
                 log = (out/f'{case}-{i}.log').open('w'); logs.append(log)
@@ -167,6 +183,8 @@ def main():
                 ubsm_stub |= 'UBSM_TEST_STUB' in text
                 if a.memory == 'ub' and f'UB_CLOSED api={a.ub_api} id={i}' not in text:
                     raise RuntimeError('Worker did not confirm UB unmap/finalize; retain object')
+                if split and 'UB_LAYOUT split ' not in text:
+                    raise RuntimeError('Worker did not confirm split UB mappings')
                 if a.memory == 'ub' and f'UB_CAS_PROBE id={i} ' not in text:
                     raise RuntimeError('Worker did not validate shared UB CAS storage')
                 lines = [line for line in text.splitlines() if line.startswith('RESULT ')]
@@ -181,15 +199,17 @@ def main():
                 raise RuntimeError('workers did not run in distinct processes')
             if a.ub_api == 'ubsm':
                 with (out/f'{case}-admin.log').open('a') as log:
-                    subprocess.run([*prefix, 'timeout', str(a.timeout), str(build/'ub_admin'), 'destroy', path],
-                                   check=True, stdout=log, stderr=subprocess.STDOUT, timeout=a.timeout+10)
+                    for obj in event['objects']:
+                        subprocess.run([*prefix, 'timeout', str(a.timeout), str(build/'ub_admin'), 'destroy', obj['name']],
+                                       check=True, stdout=log, stderr=subprocess.STDOUT, timeout=a.timeout+10)
+                        obj['state']='destroyed'
                 event['object_state'] = 'destroyed'
             event.update(status='passed', results=rows, memlink_test_stub=memlink_stub, ubsm_test_stub=ubsm_stub)
             print(f'{case}: PASS; PIDs {[r["pid"] for r in rows]}; operations {[r["completed"] for r in rows]}', flush=True)
         except BaseException as error:
             event.update(status='failed', error=str(error))
             if a.ub_api == 'ubsm':
-                print(f'UBSM failure: object {path} may remain; stop both workers before manual cleanup.', flush=True)
+                print(f'UBSM failure: objects {path} / {path}-nc may remain; stop both workers before manual cleanup.', flush=True)
             raise
         finally:
             for proc in procs:

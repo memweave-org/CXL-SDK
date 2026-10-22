@@ -24,7 +24,8 @@ Optional environment:
   UBSM_INCLUDE_DIR     Default /usr/local/ubs_mem/include
   UBSM_LIBRARY         Default /usr/local/ubs_mem/lib/libubsm_sdk.so
   UBSM_PROVIDER_NUMA  Default UINT32_MAX (SDK chooses); set to actual memory NUMA.
-  RECORDS=10000 OPS=10000 SIZE_MB=1024 JOBS=8 TIMEOUT=300
+  RECORDS=10000 OPS=10000 SIZE_MB=1024 ATOMIC_SIZE_MB=512 JOBS=8 TIMEOUT=300
+  BwTree/ClevelHash use CACHE data and a separate NONCACHE atomic arena.
   OUTPUT              New results directory (default unique directory in build/).
 
 Requires vendor SDK, running UB services and device/socket/group access.
@@ -72,7 +73,7 @@ fi
 if [[ -n ${UB_CONTAINER:-} || -n ${UB_IMAGE:-} ]]; then
   env_args=(-e UB_CONTAINER= -e UB_IMAGE=)
   for name in UBSM_PROVIDER_HOST UBSM_PROVIDER_NUMA UBSM_INCLUDE_DIR UBSM_LIBRARY \
-      LD_LIBRARY_PATH UBSM_RUNTIME_LIBRARY_DIR UB_SDK_TEST_MODE HCOM_CONNECTION_RETRY_TIMES RECORDS OPS SIZE_MB JOBS TIMEOUT OUTPUT; do
+      LD_LIBRARY_PATH UBSM_RUNTIME_LIBRARY_DIR UB_SDK_TEST_MODE HCOM_CONNECTION_RETRY_TIMES RECORDS OPS SIZE_MB ATOMIC_SIZE_MB JOBS TIMEOUT OUTPUT; do
     if [[ -v $name ]]; then env_args+=(-e "$name=${!name}"); fi
   done
   if [[ -n ${UB_IMAGE:-} ]]; then
@@ -175,12 +176,13 @@ if [[ -n ${UB_SDK_TEST_MODE:-} ]]; then
   if (( rc == 0 )); then rc=${statuses[1]}; fi
   exit "$rc"
 fi
-echo "UBSM: workers_host=$(hostname), memory_provider=$provider, provider_numa=${UBSM_PROVIDER_NUMA:-4294967295}, threads=${2:-2}/${3:-${2:-2}}"
-echo "Mapping policy: provider=cacheable, importer=noncacheable (ONLY_IMPORT_NONCACHE)."
+echo "UBSM: workers_host=$(uname -n), memory_provider=$provider, provider_numa=${UBSM_PROVIDER_NUMA:-4294967295}, threads=${2:-2}/${3:-${2:-2}}"
+echo "Mapping policy: CACHE data + NONCACHE atomics; atomic arena=${ATOMIC_SIZE_MB:-512} MiB."
 echo "Build logs, worker logs and results.json: $output"
 trap 'rc=$?; if (( rc != 0 )); then echo "Failed; inspect logs in $output. If a UB object was created, confirm workers stopped before manual cleanup." >&2; fi' EXIT
 python3 tests/two-process-ycsb/run.py \
-  --cases bwtree-on clevelhash-on --memory ub --ub-api ubsm \
+  --cases bwtree-on clevelhash-on --memory ub --ub-api ubsm --ub-layout split \
+  --atomic-size-mb "${ATOMIC_SIZE_MB:-512}" \
   --ub-library "$UBSM_LIBRARY" --ub-include "$UBSM_INCLUDE_DIR" \
   --provider-host "$provider" --provider-numa "${UBSM_PROVIDER_NUMA:-4294967295}" \
   --shared-path ub-single --threads "${2:-2}" "${3:-${2:-2}}" \

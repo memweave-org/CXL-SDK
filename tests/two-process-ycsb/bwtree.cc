@@ -3,7 +3,7 @@
 static TreeType* tree;
 void index_open(Handles& h, bool create, int threads) {
   if (create) {
-    tree = new (cacheable.malloc(sizeof(TreeType))) TreeType(false, KeyComparator{1}, KeyEqualityChecker{1});
+    tree = new (shared_atomic_memory().malloc(sizeof(TreeType))) TreeType(false, KeyComparator{1}, KeyEqualityChecker{1});
     tree->UpdateThreadLocal(threads + 1);
     h.object = tree;
   } else tree = static_cast<TreeType*>(h.object);

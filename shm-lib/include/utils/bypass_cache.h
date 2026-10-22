@@ -9,6 +9,7 @@
 #include <iostream>
 
 #include "utils/config.h"
+#include "shm/ub.h"
 
 // Architecture-specific includes
 #ifdef __x86_64__
@@ -45,7 +46,10 @@ static inline void mfence() {
 #ifdef __x86_64__
 // x86_64 implementations
 static inline void clflush(const void* data, size_t len, bool fence = true) {
-#if defined(SHM_LIB_WITH_UBSM)
+#if defined(SHM_UB_SPLIT)
+    ub_cache_maintenance(data, len, false, fence);
+    return;
+#elif defined(SHM_LIB_WITH_UBSM)
     if (fence) mfence();
     return;
 #elif defined(NO_CLFLUSH)
@@ -65,7 +69,10 @@ static inline void clflush(const void* data, size_t len, bool fence = true) {
 }
 
 static inline void clwb(const void* data, size_t len, bool fence = true) {
-#if defined(SHM_LIB_WITH_UBSM)
+#if defined(SHM_UB_SPLIT)
+    ub_cache_maintenance(data, len, true, fence);
+    return;
+#elif defined(SHM_LIB_WITH_UBSM)
     if (fence) mfence();
     return;
 #elif defined(NO_CLFLUSH)
@@ -89,7 +96,10 @@ static inline void clwb(const void* data, size_t len, bool fence = true) {
 #elif defined(__aarch64__)
 // ARM64 implementations
 static inline void clflush(const void* data, size_t len, bool fence = true) {
-#if defined(SHM_LIB_WITH_UBSM)
+#if defined(SHM_UB_SPLIT)
+    ub_cache_maintenance(data, len, false, fence);
+    return;
+#elif defined(SHM_LIB_WITH_UBSM)
     if (fence) mfence();
     return;
 #elif defined(NO_CLFLUSH)
@@ -106,7 +116,10 @@ static inline void clflush(const void* data, size_t len, bool fence = true) {
 }
 
 static inline void clwb(const void* data, size_t len, bool fence = true) {
-#if defined(SHM_LIB_WITH_UBSM)
+#if defined(SHM_UB_SPLIT)
+    ub_cache_maintenance(data, len, true, fence);
+    return;
+#elif defined(SHM_LIB_WITH_UBSM)
     if (fence) mfence();
     return;
 #elif defined(NO_CLFLUSH)
@@ -129,22 +142,42 @@ static inline void memcpy_nt_write(char* dst, const char* src, size_t size) {
   auto* out = reinterpret_cast<volatile char*>(dst);
   auto* in = reinterpret_cast<const volatile char*>(src);
   for (size_t i=0; i<size; ++i) out[i]=in[i];
+#ifdef SHM_UB_SPLIT
+  clwb(dst,size);
+#endif
   mfence();
 }
 static inline void memcpy_nt_read(char* dst, const char* src, size_t size) {
+#ifdef SHM_UB_SPLIT
+  clflush(src,size);
+#endif
   memcpy_nt_write(dst, src, size);
 }
 template<class T> static inline uint32_t READ_NT_32(T* p) {
-  static_assert(sizeof(T)==4); return __atomic_load_n(p, __ATOMIC_SEQ_CST);
+  static_assert(sizeof(T)==4);
+#ifdef SHM_UB_SPLIT
+  clflush((const void*)p,sizeof(T));
+#endif
+  return __atomic_load_n(p, __ATOMIC_SEQ_CST);
 }
 template<class T> static inline uint64_t READ_NT_64(T* p) {
-  static_assert(sizeof(T)==8); return __atomic_load_n(p, __ATOMIC_SEQ_CST);
+  static_assert(sizeof(T)==8);
+#ifdef SHM_UB_SPLIT
+  clflush((const void*)p,sizeof(T));
+#endif
+  return __atomic_load_n(p, __ATOMIC_SEQ_CST);
 }
 template<class T, class D> static inline void WRITE_NT_32(T* p, D&& v) {
   static_assert(sizeof(T)==4); __atomic_store_n(p, v, __ATOMIC_SEQ_CST);
+#ifdef SHM_UB_SPLIT
+  clwb((const void*)p,sizeof(T));
+#endif
 }
 template<class T, class D> static inline void WRITE_NT_64(T* p, D&& v) {
   static_assert(sizeof(T)==8); __atomic_store_n(p, v, __ATOMIC_SEQ_CST);
+#ifdef SHM_UB_SPLIT
+  clwb((const void*)p,sizeof(T));
+#endif
 }
 #ifdef __x86_64__
 // Copy only: these legacy helpers never promise 128-bit atomicity.

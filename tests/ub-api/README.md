@@ -43,3 +43,13 @@ UBSM/Memlink 不引用模拟用的 `clock_gettime`，非 UB 仍保留此依赖�
 这验证代码路径，不证明真实 UB 页属性或硬件原子语义。
 
 真实 SDK 的独立 init / NonCache / Cache 最小测试见 [SDK_SMOKE.md](SDK_SMOKE.md)。
+
+混合布局的独立地址/生命周期检查（使用上面的 fixture 动态库）：
+
+```sh
+c++ -std=c++17 -DSHM_LIB_WITH_UBSM -Itests/ub-api/mock -Ishm-lib/include \
+  tests/ub-api/split_contract.cc shm-lib/shm/ub.cc \
+  -Lbuild/ub-api-fixture -Wl,-rpath,"$PWD/build/ub-api-fixture" \
+  -lubsm_sdk -o build/ub-api-fixture/split_contract
+build/ub-api-fixture/split_contract
+```

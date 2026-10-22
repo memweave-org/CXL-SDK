@@ -17,7 +17,8 @@ void probe(void* p) {
 }
 ''')
     for mode, defines in [('none', []), ('memlink', ['-DSHM_LIB_WITH_UB']),
-                          ('ubsm', ['-DSHM_LIB_WITH_UBSM'])]:
+                          ('ubsm', ['-DSHM_LIB_WITH_UBSM']),
+                          ('ubsm-split', ['-DSHM_LIB_WITH_UBSM','-DSHM_UB_SPLIT'])]:
         obj = Path(tmp) / (mode + '.o')
         subprocess.run([*shlex.split(os.getenv('CXX', 'c++')), '-std=c++17',
                         '-O2', '-march=native', '-I' + str(ROOT / 'shm-lib/include'),

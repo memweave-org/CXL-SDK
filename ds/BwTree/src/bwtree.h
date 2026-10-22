@@ -502,7 +502,7 @@ protected:
       size_t malloc_size = cl_size * 3 * (thread_num + 1);
 #endif
 #ifdef USE_CXL
-      original_p = static_cast<unsigned char *>(cacheable.malloc(malloc_size));
+      original_p = static_cast<unsigned char *>(shared_atomic_memory().malloc(malloc_size));
 #else
       original_p = static_cast<unsigned char *>(malloc(malloc_size));
 #endif
@@ -533,7 +533,7 @@ protected:
       size_t malloc_size = cl_size * 3 * (thread_num + 1);
 #endif
 #ifdef USE_CXL
-      original_p2 = static_cast<unsigned char *>(cacheable.malloc(malloc_size));
+      original_p2 = static_cast<unsigned char *>(shared_atomic_memory().malloc(malloc_size));
 #else
       original_p2 = static_cast<unsigned char *>(malloc(malloc_size));
 #endif
@@ -2092,12 +2092,18 @@ class BwTree : public BwTreeBase {
     // One reasonable amount of memory for each chunk is
     // delta chain len * struct len + sizeof this struct
     static constexpr size_t CHUNK_SIZE =
+#ifdef SHM_UB_SPLIT
+        (sizeof(DeltaNodeUnion) * 8 + sizeof(AllocationMeta) + 63) & ~size_t(63);
+#else
         sizeof(DeltaNodeUnion) * 8 + sizeof(AllocationMeta);
+#endif
 
    private:
     // This points to the higher address end of the chunk we are
     // allocating from
-#ifdef NO_CC
+#ifdef SHM_UB_SPLIT
+    nt<char *>& tail;
+#elif defined(NO_CC)
     nt<char *> tail;
 #else
     std::atomic<char *> tail;
@@ -2106,14 +2112,25 @@ class BwTree : public BwTreeBase {
     char *const limit;
     // This forms a linked list which needs to be traversed in order to
     // free chunks of memory
+#ifdef SHM_UB_SPLIT
+    std::atomic<AllocationMeta *>& next;
+#else
     std::atomic<AllocationMeta *> next;
+#endif
 
    public:
     /*
      * Constructor
      */
     AllocationMeta(char *p_tail, char *p_limit)
+#ifdef SHM_UB_SPLIT
+        : tail(make_shared_atomic<nt<char *>>(p_tail)), limit{p_limit},
+          next(make_shared_atomic<std::atomic<AllocationMeta *>>(nullptr)) {
+      clwb(this, sizeof(*this));
+    }
+#else
         : tail{p_tail}, limit{p_limit}, next{nullptr} {}
+#endif
 
     /*
      * TryAllocate() - Try to allocate from this chunk
@@ -2126,6 +2143,10 @@ class BwTree : public BwTreeBase {
      * size
      */
     void *TryAllocate(size_t size) {
+#ifdef SHM_UB_SPLIT
+      // Different hosts must not publish independently dirty parts of one line.
+      size = (size + 63) & ~size_t(63);
+#endif
       // This acts as a guard to prevent allocating from a chunk which
       // has already underflown to avoid integer (64 bit pointer)
       // underflow
@@ -2295,9 +2316,18 @@ class BwTree : public BwTreeBase {
 
 #ifdef OPT_IN_USE_FLAG
 #ifdef OPT_DUP_IN_USE_FLAG
+#ifdef SHM_UB_SPLIT
+    std::array<nt<uint64_t>, OPT_DUP_IN_USE_FLAG>& status_flag =
+        make_shared_atomic<std::array<nt<uint64_t>, OPT_DUP_IN_USE_FLAG>>();
+#else
     std::array<nt<uint64_t>, OPT_DUP_IN_USE_FLAG> status_flag;
+#endif
+#else
+#ifdef SHM_UB_SPLIT
+    nt<uint64_t>& status_flag = make_shared_atomic<nt<uint64_t>>();
 #else
     nt<uint64_t> status_flag;
+#endif
 #endif
 #endif
 
@@ -3470,7 +3500,7 @@ class BwTree : public BwTreeBase {
     for (size_t i = 0; i < thread_num; ++i) {
       root_node_replicas[i].store(const_cast<BaseNode *>(root_p));
     }
-    root_help_update = new (cacheable.malloc(sizeof(HelpUpdate<BaseNode>))) HelpUpdate<BaseNode>(
+    root_help_update = new (shared_atomic_memory().malloc(sizeof(HelpUpdate<BaseNode>))) HelpUpdate<BaseNode>(
         global_root_node_p, root_node_replicas, thread_num);
   }
 
@@ -9216,7 +9246,7 @@ class BwTree : public BwTreeBase {
       // Use cacheable allocator for shared memory support
       std::cout << "[EpochManager] Allocating EpochNode using cacheable.malloc" << std::endl;
       std::cout.flush();
-      current_epoch_p = static_cast<EpochNode*>(cacheable.malloc(sizeof(EpochNode)));
+      current_epoch_p = static_cast<EpochNode*>(shared_atomic_memory().malloc(sizeof(EpochNode)));
       std::cout << "[EpochManager] Allocated EpochNode at " << current_epoch_p << std::endl;
       std::cout.flush();
       if (current_epoch_p == nullptr) {
@@ -9348,7 +9378,7 @@ class BwTree : public BwTreeBase {
       bwt_printf("Creating new epoch...\n");
 
       // Use cacheable allocator for shared memory support
-      EpochNode *epoch_node_p = static_cast<EpochNode*>(cacheable.malloc(sizeof(EpochNode)));
+      EpochNode *epoch_node_p = static_cast<EpochNode*>(shared_atomic_memory().malloc(sizeof(EpochNode)));
       new (epoch_node_p) EpochNode{};
 
       epoch_node_p->active_thread_count = 0;
@@ -9393,7 +9423,7 @@ class BwTree : public BwTreeBase {
 
       // These two could be predetermined
 #ifdef USE_CXL
-      GarbageNode *garbage_node_p = static_cast<GarbageNode*>(cacheable.malloc(sizeof(GarbageNode)));
+      GarbageNode *garbage_node_p = static_cast<GarbageNode*>(shared_atomic_memory().malloc(sizeof(GarbageNode)));
       new (garbage_node_p) GarbageNode{};
 #else
       GarbageNode *garbage_node_p = new GarbageNode;
@@ -10759,7 +10789,7 @@ class BwTree : public BwTreeBase {
   void AddGarbageNode(const BaseNode *node_p, const NodeID node_id = 0) {
     const size_t estimated_bytes = EstimateGCNodeBytes(node_p);
 #ifdef USE_CXL
-    GarbageNode *garbage_node_p = static_cast<GarbageNode*>(cacheable.malloc(sizeof(GarbageNode)));
+    GarbageNode *garbage_node_p = static_cast<GarbageNode*>(shared_atomic_memory().malloc(sizeof(GarbageNode)));
     assert(garbage_node_p != nullptr);
     new (garbage_node_p)
         GarbageNode{GetGlobalEpoch(), (void *)(node_p), node_id,

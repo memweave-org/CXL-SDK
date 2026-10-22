@@ -22,6 +22,7 @@
 
 constexpr size_t header_bytes=8ul<<20;
 constexpr uintptr_t mapping_address=0x400000000000;
+constexpr uintptr_t atomic_address=0x500000000000;
 constexpr int max_threads=192;
 struct alignas(64) Mailbox {
   nt<uint64_t> response_sequence{0};
@@ -43,8 +44,9 @@ struct Shared {
 static_assert(sizeof(Shared)<(1ul<<20));
 class Mapper: public CXLSystemMemoryMmapper {
   bool ub;
+  UbMappingMode mode;
 public:
-  Mapper(const char* path,int id,bool u):CXLSystemMemoryMmapper(),ub(u) {
+  Mapper(const char* path,int id,bool u,UbMappingMode m=UbMappingMode::Legacy):CXLSystemMemoryMmapper(),ub(u),mode(m) {
     machine_no=id; num_machines=2;
     if(strlen(path)>=sizeof(this->path)) throw std::runtime_error("mapping path too long");
     strcpy(this->path,path);
@@ -52,7 +54,7 @@ public:
   }
   void allocate(void* b,size_t n) override {
     mmap_size=n;
-    mmap_base=ub?map_ub_memory(path,b,n):mmap(b,n,PROT_READ|PROT_WRITE,MAP_SHARED|MAP_FIXED_NOREPLACE,fd,0);
+    mmap_base=ub?map_ub_memory(path,b,n,mode):mmap(b,n,PROT_READ|PROT_WRITE,MAP_SHARED|MAP_FIXED_NOREPLACE,fd,0);
     if(mmap_base==MAP_FAILED || mmap_base!=b) throw std::runtime_error("fixed shared mapping failed");
     per_machine_size=((n-header_bytes)/2)&~size_t((2ul<<20)-1);
     per_machine_base=(char*)mmap_base+header_bytes+machine_no*per_machine_size;
@@ -84,12 +86,15 @@ uint64_t allocate_value(uint64_t key) {
 bool get_checked(uint64_t key) {
   uint64_t v=0;
   if(!index_get(key,v) || v<mapping_address || v>=mapping_address+(1ull<<40)) return false;
+#ifdef SHM_UB_SPLIT
+  clflush((void*)v,8);
+#endif
   return *(volatile uint64_t*)v==value_for(key);
 }
 struct Op {uint64_t key; bool write;};
 int main(int argc,char** argv) try {
   // Intentionally explicit worker arguments; the Python runner validates them.
-  if(argc!=11) throw std::runtime_error("usage: bench ID THREADS RECORDS OPS SIZE_MB PATH file|ub SPEC RUN_TOKEN original|fresh-insert");
+  if(argc!=11 && argc!=12) throw std::runtime_error("usage: bench ID THREADS RECORDS OPS SIZE_MB PATH file|ub SPEC RUN_TOKEN original|fresh-insert");
   const int id=std::stoi(argv[1]);
   std::string thread_arg=argv[2]; auto comma=thread_arg.find(',');
   if(comma==std::string::npos) throw std::runtime_error("THREADS must be N0,N1");
@@ -108,16 +113,32 @@ int main(int argc,char** argv) try {
   set_value_size(8);
   SimThreadInfo::setup_machine_ids(id); SimThreadInfo::setup_worker_machine_count(2);
   SimThreadInfo::setup_worker_nr(total_threads+1); SimThreadInfo::setup_dispatcher_nr(total_threads);
+#ifdef SHM_UB_SPLIT
+  if (std::string(argv[7]) != "ub") throw std::runtime_error("split binary requires UB");
+  const size_t nc_bytes = (argc == 12 ? std::stoull(argv[11]) : 512) << 20;
+  if (nc_bytes < (128ul<<20) || nc_bytes % (4ul<<20)) throw std::runtime_error("invalid NC arena size");
+  auto* nc_mapper = new Mapper((std::string(argv[6])+"-nc").c_str(),id,true,UbMappingMode::Noncacheable);
+  nc_mapper->allocate((void*)atomic_address,nc_bytes);
+  ub_configure_arena(true,nc_mapper->per_machine_base,nc_mapper->per_machine_size);
+  auto* mapper=new Mapper(argv[6],id,true,UbMappingMode::Cacheable);
+  mapper->allocate((void*)mapping_address,bytes);
+  ub_configure_arena(false,mapper->per_machine_base,mapper->per_machine_size);
+  cacheable=MemoryManager(false);
+  auto* shared=(Shared*)atomic_address;
+  std::cout << "UB_LAYOUT split data=" << (void*)mapping_address << " bytes=" << bytes
+            << " atomic=" << (void*)atomic_address << " atomic_bytes=" << nc_bytes << std::endl;
+#else
   auto* mapper=new Mapper(argv[6],id,std::string(argv[7])=="ub");
   cacheable=MemoryManager(mapper,(void*)mapping_address,bytes);
   cacheable.require_shared_allocations(true);
   auto* shared=(Shared*)mapping_address;
+#endif
   auto* sequences=(char*)shared+(1ul<<20);
   if(!id) { new (shared) Shared(); memset(sequences,0,cxl_transport::shared_sequences_bytes()); }
   cxl_transport::configure_shared_sequences(sequences);
   if(!id) {
     if (std::string(argv[7]) == "ub") {
-      shared->ub_cas_probe = static_cast<uint64_t*>(cacheable.malloc(sizeof(uint64_t)));
+      shared->ub_cas_probe = static_cast<uint64_t*>(shared_atomic_memory().malloc(sizeof(uint64_t)));
       __atomic_store_n(shared->ub_cas_probe, 0, __ATOMIC_SEQ_CST);
     }
     index_open(shared->handles,true,total_threads);
@@ -128,7 +149,11 @@ int main(int argc,char** argv) try {
     for(uint64_t k=1;k<=records;++k) index_put(k,allocate_value(k));
     index_finish(total_threads);
     // Publish initialized nodes, roots, replica metadata and copy sequences.
+#ifdef SHM_UB_SPLIT
+    clwb(mapper->per_machine_base, ub_arena_used(false));
+#else
     publish((void*)mapping_address,header_bytes+mapper->per_machine_size);
+#endif
     shared->initialized.store(token);
   } else {
     wait_for(shared->initialized,token);
@@ -138,7 +163,11 @@ int main(int argc,char** argv) try {
     // Both processes CAS the same word allocated from the mapped UB arena.
     auto* probe = shared->ub_cas_probe;
     const auto addr = reinterpret_cast<uintptr_t>(probe);
+#ifdef SHM_UB_SPLIT
+    if (addr < atomic_address + header_bytes || addr > atomic_address + nc_bytes - sizeof(*probe))
+#else
     if (addr < mapping_address + header_bytes || addr > mapping_address + bytes - sizeof(*probe))
+#endif
       throw std::runtime_error("CAS probe is outside the UB arena");
     uint64_t expected = id;
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
@@ -253,11 +282,23 @@ int main(int argc,char** argv) try {
   std::cout<<"RESULT system="<<BENCH_SYSTEM<<" cc="<<BENCH_CC<<" opt="<<BENCH_OPT<<" id="<<id<<" pid="<<getpid()<<" threads="<<threads
     <<" completed="<<completed<<" errors="<<errors<<" seconds="<<shared->seconds[id]
     <<" peer_marker_checked="<<peer_marker_ok<<" peer_writes_checked="<<peer_writes<<" validation_records="<<records<<" update_semantics="<<(fresh?"fresh-insert":"update-existing")<<" reclamation=process-lifetime"<<std::endl;
+#ifdef SHM_UB_SPLIT
+  index_close();
+#endif
   shared->validated[id].store(token); wait_for(shared->validated[1-id],token);
   // Shared data remains alive until both workers finish; do not run a shared
   // object's std::thread/memkind destructor in another process.
+#ifndef SHM_UB_SPLIT
   index_close();
+#endif
+#ifdef SHM_UB_SPLIT
+  std::cout << "UB_ALLOCATIONS data_bytes=" << ub_arena_used(false)
+            << " atomic_bytes=" << ub_arena_used(true) << std::endl;
+#endif
   mapper->close_ub();
+#ifdef SHM_UB_SPLIT
+  nc_mapper->close_ub();
+#endif
   std::cout << "UB_CLOSED api=" << ub_api_name() << " id=" << id << std::endl;
   std::cout.flush(); std::cerr.flush(); _Exit(errors?1:0);
 } catch(const std::exception& e) { std::cerr<<"ERROR "<<e.what()<<std::endl; std::cerr.flush(); _Exit(1); }

@@ -65,6 +65,32 @@ API 中另有 `UBSM_FLAG_CACHE`，但文档要求它配合 `ubsmem_shmem_set_own
 双机时远端仍为 NC，不能由变量名 `cacheable` 推断远端页属性。
 UBSM 和 Memlink 构建均跳过 CAS/load/store 的模拟排队延迟；非 UB 构建保留原模拟逻辑。
 
+也可以直接指定镜像，脚本自动创建临时容器、编译并运行，结束后删除容器：
+
+```sh
+UB_IMAGE=shm-pcc-sdk:ub-glibc2.39-gcc12.3.1 \
+./tests/two-process-ycsb/run_ub_single.sh 实际本机UB拓扑主机名 2 4
+```
+
+镜像入口自动挂载仓库和 `UB_SDK_ROOT`（默认 `/usr/local/ubs_mem`），复用宿主机
+UID/GID、附加组、网络及 hostname，挂载 `/run`（只读，连接宿主机服务 socket）和
+`/dev`。OBMM 在创建对象后动态生成设备节点，因此允许字符设备读写访问；实际设备
+文件权限仍由宿主机用户/组控制。宿主机需要已安装 SDK、启动 UB 服务，用户具备
+`ubsmd` 组权限。脚本自动单独挂载 `/usr/lib64` 下的 `libubse-client.so*` 和
+`libobmm.so*`（存在时），不会覆盖整个系统库目录。
+
+如果现场服务 socket 位于其他目录，或 SDK 还有额外依赖，可设置
+`UB_DOCKER_ARGS_FILE=/绝对路径/docker-args.txt`；文件每行是一个完整 Docker 参数，
+不加 shell 引号、不做变量展开，例如：
+
+```text
+--volume
+/实际服务目录:/实际服务目录:ro
+```
+
+日志保存在宿主机仓库 `build/ub-single-*`，UB 对象失败保留策略不变。
+`UB_IMAGE` 与 `UB_CONTAINER` 不能同时设置；不指定两者则直接在当前环境运行。
+
 若已启动具备 UB 设备、服务 socket、组权限和 SDK 依赖的容器 `ub-ycsb`，且仓库
 挂载在相同绝对路径，宿主机一条命令即可在容器里完成编译和运行：
 
@@ -72,8 +98,7 @@ UBSM 和 Memlink 构建均跳过 CAS/load/store 的模拟排队延迟；非 UB �
 UB_CONTAINER=ub-ycsb ./tests/two-process-ycsb/run_ub_single.sh 实际本机UB拓扑主机名 2 4
 ```
 
-容器应使用前述 GCC 12.3.1/glibc 2.39 镜像；脚本复用容器的 SDK 环境，不负责创建
-具有厂商设备访问配置的容器。可用 `UBSM_PROVIDER_NUMA=0` 指定实际内存 NUMA，
+已有容器应使用前述 GCC 12.3.1/glibc 2.39 镜像；`UB_CONTAINER` 入口复用其 SDK 环境。可用 `UBSM_PROVIDER_NUMA=0` 指定实际内存 NUMA，
 `RECORDS`、`OPS`、`SIZE_MB`、`JOBS`、`TIMEOUT`、`OUTPUT` 覆盖默认参数。
 `--help` 查看说明。必须提供真实 SDK 路径；不会自动退回普通文件或测试替身。
 

@@ -44,17 +44,28 @@ export UB_MEMLINK_LIBRARY=/实际路径/libmemlink.so
 在具备厂商 SDK、UB 服务及访问权限的环境中，从仓库根目录执行：
 
 ```sh
-./tests/two-process-ycsb/run_ub_single.sh 实际本机UB拓扑主机名 2 4
+./tests/two-process-ycsb/run_ub_single.sh 内存提供机器的UB拓扑主机名 2 4
 ```
 
 脚本自动编译并依次运行这两个 OPT case；每个 case 有两个本地进程，以上线程数为
 2 和 4（不填默认各 2）。默认加载 10000 条记录、每进程执行 10000 次 YCSB-B 操作，
 分配 1024 MiB，使用 16-bit BwTree 映射表，适合小规模功能检查。成功后自动释放 UB
 对象；失败时保留对象并提示检查日志。输出位于 `build/ub-single-*`。
-单机结果不验证跨机导入、远端 NC 映射或跨机一致性。
+这里“单机”只指两个 worker 在同一台机器运行，不限制内存所在机器。
+例如在 A 运行脚本、参数填 B 的 UB 拓扑主机名：管理程序在 A 调用
+`ubsmem_shmem_allocate_with_provider`，`src_loc.host_name=B`；内存由 B 提供，
+A 的两个进程映射同名对象并访问 B 的内存。B 需要 UB 服务及可用资源，但不需要
+启动 benchmark worker 或 SSH 登录。`UBSM_PROVIDER_NUMA` 指 B 的内存 NUMA。
+两台机器上的进程各运行一个是另一种实验，需要使用下文的 `--host`。
 
-单机测试必须在指定 provider 本机运行。`ONLY_IMPORT_NONCACHE | WR_DELAY_COMP`
-在提供方给出 cacheable 映射，两个本地进程共用这块 UB 对象；全局 `cacheable`
+当前 `ONLY_IMPORT_NONCACHE | WR_DELAY_COMP` 在 provider 上给出 cacheable 映射，
+在 importer 上给出 NonCacheable 映射。因此 A 运行、B 供内存时，A 的两个进程
+都使用 NC 映射；本配置并不提供远端 cacheable CAS 内存。若填 A，则是本地
+cacheable UB 映射，不能用于验证远端导入。真实远端 NC 上的 CAS/分配器行为仍需
+硬件验证，不能由本地测试替身结果证明。`results.json` 记录的是请求的 provider，
+不是 SDK 查询确认的物理落点。
+
+两个进程共用这块 UB 对象；全局 `cacheable`
 分配器的两个分区均来自该映射，BwTree 映射表和 ClevelHash 桶等共享 CAS 目标也
 从中分配，不需要另建普通 DRAM 池。UB 严格分配模式检查返回地址及长度，越界即失败。
 每个 worker 启动时还会对同一个 UB 分配的 64-bit 字做 CAS，确认最终值为 2，打印
@@ -69,7 +80,7 @@ UBSM 和 Memlink 构建均跳过 CAS/load/store 的模拟排队延迟；非 UB �
 
 ```sh
 UB_IMAGE=shm-pcc-sdk:ub-glibc2.39-gcc12.3.1 \
-./tests/two-process-ycsb/run_ub_single.sh 实际本机UB拓扑主机名 2 4
+./tests/two-process-ycsb/run_ub_single.sh 内存提供机器的UB拓扑主机名 2 4
 ```
 
 镜像入口自动挂载仓库和 `UB_SDK_ROOT`（默认 `/usr/local/ubs_mem`），复用宿主机
@@ -90,7 +101,7 @@ SDK 与依赖目录的链接时和运行时搜索路径。需要额外库搜索�
 ```sh
 UB_EXTRA_LIBRARY_DIRS=/实际HCOM目录/lib:/实际安全C库目录/lib \
 UB_IMAGE=shm-pcc-sdk:ub-glibc2.39-gcc12.3.1 \
-./tests/two-process-ycsb/run_ub_single.sh 实际本机UB拓扑主机名 2 4
+./tests/two-process-ycsb/run_ub_single.sh 内存提供机器的UB拓扑主机名 2 4
 ```
 
 通过 `dlopen` 加载、没有声明在 ELF 依赖中的插件不能自动推断，可用
@@ -114,7 +125,7 @@ UB_IMAGE=shm-pcc-sdk:ub-glibc2.39-gcc12.3.1 \
 挂载在相同绝对路径，宿主机一条命令即可在容器里完成编译和运行：
 
 ```sh
-UB_CONTAINER=ub-ycsb ./tests/two-process-ycsb/run_ub_single.sh 实际本机UB拓扑主机名 2 4
+UB_CONTAINER=ub-ycsb ./tests/two-process-ycsb/run_ub_single.sh 内存提供机器的UB拓扑主机名 2 4
 ```
 
 已有容器应使用前述 GCC 12.3.1/glibc 2.39 镜像；`UB_CONTAINER` 入口复用其 SDK 环境。可用 `UBSM_PROVIDER_NUMA=0` 指定实际内存 NUMA，

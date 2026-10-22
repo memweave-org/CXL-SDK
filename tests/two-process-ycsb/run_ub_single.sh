@@ -7,8 +7,10 @@ if [[ ${1:-} == -h || ${1:-} == --help ]]; then
 Usage: ./tests/two-process-ycsb/run_ub_single.sh [PROVIDER_HOST [THREADS0 [THREADS1]]]
 
 Build and run BwTree OPT and ClevelHash OPT, each with two local processes.
-PROVIDER_HOST must be the local machine's name in the UB topology; alternatively
-set UBSM_PROVIDER_HOST. Default threads: 2 per process.
+PROVIDER_HOST is the memory provider's UB topology name (local OR remote); alternatively
+set UBSM_PROVIDER_HOST. Both worker processes run here, not on the provider.
+Remote provider means NonCacheable imports with the current flags.
+Default threads: 2 per process.
 
 Optional environment:
   UB_IMAGE            Docker image: automatically create/run/remove a container.
@@ -79,7 +81,7 @@ if [[ -n ${UB_CONTAINER:-} || -n ${UB_IMAGE:-} ]]; then
       echo "UB_SDK_ROOT must be an existing absolute directory: $sdk_root" >&2; exit 2
     fi
     if [[ -z ${1:-${UBSM_PROVIDER_HOST:-}} ]]; then
-      echo 'Specify the local UB topology hostname; see --help.' >&2; exit 2
+      echo 'Specify the memory provider UB topology hostname; see --help.' >&2; exit 2
     fi
     # OBMM creates /dev/obmm_shmdev* after allocation; a static --device list
     # cannot expose those future nodes. Keep host UID/groups and share /dev.
@@ -126,7 +128,7 @@ fi
 
 provider=${1:-${UBSM_PROVIDER_HOST:-}}
 if [[ -z $provider ]]; then
-  echo 'Specify the local UB topology hostname as argument 1 or UBSM_PROVIDER_HOST; see --help.' >&2
+  echo 'Specify the memory provider UB topology hostname as argument 1 or UBSM_PROVIDER_HOST; see --help.' >&2
   exit 2
 fi
 resolve_sdk
@@ -148,7 +150,8 @@ export HCOM_CONNECTION_RETRY_TIMES=${HCOM_CONNECTION_RETRY_TIMES:-2}
 cd "$ROOT"
 output=${OUTPUT:-build/ub-single-$(date +%Y%m%d-%H%M%S)-$$}
 if [[ $output != /* ]]; then output="$ROOT/$output"; fi
-echo "UBSM single-host: provider=$provider, threads=${2:-2}/${3:-${2:-2}}"
+echo "UBSM: workers_host=$(hostname), memory_provider=$provider, provider_numa=${UBSM_PROVIDER_NUMA:-4294967295}, threads=${2:-2}/${3:-${2:-2}}"
+echo "Mapping policy: provider=cacheable, importer=noncacheable (ONLY_IMPORT_NONCACHE)."
 echo "Build logs, worker logs and results.json: $output"
 trap 'rc=$?; if (( rc != 0 )); then echo "Failed; inspect logs in $output. If a UB object was created, confirm workers stopped before manual cleanup." >&2; fi' EXIT
 python3 tests/two-process-ycsb/run.py \

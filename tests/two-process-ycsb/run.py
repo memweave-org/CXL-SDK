@@ -133,6 +133,8 @@ def main():
         logs, procs = [], []
         event = dict(case=case, commands=commands, executable_sha256=digest,
                      memory=a.memory, ub_api=a.ub_api, shared_object=path, host=a.host, updates=a.updates, mapping_bits=a.mapping_bits,
+                     requested_provider_host=a.provider_host if a.ub_api == 'ubsm' else None,
+                     requested_provider_numa=a.provider_numa if a.ub_api == 'ubsm' else None,
                      workload_sha256=hashlib.sha256(spec.read_bytes()).hexdigest(), status='running', run_token=token)
         try:
             if a.ub_api == 'ubsm':

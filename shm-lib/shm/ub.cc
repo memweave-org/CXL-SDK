@@ -124,7 +124,9 @@ void create_ub_memory(const char* name, size_t size, const char* host, uint32_t 
   initialize();
   const int rc = ubsmem_shmem_allocate_with_provider(&provider, name, size, 0660,
       UBSM_FLAG_ONLY_IMPORT_NONCACHE | UBSM_FLAG_WR_DELAY_COMP);
-  if (!rc) std::cout << "UB_OBJECT_CREATED name=" << name << std::endl;
+  if (!rc) std::cout << "UB_OBJECT_CREATED name=" << name
+                     << " requested_provider=" << host << " numa=" << numa
+                     << " policy=only-import-noncache" << std::endl;
   finalize();
   checked(rc, "ubsmem_shmem_allocate_with_provider");
 #else

@@ -26,7 +26,7 @@ extern "C" int ubsmem_finalize() {
   int rc=event("finalize");if(!rc)active=false;return rc;
 }
 extern "C" int ubsmem_shmem_allocate_with_provider(const ubs_mem_provider_t* p,const char* n,size_t sz,mode_t mode,uint64_t flags) {
-  if(!active || !p->host_name[0] || p->socket_id!=UINT32_MAX || p->port_id!=UINT32_MAX || flags!=3 || mode!=0660)return 6002;
+  if(!active || !p->host_name[0] || p->socket_id!=UINT32_MAX || p->port_id!=UINT32_MAX || (flags!=3 && flags!=4 && flags!=10) || mode!=0660)return 6002;
   if(int rc=event("allocate"))return rc;
   std::filesystem::create_directories(root());
   int fd=open(path(n).c_str(),O_CREAT|O_EXCL|O_RDWR,mode);if(fd<0)return 6003;
@@ -55,4 +55,12 @@ extern "C" int ubsmem_shmem_deallocate(const char* n) {
   for(const auto& e:std::filesystem::directory_iterator(root()))
     if(e.path().string().find(path(n)+".mapped.")==0)return 6007;
   return unlink(path(n).c_str())?6003:0;
+}
+
+extern "C" int ubsmem_set_logger_level(int) { return event("logger"); }
+extern "C" int ubsmem_shmem_set_ownership(const char*, void* p, size_t sz, int prot) {
+  if(int rc=event("ownership"))return rc;
+  auto it=maps.find(p);
+  if(!active || it==maps.end() || it->second.bytes!=sz)return 6002;
+  return mprotect(p,sz,prot) ? 6005 : 0;
 }

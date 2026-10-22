@@ -6,6 +6,8 @@ extern "C" {
 int ubsmem_init_attributes(ubsmem_options_t*);
 int ubsmem_initialize(const ubsmem_options_t*);
 int ubsmem_finalize();
+int ubsmem_set_logger_level(int);
+int ubsmem_shmem_set_ownership(const char*, void*, size_t, int);
 int ubsmem_shmem_allocate_with_provider(const ubs_mem_provider_t*, const char*, size_t, mode_t, uint64_t);
 int ubsmem_shmem_deallocate(const char*);
 int ubsmem_shmem_map(void*, size_t, int, int, const char*, off_t, void**);

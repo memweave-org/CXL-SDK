@@ -41,3 +41,5 @@ failure_checks 注入 map/unmap/finalize 失败，验证结果失败且原对象
 UBSM/Memlink 不引用模拟用的 `clock_gettime`，非 UB 仍保留此依赖。
 单机 UB 入口的两个 OPT case 另检查双方的 `UB_CAS_PROBE` 标记。
 这验证代码路径，不证明真实 UB 页属性或硬件原子语义。
+
+真实 SDK 的独立 init / NonCache / Cache 最小测试见 [SDK_SMOKE.md](SDK_SMOKE.md)。

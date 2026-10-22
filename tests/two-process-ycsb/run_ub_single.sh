@@ -72,7 +72,7 @@ fi
 if [[ -n ${UB_CONTAINER:-} || -n ${UB_IMAGE:-} ]]; then
   env_args=(-e UB_CONTAINER= -e UB_IMAGE=)
   for name in UBSM_PROVIDER_HOST UBSM_PROVIDER_NUMA UBSM_INCLUDE_DIR UBSM_LIBRARY \
-      LD_LIBRARY_PATH UBSM_RUNTIME_LIBRARY_DIR HCOM_CONNECTION_RETRY_TIMES RECORDS OPS SIZE_MB JOBS TIMEOUT OUTPUT; do
+      LD_LIBRARY_PATH UBSM_RUNTIME_LIBRARY_DIR UB_SDK_TEST_MODE HCOM_CONNECTION_RETRY_TIMES RECORDS OPS SIZE_MB JOBS TIMEOUT OUTPUT; do
     if [[ -v $name ]]; then env_args+=(-e "$name=${!name}"); fi
   done
   if [[ -n ${UB_IMAGE:-} ]]; then
@@ -150,6 +150,20 @@ export HCOM_CONNECTION_RETRY_TIMES=${HCOM_CONNECTION_RETRY_TIMES:-2}
 cd "$ROOT"
 output=${OUTPUT:-build/ub-single-$(date +%Y%m%d-%H%M%S)-$$}
 if [[ $output != /* ]]; then output="$ROOT/$output"; fi
+if [[ -n ${UB_SDK_TEST_MODE:-} ]]; then
+  mkdir -p "$output"
+  link_args=(-Wl,-rpath,"$(dirname -- "$UBSM_LIBRARY")")
+  if [[ -n ${UBSM_RUNTIME_LIBRARY_DIR:-} ]]; then
+    link_args+=(-Wl,-rpath,"$UBSM_RUNTIME_LIBRARY_DIR" -Wl,-rpath-link,"$UBSM_RUNTIME_LIBRARY_DIR")
+  fi
+  echo "Standalone SDK test; logs: $output"
+  "${CXX:-c++}" -std=c++17 -O0 -g -I"$UBSM_INCLUDE_DIR" \
+    "$ROOT/tests/ub-api/sdk_smoke.cc" "$UBSM_LIBRARY" "${link_args[@]}" \
+    -o "$output/ub_sdk_smoke" 2>&1 | tee "$output/build.log"
+  "$output/ub_sdk_smoke" "$UB_SDK_TEST_MODE" "$provider" "${SIZE_MB:-128}" \
+    2>&1 | tee "$output/run.log"
+  exit 0
+fi
 echo "UBSM: workers_host=$(hostname), memory_provider=$provider, provider_numa=${UBSM_PROVIDER_NUMA:-4294967295}, threads=${2:-2}/${3:-${2:-2}}"
 echo "Mapping policy: provider=cacheable, importer=noncacheable (ONLY_IMPORT_NONCACHE)."
 echo "Build logs, worker logs and results.json: $output"

@@ -297,9 +297,20 @@ public:
 
     level_bucket() : buckets(nullptr), capacity(0), up(nullptr) {}
 
-    void allocate(uint64_t capacity) {
+    void allocate(uint64_t capacity, const char* caller_file = __builtin_FILE(),
+                  int caller_line = __builtin_LINE(), const char* caller_function = __builtin_FUNCTION()) {
 #ifdef USE_CXL
-      this->buckets = new (shared_atomic_memory().malloc(capacity * sizeof(bucket))) bucket[capacity];
+      try {
+        this->buckets = new (shared_atomic_memory().malloc(capacity * sizeof(bucket))) bucket[capacity];
+      } catch (const std::bad_alloc&) {
+        std::cerr << "CLEVEL_ALLOC_FAILED context=" << __FILE__ << ':' << __LINE__
+                  << " caller=" << caller_file << ":" << caller_line
+                  << " caller_function=" << caller_function
+                  << " function=level_bucket::allocate capacity=" << capacity
+                  << " bucket_bytes=" << sizeof(bucket)
+                  << " requested_bytes=" << capacity * sizeof(bucket) << std::endl;
+        throw;
+      }
       if (this->buckets == nullptr) {
         printf("Failed to allocate memory for level_bucket, size=%lu\n", capacity);
         exit(1);

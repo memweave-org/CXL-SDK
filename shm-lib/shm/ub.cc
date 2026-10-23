@@ -201,15 +201,24 @@ void ub_configure_arena(bool atomic, void* base, size_t size) {
 }
 void* ub_arena_allocate(bool atomic, size_t size, size_t alignment) {
   auto& a = arenas[atomic];
-  if (!a.base || !alignment || (alignment & (alignment-1))) throw std::bad_alloc();
+  auto fail = [&](const char* reason) -> void {
+    const auto used = a.used.load(std::memory_order_relaxed);
+    std::cerr << "UB_ALLOC_FAILED arena=" << (atomic ? "NC" : "CACHE")
+              << " requested_bytes=" << size << " alignment=" << alignment
+              << " process_capacity_bytes=" << a.size << " used_bytes=" << used
+              << " remaining_bytes=" << (used <= a.size ? a.size-used : 0)
+              << " reason=" << reason << std::endl;
+    throw std::bad_alloc();
+  };
+  if (!a.base || !alignment || (alignment & (alignment-1))) fail("unconfigured arena or invalid alignment");
   alignment = std::max(alignment, size_t(64));
   auto old = a.used.load(std::memory_order_relaxed);
   for (;;) {
-    if (old > a.size || alignment-1 > a.size-old) throw std::bad_alloc();
+    if (old > a.size || alignment-1 > a.size-old) fail("arena exhausted or allocation exceeds bounds");
     const size_t start = (old + alignment-1) & ~(alignment-1);
-    if (start > a.size || size > a.size-start || size > SIZE_MAX-63) throw std::bad_alloc();
+    if (start > a.size || size > a.size-start || size > SIZE_MAX-63) fail("arena exhausted or allocation exceeds bounds");
     const size_t padded = (size + 63) & ~size_t(63);
-    if (padded > a.size-start) throw std::bad_alloc();
+    if (padded > a.size-start) fail("arena exhausted or allocation exceeds bounds");
     const size_t next = start + padded;
     if (a.used.compare_exchange_weak(old,next,std::memory_order_relaxed)) return a.base + start;
   }

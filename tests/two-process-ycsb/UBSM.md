@@ -80,23 +80,32 @@ UBSM 构建不模拟 CAS 延迟。其他后端和 `--ub-layout legacy` 保留原
 CC case 继续使用旧路径。可显式 `--ub-layout split`，不支持的 case
 会报错，不会偷偷改成 legacy。单机脚本显式指定 split。
 
-也可以直接指定镜像，脚本自动创建临时容器、编译并运行，结束后删除容器：
+也可以直接指定镜像，脚本自动创建临时容器完成编译并删除容器，然后在宿主机运行大测试：
 
 ```sh
 UB_IMAGE=shm-pcc-sdk:ub-glibc2.39-gcc12.3.1 \
 ./tests/two-process-ycsb/run_ub_single.sh 内存提供机器的UB拓扑主机名 2 4
 ```
 
-镜像入口自动挂载仓库和 `UB_SDK_ROOT`（默认 `/usr/local/ubs_mem`），复用宿主机
-UID/GID、附加组、网络及 hostname，挂载 `/run`（只读，连接宿主机服务 socket）和
-`/dev`。OBMM 在创建对象后动态生成设备节点，因此允许字符设备读写访问；实际设备
-文件权限仍由宿主机用户/组控制。宿主机需要已安装 SDK、启动 UB 服务，用户具备
-`ubsmd` 组权限。脚本自动解析宿主机 `libubsm_sdk.so` 的动态依赖链，将 SDK 及
-配套依赖复制到 `build/ub-runtime/run-*/lib`，只读挂载进容器；清单保存在其中的
-`manifest.json`。镜像继续使用自己的 glibc、动态加载器、libstdc++ 和 libgcc，
-不会用宿主机系统库覆盖它们。容器内先执行 `ldd -r`，缺库或未解析符号会直接打印
-到终端，检查通过后再编译。缺少 `memset_s`、HCOM 符号时，应检查配套依赖是否
-被解析及其版本是否与 SDK 匹配；不能仅凭库名相同判断 ABI 兼容。
+大测试的镜像入口只挂载仓库、SDK 和编译依赖，使用宿主机 UID/GID 与附加组；
+不需要 UB 设备或服务 socket。编译完成后，`ub_admin` 和两个 worker 全部在
+宿主机运行，使用宿主机用户和 SDK 环境，不会在容器中初始化 UB。
+宿主机需要安装 SDK、启动 UB 服务并具备相应设备和服务访问权限。
+
+脚本自动解析宿主机 `libubsm_sdk.so` 的动态依赖链，将 SDK 及配套依赖复制到
+`build/ub-runtime/run-*/lib` 供容器链接，清单保存在 `manifest.json`。
+镜像使用自己的 glibc、动态加载器、libstdc++ 和 libgcc。
+宿主机必须能运行该镜像编译的产物；例如宿主机 glibc 太旧，使用 glibc 2.39
+镜像编译并不能解决宿主机运行兼容性。脚本在创建任何 UB 对象前，对两组
+`bench` 和 `ub_admin` 执行宿主机 `ldd -r`，缺库、符号缺失或版本不兼容时
+立即停止。应选择与宿主机兼容的镜像或补齐宿主机依赖。
+
+运行日志位于 `OUTPUT`（默认 `build/ub-single-*`），编译日志位于其同级
+`OUTPUT-build` 目录；两者必须不存在。`UB_EXTRA_LIBRARY_DIRS` 同时用于
+宿主机依赖搜索。不要把容器的 glibc 或动态加载器复制到宿主机覆盖系统库。
+
+独立 `run_sdk_smoke.sh` 的 `UB_IMAGE` 模式仍在容器内运行，用于诊断容器 SDK
+环境；若要与大测试的宿主机运行环境对照，应不设置 `UB_IMAGE`、`UB_CONTAINER`。
 
 SDK 默认路径为 `/usr/local/ubs_mem`，同时支持 `lib`、`lib64`，以及只有一个实际
 版本库文件、没有无版本 `.so` 链接的情况。CMake 使用完整文件路径链接，并配置

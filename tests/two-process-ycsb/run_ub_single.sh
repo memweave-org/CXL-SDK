@@ -9,13 +9,14 @@ Usage: ./tests/two-process-ycsb/run_ub_single.sh [PROVIDER_HOST [THREADS0 [THREA
 Build and run BwTree OPT and ClevelHash OPT, each with two local processes.
 PROVIDER_HOST is the memory provider's UB topology name (local OR remote); alternatively
 set UBSM_PROVIDER_HOST. Both worker processes run here, not on the provider.
-Data uses CACHE; shared atomic targets use a separate NONCACHE object.
+Data uses CACHE memory; atomics use a separate NONCACHE arena.
 Default threads: 2 per process.
 
 Optional environment:
   CASES               Space-separated cases (default: bwtree-on clevelhash-on).
                       Example: "sherman rpc bwtree-on clevelhash-on".
-  UB_IMAGE            Docker image: automatically create/run/remove a container.
+  UB_IMAGE            Docker build image; YCSB runs on the host after compilation.
+                      Standalone UB_SDK_TEST_MODE tests still run in the container.
   UB_SDK_ROOT         Host SDK directory (default /usr/local/ubs_mem).
                       Auto-detect lib/lib64, including a sole versioned library.
   UB_EXTRA_LIBRARIES  Colon-separated SDK plugin paths (for dlopen dependencies).
@@ -86,12 +87,14 @@ if [[ -n ${UB_CONTAINER:-} || -n ${UB_IMAGE:-} ]]; then
     if [[ -z ${1:-${UBSM_PROVIDER_HOST:-}} ]]; then
       echo 'Specify the memory provider UB topology hostname; see --help.' >&2; exit 2
     fi
-    # OBMM creates /dev/obmm_shmdev* after allocation; a static --device list
-    # cannot expose those future nodes. Keep host UID/groups and share /dev.
-    run_args=(--rm --network host --uts host
-      --user "$(id -u):$(id -g)" --device-cgroup-rule 'c *:* rw'
-      -v "$ROOT:$ROOT" -w "$ROOT"
-      -v /dev:/dev -v /run:/run:ro -v "$sdk_root:$sdk_root:ro")
+    # Compilation needs source and SDK files only. Standalone smoke tests
+    # still need service sockets and dynamically created OBMM device nodes.
+    run_args=(--rm --user "$(id -u):$(id -g)"
+      -v "$ROOT:$ROOT" -w "$ROOT" -v "$sdk_root:$sdk_root:ro")
+    if [[ -n ${UB_SDK_TEST_MODE:-} ]]; then
+      run_args+=(--network host --uts host --device-cgroup-rule 'c *:* rw'
+        -v /dev:/dev -v /run:/run:ro)
+    fi
     for gid in $(id -G); do run_args+=(--group-add "$gid"); done
     resolve_sdk
     # Explicit headers/library may be outside the SDK root. Mount just the
@@ -121,9 +124,26 @@ if [[ -n ${UB_CONTAINER:-} || -n ${UB_IMAGE:-} ]]; then
         [[ -z $arg || $arg == \#* ]] || run_args+=("$arg")
       done < "$UB_DOCKER_ARGS_FILE"
     fi
-    echo "Creating temporary UB container from image: $UB_IMAGE"
-    exec docker run "${run_args[@]}" "${env_args[@]}" --entrypoint /bin/bash "$UB_IMAGE" \
+    if [[ -n ${UB_SDK_TEST_MODE:-} ]]; then
+      echo "Creating temporary SDK smoke-test container from image: $UB_IMAGE"
+      exec docker run "${run_args[@]}" "${env_args[@]}" --entrypoint /bin/bash "$UB_IMAGE" \
+        "$ROOT/tests/two-process-ycsb/run_ub_single.sh" "$@"
+    fi
+    output=${OUTPUT:-build/ub-single-$(date +%Y%m%d-%H%M%S)-$$}
+    if [[ $output != /* ]]; then output="$ROOT/$output"; fi
+    if [[ -e $output || -e ${output}-build ]]; then
+      echo "Output already exists: $output or ${output}-build" >&2; exit 2
+    fi
+    echo "Compiling in Docker: $UB_IMAGE; build logs: ${output}-build"
+    docker run "${run_args[@]}" "${env_args[@]}" \
+      -e UB_SINGLE_BUILD_ONLY=1 -e "OUTPUT=${output}-build" \
+      --entrypoint /bin/bash "$UB_IMAGE" \
       "$ROOT/tests/two-process-ycsb/run_ub_single.sh" "$@"
+    echo "Compilation finished; running UBSM admin and workers on host: $(uname -n)"
+    # Re-enter on the host without the container's dependency bundle/environment.
+    exec env -u UB_IMAGE -u UB_CONTAINER -u UB_SINGLE_BUILD_ONLY \
+      UB_SINGLE_SKIP_BUILD=1 "OUTPUT=$output" \
+      bash "$ROOT/tests/two-process-ycsb/run_ub_single.sh" "$@"
   fi
   exec docker exec "${env_args[@]}" -w "$ROOT" "$UB_CONTAINER" \
     bash "$ROOT/tests/two-process-ycsb/run_ub_single.sh" "$@"
@@ -135,7 +155,7 @@ if [[ -z $provider ]]; then
   exit 2
 fi
 resolve_sdk
-export LD_LIBRARY_PATH="${UBSM_RUNTIME_LIBRARY_DIR:+$UBSM_RUNTIME_LIBRARY_DIR:}$(dirname -- "$UBSM_LIBRARY")${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export LD_LIBRARY_PATH="${UBSM_RUNTIME_LIBRARY_DIR:+$UBSM_RUNTIME_LIBRARY_DIR:}$(dirname -- "$UBSM_LIBRARY")${UB_EXTRA_LIBRARY_DIRS:+:$UB_EXTRA_LIBRARY_DIRS}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 echo "UBSM headers: $UBSM_INCLUDE_DIR"
 echo "UBSM library: $UBSM_LIBRARY"
 # Show missing transitive libraries before starting a build with redirected logs.
@@ -178,12 +198,35 @@ if [[ -n ${UB_SDK_TEST_MODE:-} ]]; then
   if (( rc == 0 )); then rc=${statuses[1]}; fi
   exit "$rc"
 fi
-echo "UBSM: workers_host=$(uname -n), memory_provider=$provider, provider_numa=${UBSM_PROVIDER_NUMA:-4294967295}, threads=${2:-2}/${3:-${2:-2}}"
+read -r -a cases <<< "${CASES:-bwtree-on clevelhash-on}"
+runner_args=()
+if [[ ${UB_SINGLE_BUILD_ONLY:-0} == 1 ]]; then
+  runner_args+=(--build-only)
+elif [[ ${UB_SINGLE_SKIP_BUILD:-0} == 1 ]]; then
+  runner_args+=(--skip-build)
+  # Check selected cases before the first UB allocation. Host glibc, libstdc++,
+  # memkind and other dependencies must support the container-built binaries.
+  for case in "${cases[@]}"; do
+    for binary in bench ub_admin; do
+      executable="$ROOT/build/two-ycsb/$case-ubsm-split/$binary"
+      if ! deps=$(ldd -r "$executable" 2>&1) ||
+          [[ $deps == *"not found"* || $deps == *"undefined symbol"* ]]; then
+        printf '%s\n' "$deps" >&2
+        echo "Host cannot load $executable; use a host-compatible build image or install matching host dependencies. No UB objects have been created." >&2
+        exit 2
+      fi
+    done
+  done
+fi
+if [[ ${UB_SINGLE_BUILD_ONLY:-0} == 1 ]]; then
+  echo "Build only: no UBSM initialization or workers in this container."
+else
+  echo "UBSM: workers_host=$(uname -n), memory_provider=$provider, provider_numa=${UBSM_PROVIDER_NUMA:-4294967295}, threads=${2:-2}/${3:-${2:-2}}"
+fi
 echo "Mapping policy: CACHE data + NONCACHE atomics; atomic arena=${ATOMIC_SIZE_MB:-512} MiB."
 echo "Build logs, worker logs and results.json: $output"
 trap 'rc=$?; if (( rc != 0 )); then echo "Failed; inspect logs in $output. If a UB object was created, confirm workers stopped before manual cleanup." >&2; fi' EXIT
-read -r -a cases <<< "${CASES:-bwtree-on clevelhash-on}"
-python3 tests/two-process-ycsb/run.py \
+python3 tests/two-process-ycsb/run.py "${runner_args[@]}" \
   --cases "${cases[@]}" --memory ub --ub-api ubsm --ub-layout split \
   --atomic-size-mb "${ATOMIC_SIZE_MB:-512}" \
   --ub-library "$UBSM_LIBRARY" --ub-include "$UBSM_INCLUDE_DIR" \

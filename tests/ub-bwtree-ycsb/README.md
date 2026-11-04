@@ -53,7 +53,7 @@ A 的代码不对 UB 区域执行 store/CAS。此配置的结果不能当作原 
 ## 吞吐口径
 
 每次运行写入 `result-A-*` / `result-B-*`，包括 `build.log`、`worker.log`、
-`config.json` 和 `result.json`。两端获得相同汇总结果。
+`config.json`、`control.log` 和 `result.json`。两端获得相同汇总结果。
 
 ```
 total_ops_per_second = (A 完成操作数 + B 完成操作数) / common_seconds
@@ -79,3 +79,19 @@ python3 tests/ub-bwtree-ycsb/test_readonly.py
 用 32 条初始数据和每进程 128 次操作验证真正的 A `PROT_READ`、B 插入、分裂、
 A 跨进程查询全部 key 和成功释放；丢弃计时，不作为性能样本。
 这些检查不能证明真实双机 UB 的 CACHE/ownership 支持或硬件可见性。
+
+## 定位等待阶段
+
+终端会区分 B 监听、A 连接重试、TCP 已连接、握手完成、UB 初始化、加载和执行。
+控制阶段保存到 `control.log`；worker 的 SDK 调用和加载进度同时输出到终端及
+`worker.log`。最后一个没有对应 END 的 `BEGIN` 标记表示尚未返回的 SDK 调用。
+A 显示等待 B load 时，看 B 的日志；这不表示 TCP 还未连接。
+
+旧版只打印一次 `Waiting for other host...`，连接成功也不更新该提示。
+在测试目录另开终端，查看现有运行日志（无需重启正在运行的测试）：
+
+```sh
+tail -n 30 result-B-*/worker.log  # B 上
+```
+
+只有日志明确显示 A 无法建立 TCP 连接时，再检查 B 的 18982 监听及两机网络。

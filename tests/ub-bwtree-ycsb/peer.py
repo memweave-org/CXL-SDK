@@ -16,6 +16,7 @@ import uuid
 class Worker:
     def __init__(self, args, name, provider, log):
         self.queue = queue.Queue()
+        self.role = args.role
         self.process = subprocess.Popen([args.binary, args.role, name, provider,
             str(args.size_mb), str(args.threads), str(args.records), str(args.ops),
             args.spec, str(args.cpu)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -26,13 +27,25 @@ class Worker:
                 log.flush()
                 if line.startswith('UBYCSB '):
                     self.queue.put(line.strip()[7:])
+                else:
+                    print(f'[{args.role} worker] {line.rstrip()}', flush=True)
             self.queue.put('EOF')
         self.reader = threading.Thread(target=read, daemon=True)
         self.reader.start()
         self.timeout = args.timeout
 
     def receive(self):
-        response = self.queue.get(timeout=self.timeout)
+        start = time.monotonic()
+        deadline = start + self.timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f'worker response timed out after {self.timeout}s; inspect worker.log')
+            try:
+                response = self.queue.get(timeout=min(10, remaining))
+                break
+            except queue.Empty:
+                print(f'[{self.role}] Waiting for worker response ({time.monotonic()-start:.0f}s); see worker.log', flush=True)
         if response == 'EOF':
             raise RuntimeError('worker exited; inspect worker.log')
         return response
@@ -86,6 +99,14 @@ def main():
     worker = stream = connection = server = None
     report = {'pass': False}
     log = (args.output/'worker.log').open('w')
+    control_log = (args.output/'control.log').open('w')
+    stage = 'starting'
+    def status(message):
+        nonlocal stage
+        stage = message
+        line = f'[{args.role}] {message}'
+        print(line, flush=True)
+        control_log.write(line + '\n'); control_log.flush()
     def send(message):
         stream.write((json.dumps(message)+'\n').encode()); stream.flush()
     def receive():
@@ -94,21 +115,28 @@ def main():
             raise RuntimeError('peer disconnected')
         return json.loads(data)
     try:
-        print('Waiting for other host...', flush=True)
         if args.role == 'B':
             server = socket.socket()
             server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             server.bind((args.peer, args.port)); server.listen(1); server.settimeout(args.timeout)
-            connection, _ = server.accept()
+            status(f'Listening on {args.peer}:{args.port}; waiting for A')
+            connection, remote_address = server.accept()
+            status(f'TCP connected from {remote_address[0]}:{remote_address[1]}')
         else:
+            status(f'Connecting to B at {args.peer}:{args.port}')
             deadline = time.monotonic()+args.timeout
+            last_notice = 0.0
             while True:
                 try:
                     connection = socket.create_connection((args.peer,args.port), timeout=3)
+                    status(f'TCP connected to B at {args.peer}:{args.port}')
                     break
-                except OSError:
+                except OSError as error:
                     if time.monotonic() >= deadline:
                         raise
+                    if time.monotonic()-last_notice >= 10:
+                        status(f'Connection not established: {error}; retrying {args.peer}:{args.port}')
+                        last_notice = time.monotonic()
                     time.sleep(1)
         connection.settimeout(args.timeout)
         stream = connection.makefile('rwb')
@@ -116,6 +144,7 @@ def main():
                     'binary_sha256':hashlib.sha256(Path(args.binary).read_bytes()).hexdigest(),
                     'spec_sha256':hashlib.sha256(Path(args.spec).read_bytes()).hexdigest(),
                     'size_mb':args.size_mb,'records':args.records,'ops':args.ops}
+        status('TCP connected; exchanging configuration and binary hashes')
         send(identity); peer = receive()
         if peer['role'] == args.role or peer['host'] == identity['host']:
             raise RuntimeError('expected two different physical hosts and roles')
@@ -123,19 +152,25 @@ def main():
             if identity[key] != peer[key]:
                 raise RuntimeError('configuration mismatch: '+key)
         provider = args.provider or (identity['host'] if args.role=='B' else peer['host'])
+        status(f'Handshake complete; UB provider={provider}')
         if args.role=='B':
             name='ub-bwtree-'+uuid.uuid4().hex[:18]; send(name)
         else:
             name=receive()
+            status(f'Waiting for B to initialize UB and load BwTree; object={name}')
             if receive()!='LOADED': raise RuntimeError('B did not load')
         (args.output/'config.json').write_text(json.dumps({**vars(args),'name':name,'provider':provider,
                                                         'identity':identity,'peer':peer,
                                                         'workload':Path(args.spec).read_text()},default=str,indent=2))
+        status('Starting host worker: UB mapping, initial load (B only), and trace generation')
         worker=Worker(args,name,provider,log)
         if worker.receive()!='READY': raise RuntimeError('expected READY')
+        status('Host worker READY')
         if args.role=='B':
+            status('B load complete; waiting for A to map and prepare')
             send('LOADED')
             if receive()!='RUN': raise RuntimeError('expected RUN')
+            status('Running YCSB workload')
             worker.send('run')
             result=worker.receive()
             if not result.startswith('RESULT '): raise RuntimeError(result)
@@ -144,6 +179,7 @@ def main():
             worker.finish('release'); send('CLOSED')
             report=receive()
         else:
+            status('Both workers READY; starting YCSB workload')
             # One monotonic clock covers both starts and both completions.
             start=time.monotonic()
             send('RUN'); worker.send('run')
@@ -151,6 +187,7 @@ def main():
             if not result.startswith('RESULT '): raise RuntimeError(result)
             a=json.loads(result[7:]); b=receive()
             elapsed=time.monotonic()-start
+            status('Both workloads complete; verifying B inserts and cleaning up')
             report=summary(a,b,elapsed,args.ops)
             # Untimed: prove A can see B's inserted keys and representative initial keys.
             witnesses=[1,args.records,*b['witnesses']]
@@ -161,7 +198,7 @@ def main():
             if receive()!='CLOSED': raise RuntimeError('B cleanup failed')
             send(report)
     except Exception as error:
-        report.update({'pass':False,'error':str(error),'object_may_remain':True})
+        report.update({'pass':False,'error':str(error),'stage':stage,'object_may_remain':True})
     finally:
         if worker:
             try:
@@ -172,6 +209,7 @@ def main():
         for handle in (stream, connection, server):
             if handle: handle.close()
         if not worker or not worker.reader.is_alive(): log.close()
+        control_log.close()
         (args.output/'result.json').write_text(json.dumps(report,indent=2))
     print(json.dumps(report,indent=2),flush=True)
     return 0 if report['pass'] else 1

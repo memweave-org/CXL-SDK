@@ -14,10 +14,13 @@ using Tree=wangziqi2013::bwtree::BwTree<uint64_t,uint64_t>;
 constexpr uintptr_t BASE=0x300000000000;
 static uintptr_t arena_end;
 struct Header { Tree* tree; uint64_t records; };
-static void check(const char* op,int rc) {
-  std::cerr<<op<<" rc="<<rc<<std::endl;
+template<class F> static void check(const char* op,F call) {
+  std::cerr<<"BEGIN "<<op<<std::endl;
+  const int rc=call();
+  std::cerr<<"END "<<op<<" rc="<<rc<<std::endl;
   if(rc) throw std::runtime_error(op);
 }
+#define SDK(op, call) check(op,[&] { return (call); })
 static uint64_t value_for(uint64_t key) { return key^0x5a17b9c3d401f02eULL; }
 static bool lookup(Tree* tree,uint64_t key) {
   // No epoch writes or cooperative mutation on A; all nodes retained until exit.
@@ -57,15 +60,15 @@ int main(int argc,char** argv) {
     strcpy(provider.host_name,argv[3]);
     provider.socket_id=provider.numa_id=provider.port_id=UINT32_MAX;
     ubsmem_options_t options{};
-    check("attributes",ubsmem_init_attributes(&options));
-    check("initialize",ubsmem_initialize(&options)); initialized=true;
+    SDK("attributes",ubsmem_init_attributes(&options));
+    SDK("initialize",ubsmem_initialize(&options)); initialized=true;
     if(owner) {
-      check("allocate CACHE",ubsmem_shmem_allocate_with_provider(&provider,name.c_str(),bytes,0660,UBSM_FLAG_CACHE)); created=true;
+      SDK("allocate CACHE",ubsmem_shmem_allocate_with_provider(&provider,name.c_str(),bytes,0660,UBSM_FLAG_CACHE)); created=true;
     }
     const int prot=owner?PROT_READ|PROT_WRITE:PROT_READ;
-    check("map",ubsmem_shmem_map(reinterpret_cast<void*>(BASE),bytes,prot,MAP_SHARED|MAP_FIXED_NOREPLACE,name.c_str(),0,&address));
+    SDK("map",ubsmem_shmem_map(reinterpret_cast<void*>(BASE),bytes,prot,MAP_SHARED|MAP_FIXED_NOREPLACE,name.c_str(),0,&address));
     if(address!=reinterpret_cast<void*>(BASE)) throw std::runtime_error("SDK did not honor fixed VA");
-    check("ownership",ubsmem_shmem_set_ownership(name.c_str(),address,bytes,prot)); owned=true;
+    SDK("ownership",ubsmem_shmem_set_ownership(name.c_str(),address,bytes,prot)); owned=true;
     std::cerr<<"MAPPED role="<<role<<" pid="<<getpid()<<" address="<<address<<" prot="<<prot<<std::endl;
     auto* header=static_cast<Header*>(address);
     Tree* tree;
@@ -76,7 +79,11 @@ int main(int argc,char** argv) {
       configure_arena(static_cast<char*>(address)+4096,bytes-4096);
       tree=new(cacheable.malloc(sizeof(Tree))) Tree(false,false);
       tree->UpdateThreadLocal(threads+1); tree->AssignGCID(threads);
-      for(uint64_t key=1;key<=records;++key) insert(tree,key);
+      std::cerr<<"STAGE loading records="<<records<<std::endl;
+      for(uint64_t key=1;key<=records;++key) {
+        insert(tree,key);
+        if(key%10000==0 || key==records) std::cerr<<"STAGE loaded="<<key<<"/"<<records<<std::endl;
+      }
       header->tree=tree; header->records=records;
       clwb(address,4096+arena_used());
     } else {
@@ -88,6 +95,7 @@ int main(int argc,char** argv) {
       clflush(tree,sizeof(Tree));
     }
     // Pre-generate YCSB traces before READY, outside throughput timing.
+    std::cerr<<"STAGE generating trace ops="<<ops<<" threads="<<threads<<std::endl;
     std::vector<std::vector<Op>> traces(threads);
     for(int t=0;t<threads;++t) {
       utils::Properties props; std::ifstream spec(argv[8]);
@@ -154,10 +162,10 @@ int main(int argc,char** argv) {
         while(keys>>key) if(key && !lookup(tree,key)) ok=false;
         std::cout<<"UBYCSB "<<(ok?"VERIFIED":"BAD_VALUE")<<std::endl;
       } else if(command=="close" || (command=="release" && owner)) {
-        check("ownership NONE",ubsmem_shmem_set_ownership(name.c_str(),address,bytes,PROT_NONE)); owned=false;
-        check("unmap",ubsmem_shmem_unmap(address,bytes));address=nullptr;
-        if(command=="release") { check("deallocate",ubsmem_shmem_deallocate(name.c_str()));created=false; }
-        check("finalize",ubsmem_finalize());initialized=false;
+        SDK("ownership NONE",ubsmem_shmem_set_ownership(name.c_str(),address,bytes,PROT_NONE)); owned=false;
+        SDK("unmap",ubsmem_shmem_unmap(address,bytes));address=nullptr;
+        if(command=="release") { SDK("deallocate",ubsmem_shmem_deallocate(name.c_str()));created=false; }
+        SDK("finalize",ubsmem_finalize());initialized=false;
         std::cout<<"UBYCSB CLOSED"<<std::endl;exit_code=0;break;
       } else throw std::runtime_error("unknown command");
     }

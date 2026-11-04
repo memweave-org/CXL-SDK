@@ -27,7 +27,14 @@ bash ./run.sh
 | CACHE | `0x300000000000` | READ | RW | BwTree 节点、delta、value |
 | NONCACHE + WR_DELAY_COMP | `0x400000000000` | RW | RW | DB/树对象、映射表、epoch、OPT 元数据、线程控制及原框架共享数组 |
 
-复用现有 `SHM_UB_SPLIT` 和 `nt` 实现；UB 原子路径不注入模拟延迟。
+使用 `SHM_UB_SPLIT` 和独立的 UB NT backend：`UB_API=ubsm`（或 Memlink）
+在编译时为 `nt`、`aligned_nt`、`nt_pointer` 选择 `atomic_ub_*`，直接对对象所在的
+mmap 地址执行 CPU 原子 load/store/CAS/fetch 操作。共享原子对象由 NC arena 分配；
+栈上/进程内临时对象仍可使用。对象本身不保存模拟副本、queue 或计时状态。
+NC 的 `flush()` 只执行内存屏障，CACHE 节点仍走原有显式 cache maintenance。
+UB 构建不编译 queue 模拟源文件；`UB_API=none` 的 NO_CC 模式继续使用原 queue backend。
+兼容参数 `nt=false` 不会绕过 UB 原子操作或 CACHE 地址检查。
+`run.sh` 自动设置 `UB_API=ubsm` 并重新编译，更新后仍用相同入口，无需额外 backend 参数。
 A 正常登记/注销 epoch，可写 NC 中的 OPT 元数据；没有额外改写 `GetType()`。
 value 从 CACHE 分配并在发布前写回，避免把 B 的进程私有 malloc 指针传给 A。
 NC 的分配空间分成互不重叠的两半，分配偏移位于各进程本地。
@@ -73,6 +80,20 @@ python3 tests/YCSB-C/ub/test_framework.py --binary /absolute/path/ycsbc_nocc_no_
 
 上述二进制必须链接文件映射 SDK 替身；不要把这项本机检查指向真实 SDK 二进制。
 用于编译的替身头文件/实现见 `tests/ub-bwtree-ycsb/mock/`。
+
+从仓库根目录可独立检查 NT backend 选择及映射内存原子操作：
+
+```sh
+python3 tests/ub-api/latency_check.py
+out=$(mktemp -d /tmp/ub-nt-check-XXXXXX)
+c++ -std=c++17 -shared -fPIC -Itests/ub-bwtree-ycsb/mock \
+  tests/ub-bwtree-ycsb/mock/sdk.cc -o "$out/libubsm_sdk.so"
+c++ -std=c++17 -O2 -pthread -DSHM_LIB_WITH_UBSM -DSHM_UB_SPLIT \
+  -Itests/ub-bwtree-ycsb/mock -Ishm-lib/include \
+  tests/ub-api/nt_contract.cc shm-lib/shm/ub.cc \
+  -L"$out" -Wl,-rpath,"$out" -lubsm_sdk -o "$out/nt_contract"
+UBSM_TEST_DIRECTORY="$out/objects" "$out/nt_contract"
+```
 
 本地 worker 的 READY、RESULT、CLOSED 通过专用继承 pipe
 （`YCSB_UB_CONTROL_FD`）传给控制器；stdin 只接收控制命令，stdout/stderr 只作日志。

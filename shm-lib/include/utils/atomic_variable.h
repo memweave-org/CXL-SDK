@@ -13,7 +13,9 @@
 #include "utils/sim_id.h"
 #include "utils/timing.h"
 
-#ifdef QUEUE_SIM_CAS
+#ifdef SHM_NT_UB
+#include "atomic_ub_variable.h"
+#elif defined(QUEUE_SIM_CAS)
 #include "atomic_queued_variable.h"
 #else
 #ifdef SNIPER

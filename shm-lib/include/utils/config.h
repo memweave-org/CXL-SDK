@@ -11,9 +11,13 @@
 
 // #define OPT_NO_CC
 
+#if defined(SHM_LIB_WITH_UBSM) || defined(SHM_LIB_WITH_UB)
+    #define SHM_NT_UB
+#endif
+
 #ifdef NO_CC
     #define BYPASS_CACHE_DEFAULT (true)
-    #ifndef QUEUE_SIM_CAS
+    #if !defined(SHM_NT_UB) && !defined(QUEUE_SIM_CAS)
         #define QUEUE_SIM_CAS
     #endif
     #ifndef USE_CXL
@@ -22,7 +26,9 @@
     #else
     #define BYPASS_CACHE_DEFAULT (false)
     #ifdef USE_MSG_QUEUE
-        #define QUEUE_SIM_CAS
+        #ifndef SHM_NT_UB
+            #define QUEUE_SIM_CAS
+        #endif
         #ifndef USE_CXL
             #define USE_CXL
         #endif

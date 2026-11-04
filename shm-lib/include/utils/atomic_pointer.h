@@ -11,7 +11,9 @@
 
 using namespace std;
 
-#ifdef QUEUE_SIM_CAS
+#ifdef SHM_NT_UB
+#include "atomic_ub_pointer.h"
+#elif defined(QUEUE_SIM_CAS)
 #include "atomic_queued_pointer.h"
 #else
 

@@ -18,7 +18,7 @@ BUILD_IMAGE="$BUILD_IMAGE" SDK_ROOT="$SDK_ROOT" SDK_LIBRARY="${SDK_LIBRARY:-}" O
 export LD_LIBRARY_PATH="$out/lib:$SDK_ROOT/lib:$SDK_ROOT/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 deps=$(ldd -r "$out/ycsbc" 2>&1) || { echo "$deps"; exit 1; }
 if [[ $deps == *'not found'* || $deps == *'undefined symbol'* ]]; then echo "$deps"; exit 1; fi
-echo "物理机 $(hostname)，角色 $role，原框架 ycsbc，OPT=$OPT，日志 $out"
+echo "物理机 $(hostname)，角色 $role，原框架 ycsbc，OPT=$OPT，NT backend=UB（直接访问 NC），日志 $out"
 if [[ $role == A ]]; then threads=$THREADS_A; cpu=${CPU_A:-}; else threads=$THREADS_B; cpu=${CPU_B:-}; fi
 cpu_args=(); if [[ -n $cpu ]]; then cpu_args=(--cpu "$cpu"); fi
 python3 ./peer.py --role "$role" --peer "$B_IP" --port "$PORT" --provider "$PROVIDER_B" \

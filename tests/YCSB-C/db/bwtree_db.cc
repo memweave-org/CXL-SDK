@@ -49,11 +49,15 @@ BwTreeDB::BwTreeDB(int thread_num)
   if (tree != nullptr) {
 #ifdef USE_CXL
     bool expected = false;
+    // UB has a single writer/allocator B; its collector frees all nodes locally.
+    // No remote GC requests or message-queue dispatcher are needed on A.
+#if !defined(YCSB_UB_TWO_HOST)
     if (SimThreadInfo::worker_machine_count > 1 &&
         bwtree_gc_dispatcher_registered.compare_exchange_strong(expected,
                                                                  true)) {
       add_dispatcher(BWTREE_GC, HandleBwTreeRemoteGC);
     }
+#endif
 #endif
     // DBFactory passes one extra slot that is not used by BwTree operations.
     // Including it in epoch tracking pins min_epoch at 0 and prevents reclaim.
@@ -119,7 +123,7 @@ void BwTreeDB::ThreadClose(int thread_id) {
 int BwTreeDB::Read(const std::string& table, const std::string& key,
                    const std::vector<std::string>* fields,
                    std::vector<KVPair>& result) {
-  int finish = false;
+  std::atomic<int> finish{false};
   auto task = [this, key, &finish]() {
     long key_index = convert_std_hash(key);
     std::vector<long> val;
@@ -133,7 +137,7 @@ int BwTreeDB::Read(const std::string& table, const std::string& key,
 #ifdef USE_MSG_QUEUE
 #ifdef RETURN_SYNC
       pool->enqueue(utils::RandomValueNum(), task);
-#ifdef USE_MWAIT
+#if defined(USE_MWAIT) && defined(__x86_64__) && defined(__WAITPKG__)
         _umonitor(&finish);
         while (finish != true) {
           _umwait(0, 1);
@@ -191,7 +195,7 @@ int BwTreeDB::Scan(const std::string& table, const std::string& key, int len,
 //   int return_value = 0xF980AB;
 //   pool->enqueue(RandomThreadNum() % thread_num, SCAN, tree, key,
 //   &return_value);
-// #ifdef USE_MWAIT
+// #if defined(USE_MWAIT) && defined(__x86_64__) && defined(__WAITPKG__)
 //   _umonitor(&return_value);
 //   while (return_value == 0xF980AB) {
 //     _umwait(1, 0);
@@ -239,7 +243,7 @@ int BwTreeDB::Scan(const std::string& table, const std::string& key, int len,
 [[deprecated("Use UpdateInternal instead.")]]
 int BwTreeDB::Update(const std::string& table, const std::string& key,
                      std::vector<KVPair>& values) {
-  bool finish = false;
+  std::atomic<int> finish{false};
   auto task = [this, key, &finish]() {
     long key_index = convert_std_hash(key);
     // long rand_key = utils::RandomValueNum();    
@@ -252,7 +256,7 @@ int BwTreeDB::Update(const std::string& table, const std::string& key,
   #ifdef USE_MSG_QUEUE
     #ifdef RETURN_SYNC
     pool->enqueue(utils::RandomValueNum(), task);
-      #ifdef USE_MWAIT
+      #if defined(USE_MWAIT) && defined(__x86_64__) && defined(__WAITPKG__)
         _umonitor(&finish);
         while (finish != true) {
           _umwait(0, 1);
@@ -282,7 +286,7 @@ int BwTreeDB::UpdateInternal(uint64_t key, uintptr_t value) {
 [[deprecated("Use InsertInternal instead.")]]
 int BwTreeDB::Insert(const std::string& table, const std::string& key,
                      std::vector<KVPair>& values) {
-  bool finish = false;
+  std::atomic<int> finish{false};
   auto task = [this, key, &finish]() {
     long key_index = convert_std_hash(key);
     auto ret = tree->Insert(key_index, key_index + 1) ? DB::kOK : DB::kErrorNoData;
@@ -294,7 +298,7 @@ int BwTreeDB::Insert(const std::string& table, const std::string& key,
   #ifdef USE_MSG_QUEUE
     #ifdef RETURN_SYNC
     pool->enqueue(utils::RandomValueNum(), task);
-      #ifdef USE_MWAIT
+      #if defined(USE_MWAIT) && defined(__x86_64__) && defined(__WAITPKG__)
         _umonitor(&finish);
         while (finish != true) {
           _umwait(0, 1);
@@ -322,7 +326,7 @@ int BwTreeDB::InsertInternal(uint64_t key, uintptr_t value) {
 
 [[deprecated("Use DeleteInternal instead.")]]
 int BwTreeDB::Delete(const std::string& table, const std::string& key) {
-  bool finish = false;
+  std::atomic<int> finish{false};
   auto task = [this, key, &finish]() {
     long key_index = convert_std_hash(key);
     auto ret = tree->Delete(key_index, key_index + 1);
@@ -334,7 +338,7 @@ int BwTreeDB::Delete(const std::string& table, const std::string& key) {
   #ifdef USE_MSG_QUEUE
     #ifdef RETURN_SYNC
     pool->enqueue(utils::RandomValueNum(), task);
-      #ifdef USE_MWAIT
+      #if defined(USE_MWAIT) && defined(__x86_64__) && defined(__WAITPKG__)
         _umonitor(&finish);
         while (finish != true) {
           _umwait(0, 1);

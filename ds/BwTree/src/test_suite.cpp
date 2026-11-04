@@ -29,7 +29,7 @@ TreeType *GetEmptyTree(bool no_print) {
       gc_flush_env != nullptr && std::atoi(gc_flush_env) != 0;
 
 #ifdef USE_CXL
-  void *alloc_base = cacheable.malloc(sizeof(TreeType));
+  void *alloc_base = shared_atomic_memory().malloc(sizeof(TreeType));
 #else
   void *alloc_base = malloc(sizeof(TreeType));
 #endif
@@ -79,7 +79,7 @@ void DestroyTree(TreeType *t, bool no_print) {
 
   // delete t;
   t->~TreeType();
-  cacheable.free(t);
+  shared_atomic_memory().free(t);
 
   print_flag = false;
 

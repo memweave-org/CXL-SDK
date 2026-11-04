@@ -30,13 +30,14 @@ def main():
         os.environ['UBSM_TEST_DIRECTORY']=str(tmp/'objects')
         spec=tmp/'workload.spec'
         spec.write_text('readproportion=0\nupdateproportion=1\nrequestdistribution=uniform\n')
-        cpu=min(os.sched_getaffinity(0))
+        allowed=os.sched_getaffinity(0)
+        cpu=next(c for c in sorted(allowed) if c+1 in allowed)
         workers=[]; logs=[]
         try:
             for role in ('B','A'):
                 log=(tmp/(role+'.log')).open('w');logs.append(log)
-                args=SimpleNamespace(role=role,binary=str(binary),size_mb=128,threads=1,
-                                     records=32,ops=128,spec=str(spec),cpu=cpu,timeout=30)
+                args=SimpleNamespace(role=role,binary=str(binary),size_mb=128,threads=1 if role=='A' else 2,
+                                     thread_slots=6,nc_size_mb=128,records=32,ops=128,spec=str(spec),cpu=cpu,timeout=30)
                 worker=Worker(args,'readonly-test','fixture-owner',log);workers.append(worker)
                 assert worker.receive()=='READY'
             b,a=workers
@@ -48,6 +49,9 @@ def main():
             a.finish('close');b.finish('release')
             assert not list((tmp/'objects').iterdir())
             assert 'prot=1' in (tmp/'A.log').read_text()
+            for role in ('A','B'):
+                assert 'NC_MAPPED role='+role+' address=0x400000000000 prot=3' in (tmp/(role+'.log')).read_text()
+            assert all(r['bwtree_opt']==(os.environ.get('OPT','1')=='1') for r in results)
             print('PASS: A PROT_READ, B RW, reads/inserts and cross-process visibility; fixture only')
         except Exception:
             for role in ('A','B'):

@@ -75,7 +75,7 @@ private:
   // Pointer to global pointer (using nt type)
   nt_pointer<T>* global_ptr_;
   // Pointer to replica pointer array (using nt type)
-  std::vector<nt_pointer<T>>* replica_ptrs_;
+  nt_pointer<T>* replica_ptrs_;
   // Number of replicas
   size_t replica_num_;
 
@@ -88,10 +88,13 @@ private:
   }
 
 public:
+  // The replica buffer must remain allocated and must not resize while this
+  // helper is in use. Store its data pointer, not a process-private vector.
+  template<class Allocator>
   HelpUpdate(nt_pointer<T> &global_ptr,
-             std::vector<nt_pointer<T>> &replica_ptrs,
+             std::vector<nt_pointer<T>, Allocator> &replica_ptrs,
              size_t replica_num)
-      : global_ptr_(&global_ptr), replica_ptrs_(&replica_ptrs),
+      : global_ptr_(&global_ptr), replica_ptrs_(replica_ptrs.data()),
         replica_num_(replica_num) {}
 
   // Update all replicas for one round
@@ -110,7 +113,7 @@ public:
         return true;
       }
 
-      T* local_r = (*replica_ptrs_)[i].load();
+      T* local_r = replica_ptrs_[i].load();
       LockedPointer<T> local = LockedPointer<T>::from_locked(local_r);
       if (local != expected) {
         cur_global_ptr = global_ptr_->load();
@@ -118,7 +121,7 @@ public:
         if (cur_global != expected) {
           return false;
         }
-        if (!current_cas((*replica_ptrs_)[i], local_r, expected.with_lock())) {
+        if (!current_cas(replica_ptrs_[i], local_r, expected.with_lock())) {
           return false;
         }
       }
@@ -160,7 +163,7 @@ public:
   // Returns correct ptr (with lock bit cleared)
   T* load_ptr(size_t thread_id) {
     assert(thread_id < replica_num_);
-    T* local_r = (*replica_ptrs_)[thread_id].load();
+    T* local_r = replica_ptrs_[thread_id].load();
 
     if (!LockedPointer<T>::has_lock(local_r)) {
       return local_r;
@@ -173,8 +176,8 @@ public:
       help_update(cleared_val, thread_id + 1);
     }
     // printf("load_ptr cas old: %p, new: %p\n", local_r, cleared_val);
-    current_cas((*replica_ptrs_)[thread_id], local_r, cleared_val);
-    // printf("load_ptr success: %p, %p\n", cleared_val, (*replica_ptrs_)[thread_id]);
+    current_cas(replica_ptrs_[thread_id], local_r, cleared_val);
+    // printf("load_ptr success: %p, %p\n", cleared_val, replica_ptrs_[thread_id]);
     return cleared_val;
   }
 };

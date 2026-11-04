@@ -54,10 +54,30 @@ class MPMCQueue {
     return *this;
   }
 
+  // Placement diagnostics only; never used on the enqueue/dequeue hot path.
+  const void* storage_address() { return buffer.load(); }
   MPMCQueue(const MPMCQueue&) = delete;
   MPMCQueue& operator=(const MPMCQueue&) = delete;
 
   ~MPMCQueue() = default;
+
+  // One reservation attempt, matching the MPSC retry policy. Failure (full or
+  // contention) claims no ticket, so the producer may try another queue.
+  template <typename U>
+  bool try_enqueue(U&& item) {
+    size_t current_tail = tail.load();
+    auto& slot = buffer[idx(current_tail)];
+    const size_t generation = turn(current_tail);
+    if (slot.turn.load(std::memory_order_acquire) != generation * 2)
+      return false;
+    if (!tail.compare_exchange_strong(current_tail, current_tail + 1))
+      return false;
+    // A claimed ticket must be published, even if its producer is delayed.
+    slot.value = std::forward<U>(item);
+    clwb(&slot.value, sizeof(T));
+    slot.turn.store(generation * 2 + 1, std::memory_order_release);
+    return true;
+  }
 
   template <typename U>
   bool enqueue(U&& item) {
@@ -90,7 +110,7 @@ class MPMCQueue {
 #endif
     size_t current_head = head.fetch_add(1);
     auto& slot = buffer[idx(current_head)];
-#ifdef USE_MWAIT
+#if defined(USE_MWAIT) && defined(__x86_64__) && defined(__WAITPKG__)
     while (turn(current_head) * 2 + 1 !=
            slot.turn.load(std::memory_order_acquire)) {
       _umonitor(&slot.turn);

@@ -19,6 +19,7 @@
 #include "connection/establish.h"
 #include "core/core_workload.h"
 #include "core/db.h"
+#include "core/ub_session.h"
 #include "core/delegator/load_manager.h"
 #include "core/delegator/master_trx_manager.h"
 #include "core/delegator/trx_thread_controller.h"
@@ -114,7 +115,7 @@ void PrepareShmEnv(inicpp::IniManager &ini) {
 }
 
 auto build_dbs(utils::Properties &props) {
-  auto dbs = ALLOC_AND_CONSTRUCT(cxl_vector<ycsbc::DB *>, cacheable.malloc);
+  auto dbs = ALLOC_AND_CONSTRUCT(cxl_vector<ycsbc::DB *>, shared_atomic_memory().malloc);
   dbs->reserve(SimThreadInfo::worker_db_count);
   for (uint32_t i = 0; i < SimThreadInfo::worker_db_count; i++) {
     ycsbc::DB *db = ycsbc::DBFactory::CreateDB(props);
@@ -168,8 +169,12 @@ void master_process(utils::Properties &props) {
   std::cerr << "========================================\n" << std::endl;
 #endif
   
+#ifdef YCSB_UB_TWO_HOST
+  std::vector<std::string> machine_list{"UB-prestarted-A"};
+#else
   auto machine_list =stoi(props.GetProperty("machinenum", "1")) == 1 ? std::vector<std::string>() :
       FollowerManager::split_machines(props.GetProperty("follower_list"));
+#endif
   assert(machine_list.size() == SimThreadInfo::worker_machine_count - 1);
 
   double duration;
@@ -178,7 +183,7 @@ void master_process(utils::Properties &props) {
   size_t total_trx_ops =
       stoi(props.GetProperty(ycsbc::CoreWorkload::OPERATION_COUNT_PROPERTY));
   auto master_trx_manager =
-      ALLOC_AND_CONSTRUCT(ycsbc::MasterTransactionManager, cacheable.malloc,
+      ALLOC_AND_CONSTRUCT(ycsbc::MasterTransactionManager, shared_atomic_memory().malloc,
                           machine_list, dbs, wl, total_trx_ops);
   master_trx_manager->Execute(props, duration, sum);
 
@@ -206,6 +211,10 @@ void master_process(utils::Properties &props) {
   }
 #endif
 
+#ifdef YCSB_UB_TWO_HOST
+  // A must have finished and unmapped before destroying the shared DB.
+  ycsbc_ub::await_cleanup();
+#endif
   for (uint32_t i = 0; i < SimThreadInfo::worker_db_count; i++) {
     ycsbc::DB *db = (*dbs)[i];
 #ifdef USE_CXL
@@ -218,6 +227,9 @@ void master_process(utils::Properties &props) {
 }
 
 void follower_process(utils::Properties &props) {
+#ifdef YCSB_UB_TWO_HOST
+  g_var_struct=static_cast<GlobalVariables*>(ycsbc_ub::control_header());
+#else
   std::string hexAddrStr = props.GetProperty("share_var");
   void *addr = nullptr;
 
@@ -225,11 +237,21 @@ void follower_process(utils::Properties &props) {
   ss << std::hex << hexAddrStr;
   ss >> addr;
   g_var_struct = (GlobalVariables *)addr;
+#endif
 
   auto trx_thread_controller = g_var_struct->trx_thread_controller;
 
   trx_thread_controller->StartThreads();
+#ifdef YCSB_UB_TWO_HOST
+  trx_thread_controller->WaitForLocalReady();
+  ycsbc_ub::ready();
+  utils::Timer<double> local_timer; local_timer.Start();
+#endif
   trx_thread_controller->WaitForLocalThreads();
+#ifdef YCSB_UB_TWO_HOST
+  trx_thread_controller->ReportLocal(local_timer.End());
+  ycsbc_ub::await_cleanup();
+#endif
   std::cerr << "Follower machine " << SimThreadInfo::worker_machine_id
             << " finished." << std::endl;
 }
@@ -276,12 +298,19 @@ int main(const int argc, const char *argv[]) {
     std::cin.get();
   }
 
+#ifdef YCSB_UB_TWO_HOST
+  ycsbc_ub::prepare(props);
+#else
   PrepareShmEnv(ini_manager);
+#endif
   if (SimThreadInfo::is_master()) {
     master_process(props);
   } else {
     follower_process(props);
   }
+#ifdef YCSB_UB_TWO_HOST
+  ycsbc_ub::finish();
+#endif
 #ifdef LIMIT_ATOMIC
   cxl_std::exit_atomic_library();
 #endif

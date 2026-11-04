@@ -108,3 +108,6 @@ endif()
 
 # 公开头文件目录
 target_include_directories(shm-lib PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+
+option(WITH_UB "Deprecated alias for UB_API=memlink" OFF)
+include(${CMAKE_CURRENT_SOURCE_DIR}/../cmake/UBBackend.cmake)

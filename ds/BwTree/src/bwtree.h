@@ -1,3 +1,4 @@
+#include "shm/cxl_type.h"
 //===----------------------------------------------------------------------===//
 //
 //                         PelotonDB
@@ -43,6 +44,7 @@
 #include <iostream>
 
 #include "shm/mm.h"
+#include "allocation_context.h"
 #ifdef USE_CXL
 #include "msg/msg_collector.h"
 #include "shm/mempool.h"
@@ -50,6 +52,12 @@
 #endif
 #include "utils/atomic_variable.h"
 #include "utils/config.h"
+#ifndef BWTREE_MAPPING_CACHE_DRAM
+#define BWTREE_MAPPING_CACHE_DRAM 0
+#endif
+#if defined(NO_CC) && defined(OPT_IN_USE_FLAG) && !defined(NT_SIM) && BWTREE_MAPPING_CACHE_DRAM
+#include "dram_mapping_cache.h"
+#endif
 #include "utils/timing.h"
 #ifdef OPT_ROOT_READ
 #include "replica_help_update/help_update.h"
@@ -212,9 +220,10 @@ static_assert(BWTREE_MAPPING_TABLE_BITS >= 10 && BWTREE_MAPPING_TABLE_BITS <= 30
               "BWTREE_MAPPING_TABLE_BITS must be between 10 and 30");
 #define MAPPING_TABLE_SIZE ((size_t)(1ULL << BWTREE_MAPPING_TABLE_BITS))
 
-// If the length of delta chain exceeds ( >= ) this then we consolidate the node
-#define INNER_DELTA_CHAIN_LENGTH_THRESHOLD ((int)8)
-#define LEAF_DELTA_CHAIN_LENGTH_THRESHOLD ((int)8)
+// Trigger consolidation at this depth to reduce dependent CXL reads.
+// This is not a hard chain-length bound: consolidation can fail or be deferred.
+#define INNER_DELTA_CHAIN_LENGTH_THRESHOLD ((int)4)
+#define LEAF_DELTA_CHAIN_LENGTH_THRESHOLD ((int)4)
 
 // If node size goes above this then we split it
 #define INNER_NODE_SIZE_UPPER_THRESHOLD ((int)128)
@@ -356,6 +365,7 @@ protected:
     // The number of nodes inside this GC context
     // We use this as a threshold to trigger GC
     uint64_t node_count;
+    uint64_t pending_bytes;
 
     /*
      * Default constructor
@@ -364,7 +374,7 @@ protected:
         : last_active_epoch{std::numeric_limits<uint64_t>::max()},
           header{},
           last_p{&header},
-          node_count{0UL} {}
+          node_count{0UL}, pending_bytes{0UL} {}
   };
 
   // Make sure class Data does not exceed one cache line
@@ -443,12 +453,12 @@ protected:
   // We need to make it atomic since multiple threads might try to modify it
 #ifdef NO_CC
 #if defined(NO_CC) && defined(OPT_GC)
-  uint64_t epoch;
+  std::atomic<uint64_t> epoch;
 #else
   nt<uint64_t> epoch;
 #endif
 #else
-  uint64_t epoch;
+  std::atomic<uint64_t> epoch;
 #endif
 
  public:
@@ -478,7 +488,7 @@ protected:
     }
 
     // Free memory using original pointer rather than adjusted pointer
-    // cacheable.free(original_p);
+    // bwtree_memory().free(original_p);
 
     return;
   }
@@ -501,7 +511,7 @@ protected:
       size_t malloc_size = cl_size * 3 * (thread_num + 1);
 #endif
 #ifdef USE_CXL
-      original_p = static_cast<unsigned char *>(cacheable.malloc(malloc_size));
+      original_p = static_cast<unsigned char *>(shared_atomic_memory(bwtree_memory()).malloc(malloc_size));
 #else
       original_p = static_cast<unsigned char *>(malloc(malloc_size));
 #endif
@@ -532,7 +542,7 @@ protected:
       size_t malloc_size = cl_size * 3 * (thread_num + 1);
 #endif
 #ifdef USE_CXL
-      original_p2 = static_cast<unsigned char *>(cacheable.malloc(malloc_size));
+      original_p2 = static_cast<unsigned char *>(shared_atomic_memory(bwtree_memory()).malloc(malloc_size));
 #else
       original_p2 = static_cast<unsigned char *>(malloc(malloc_size));
 #endif
@@ -650,11 +660,12 @@ protected:
     epoch++;
 #if defined(NO_CC) && defined(OPT_GC)
     uint64_t min_epoch = std::numeric_limits<uint64_t>::max();
-    // when increase epoch, we need to update all thread's last_active_epoch
+    // Only workers may publish quiescence. Advancing a running worker's
+    // last_active_epoch here can reclaim nodes it still references.
+    // The collector samples progress and publishes a conservative minimum.
     for (int i = 0; i < static_cast<int>(thread_num); i++) {
       auto meta = GetGCMetaData(i);
       min_epoch = std::min(meta->last_active_epoch.load(), min_epoch);
-      GetGCMetaData(i)->last_active_epoch.store(epoch);
     }
 
     // update all thread's minimun_epoch
@@ -2091,12 +2102,18 @@ class BwTree : public BwTreeBase {
     // One reasonable amount of memory for each chunk is
     // delta chain len * struct len + sizeof this struct
     static constexpr size_t CHUNK_SIZE =
+#ifdef SHM_UB_SPLIT
+        (sizeof(DeltaNodeUnion) * 8 + sizeof(AllocationMeta) + 63) & ~size_t(63);
+#else
         sizeof(DeltaNodeUnion) * 8 + sizeof(AllocationMeta);
+#endif
 
    private:
     // This points to the higher address end of the chunk we are
     // allocating from
-#ifdef NO_CC
+#ifdef SHM_UB_SPLIT
+    nt<char *>& tail;
+#elif defined(NO_CC)
     nt<char *> tail;
 #else
     std::atomic<char *> tail;
@@ -2105,14 +2122,25 @@ class BwTree : public BwTreeBase {
     char *const limit;
     // This forms a linked list which needs to be traversed in order to
     // free chunks of memory
+#ifdef SHM_UB_SPLIT
+    std::atomic<AllocationMeta *>& next;
+#else
     std::atomic<AllocationMeta *> next;
+#endif
 
    public:
     /*
      * Constructor
      */
     AllocationMeta(char *p_tail, char *p_limit)
+#ifdef SHM_UB_SPLIT
+        : tail(make_shared_atomic<nt<char *>>(p_tail)), limit{p_limit},
+          next(make_shared_atomic<std::atomic<AllocationMeta *>>(nullptr)) {
+      clwb(this, sizeof(*this));
+    }
+#else
         : tail{p_tail}, limit{p_limit}, next{nullptr} {}
+#endif
 
     /*
      * TryAllocate() - Try to allocate from this chunk
@@ -2125,6 +2153,10 @@ class BwTree : public BwTreeBase {
      * size
      */
     void *TryAllocate(size_t size) {
+#ifdef SHM_UB_SPLIT
+      // Different hosts must not publish independently dirty parts of one line.
+      size = (size + 63) & ~size_t(63);
+#endif
       // This acts as a guard to prevent allocating from a chunk which
       // has already underflown to avoid integer (64 bit pointer)
       // underflow
@@ -2169,7 +2201,7 @@ class BwTree : public BwTreeBase {
       }
 #ifdef USE_CXL
       char *new_chunk;
-      cacheable.clalign((void **)&new_chunk, CHUNK_SIZE);
+      bwtree_memory().clalign((void **)&new_chunk, CHUNK_SIZE);
 #else
       char *new_chunk = new char[CHUNK_SIZE];
 #endif
@@ -2197,7 +2229,7 @@ class BwTree : public BwTreeBase {
       // to complete the entire sequence which should be done by the compiler
       new_meta_base->~AllocationMeta();
 #ifdef USE_CXL
-      cacheable.free(new_chunk);
+      bwtree_memory().free(new_chunk);
 #else
       delete[] new_chunk;
 #endif
@@ -2263,7 +2295,7 @@ class BwTree : public BwTreeBase {
         // returned by operator new[]
         meta_p->~AllocationMeta();
 #ifdef USE_CXL
-        cacheable.free(reinterpret_cast<char *>(meta_p));
+        bwtree_memory().free(reinterpret_cast<char *>(meta_p));
 #else
         delete[] reinterpret_cast<char *>(meta_p);
 #endif
@@ -2294,9 +2326,18 @@ class BwTree : public BwTreeBase {
 
 #ifdef OPT_IN_USE_FLAG
 #ifdef OPT_DUP_IN_USE_FLAG
+#ifdef SHM_UB_SPLIT
+    std::array<nt<uint64_t>, OPT_DUP_IN_USE_FLAG>& status_flag =
+        make_shared_atomic<std::array<nt<uint64_t>, OPT_DUP_IN_USE_FLAG>>();
+#else
     std::array<nt<uint64_t>, OPT_DUP_IN_USE_FLAG> status_flag;
+#endif
+#else
+#ifdef SHM_UB_SPLIT
+    nt<uint64_t>& status_flag = make_shared_atomic<nt<uint64_t>>();
 #else
     nt<uint64_t> status_flag;
+#endif
 #endif
 #endif
 
@@ -2544,7 +2585,7 @@ class BwTree : public BwTreeBase {
       // Note: do not make it constant since it is going to be modified
       // after being returned
 #ifdef USE_CXL
-      char *alloc_base = (char *)cacheable.malloc(sizeof(ElasticNode) +
+      char *alloc_base = (char *)bwtree_memory().malloc(sizeof(ElasticNode) +
                                                  size * sizeof(ElementType) +
                                                  AllocationMeta::CHUNK_SIZE);
 #else
@@ -3011,7 +3052,7 @@ class BwTree : public BwTreeBase {
 #ifdef OPT_ROOT_READ
     // FreeNodeByNodeID() resolves the root through GetRootPtr(), so the
     // replicated-pointer helper must outlive the node teardown.
-    delete root_help_update;
+    if (root_help_update) { root_help_update->~HelpUpdate<BaseNode>(); bwtree_memory().free(root_help_update); }
     root_help_update = nullptr;
 #endif
 
@@ -3095,7 +3136,7 @@ class BwTree : public BwTreeBase {
 // #ifdef OPT_IN_USE_FLAG
 //     // FIXME: now we directly set instead of sending message
 //     for (size_t i = 0; i < DEFAULT_MACHINE_COUNT; i++) {
-//         cached_mapping_table[i][node_id].store(nullptr);
+//         cached_mapping_table[i][node_id].store(0);
 //     }
 // #endif
 #if defined(NO_CC)
@@ -3128,7 +3169,7 @@ class BwTree : public BwTreeBase {
 // #ifdef OPT_IN_USE_FLAG
 //     // FIXME: now we directly set instead of sending message
 //     for (size_t i = 0; i < DEFAULT_MACHINE_COUNT; i++) {
-//         cached_mapping_table[i][node_id].store(nullptr);
+//         cached_mapping_table[i][node_id].store(0);
 //     }
 // #endif
 #ifdef NO_CC
@@ -3419,8 +3460,8 @@ class BwTree : public BwTreeBase {
     for (size_t i = 0; i < DEFAULT_MACHINE_COUNT; i++) {
       // memset(&cached_mapping_table[i], 0, MAPPING_TABLE_SIZE);
       for (size_t j = 0; j < MAPPING_TABLE_SIZE; j++) {
-        if (cached_mapping_table[i][j].load() != nullptr) {
-          cached_mapping_table[i][j].store(nullptr);
+        if (cached_mapping_table[i][j].load() != 0) {
+          cached_mapping_table[i][j].store(0);
         }
       }
     }
@@ -3454,7 +3495,7 @@ class BwTree : public BwTreeBase {
   }
 
   void ConfigureRootPointerReplicas() {
-    delete root_help_update;
+    if (root_help_update) { root_help_update->~HelpUpdate<BaseNode>(); bwtree_memory().free(root_help_update); }
     root_help_update = nullptr;
     root_node_replicas.clear();
     root_node_replicas.resize(thread_num);
@@ -3469,7 +3510,7 @@ class BwTree : public BwTreeBase {
     for (size_t i = 0; i < thread_num; ++i) {
       root_node_replicas[i].store(const_cast<BaseNode *>(root_p));
     }
-    root_help_update = new HelpUpdate<BaseNode>(
+    root_help_update = new (shared_atomic_memory(bwtree_memory()).malloc(sizeof(HelpUpdate<BaseNode>))) HelpUpdate<BaseNode>(
         global_root_node_p, root_node_replicas, thread_num);
   }
 
@@ -3505,7 +3546,12 @@ class BwTree : public BwTreeBase {
     // If the first element is true then the NodeID is a valid one
     // If the first element is false then NodeID is invalid and the
     // stack is either empty or being used (we cannot lock and wait)
+#ifdef YCSB_UB_TWO_HOST
+    // This implementation never pushes freed NodeIDs; avoid unused 128-bit CAS on UB.
+    auto ret_pair = std::make_pair(false, NodeID{});
+#else
     auto ret_pair = free_node_id_list.Pop();
+#endif
 
     // If there is no free node id
     if (ret_pair.first == false) {
@@ -3668,9 +3714,10 @@ class BwTree : public BwTreeBase {
     // bypass_cache == true: should use data in mapping_table and update cache
     // bypass_cache == false: use data in cache
     if (bypass_cache == false) {
-      const BaseNode *cached = GetLocalCacheMappingTable()[node_id].load();
+      const uintptr_t cached_entry = GetLocalCacheMappingTable()[node_id].load();
+      const BaseNode *cached = DecodeCachedNode(cached_entry);
       if (cached != nullptr) {
-        if (cached->IsOnLeafDeltaChain()) {
+        if (CachedNodeIsLeaf(cached_entry)) {
           ret = mapping_table[node_id].load();
           CatchupLocalCacheMappingTable(node_id, ret);
           assert(ret != nullptr);
@@ -3726,7 +3773,7 @@ class BwTree : public BwTreeBase {
 
 #ifdef OPT_IN_USE_FLAG
     assert(bypass_cache == true);
-    GetLocalCacheMappingTable()[node_id].store(ret);
+    GetLocalCacheMappingTable()[node_id].store(EncodeCachedNode(ret));
 #endif
 
   #ifdef PLOAD_COMMON_STAT
@@ -6999,7 +7046,7 @@ class BwTree : public BwTreeBase {
             // destroyed since they are both put into the GC chain
 #ifdef USE_CXL
             InnerRemoveNode *fake_remove_node_p =
-                static_cast<InnerRemoveNode *>(cacheable.malloc(sizeof(InnerRemoveNode)));
+                static_cast<InnerRemoveNode *>(bwtree_memory().malloc(sizeof(InnerRemoveNode)));
             new (fake_remove_node_p) InnerRemoveNode{new_root_id, inner_node_p};
 #else
             const InnerRemoveNode *fake_remove_node_p =
@@ -7386,7 +7433,7 @@ class BwTree : public BwTreeBase {
           // is deleted
 #ifdef USE_CXL
           LeafRemoveNode *fake_remove_node_p =
-              static_cast<LeafRemoveNode *>(cacheable.malloc(sizeof(LeafRemoveNode)));
+              static_cast<LeafRemoveNode *>(bwtree_memory().malloc(sizeof(LeafRemoveNode)));
           new (fake_remove_node_p) LeafRemoveNode{new_node_id, new_leaf_node_p};
 #else
           const LeafRemoveNode *fake_remove_node_p =
@@ -7442,7 +7489,7 @@ class BwTree : public BwTreeBase {
 
 #ifdef USE_CXL
         LeafRemoveNode *remove_node_p =
-            static_cast<LeafRemoveNode *>(cacheable.malloc(sizeof(LeafRemoveNode)));
+            static_cast<LeafRemoveNode *>(bwtree_memory().malloc(sizeof(LeafRemoveNode)));
         new (remove_node_p) LeafRemoveNode{node_id, node_p};
 #else
         const LeafRemoveNode *remove_node_p = new LeafRemoveNode{node_id, node_p};
@@ -7462,7 +7509,7 @@ class BwTree : public BwTreeBase {
 
 #ifdef USE_CXL
           remove_node_p->~LeafRemoveNode();
-          cacheable.free(remove_node_p);
+          bwtree_memory().free(remove_node_p);
 #else
           delete remove_node_p;
 #endif
@@ -7559,7 +7606,7 @@ class BwTree : public BwTreeBase {
           // be destroyed before fake_remove_node_p is destroyed
 #ifdef USE_CXL
           InnerRemoveNode *fake_remove_node_p =
-              static_cast<InnerRemoveNode *>(cacheable.malloc(sizeof(InnerRemoveNode)));
+              static_cast<InnerRemoveNode *>(bwtree_memory().malloc(sizeof(InnerRemoveNode)));
           new (fake_remove_node_p) InnerRemoveNode{new_node_id, new_inner_node_p};
 #else
           const InnerRemoveNode *fake_remove_node_p =
@@ -7623,7 +7670,7 @@ class BwTree : public BwTreeBase {
 
 #ifdef USE_CXL
         InnerRemoveNode *remove_node_p =
-            static_cast<InnerRemoveNode *>(cacheable.malloc(sizeof(InnerRemoveNode)));
+            static_cast<InnerRemoveNode *>(bwtree_memory().malloc(sizeof(InnerRemoveNode)));
         new (remove_node_p) InnerRemoveNode{node_id, node_p};
 #else
         const InnerRemoveNode *remove_node_p = new InnerRemoveNode{node_id, node_p};
@@ -7647,7 +7694,7 @@ class BwTree : public BwTreeBase {
 
 #ifdef USE_CXL
           remove_node_p->~InnerRemoveNode();
-          cacheable.free(remove_node_p);
+          bwtree_memory().free(remove_node_p);
 #else
           delete remove_node_p;
 #endif
@@ -7733,7 +7780,7 @@ class BwTree : public BwTreeBase {
 
 #ifdef USE_CXL
     InnerAbortNode *abort_node_p =
-        static_cast<InnerAbortNode *>(cacheable.malloc(sizeof(InnerAbortNode)));
+        static_cast<InnerAbortNode *>(bwtree_memory().malloc(sizeof(InnerAbortNode)));
     new (abort_node_p) InnerAbortNode{parent_node_p};
 #else
     InnerAbortNode *abort_node_p = new InnerAbortNode{parent_node_p};
@@ -7753,7 +7800,7 @@ class BwTree : public BwTreeBase {
 
 #ifdef USE_CXL
       abort_node_p->~InnerAbortNode();
-      cacheable.free(abort_node_p);
+      bwtree_memory().free(abort_node_p);
 #else
       delete abort_node_p;
 #endif
@@ -8445,6 +8492,42 @@ class BwTree : public BwTreeBase {
    *
    * This functions shares a same structure with the Insert() one
    */
+  // Atomic replacement for the unique-key benchmark adapter. Both deltas
+  // become visible through one mapping-table CAS, so readers see no gap.
+  bool CompareExchangeValue(const KeyType &key, const ValueType &expected,
+                            const ValueType &desired, ValueType &committed) {
+    EpochNode *epoch = epoch_manager.JoinEpoch();
+    for (;;) {
+      Context context{key};
+      std::pair<int, bool> position;
+      if (!Traverse(&context, &expected, &position)) {
+        epoch_manager.LeaveEpoch(epoch);
+        return false;
+      }
+      auto *snapshot = GetLatestNodeSnapshot(&context);
+      const BaseNode *head = snapshot->node_p;
+      const auto *del = LeafInlineAllocateOfType(
+          LeafDeleteNode, head, key, expected, head, position);
+      // A base-record replacement inserts just after that base record;
+      // a delta-record replacement inherits its insertion position.
+      std::pair<int,bool> insertion{position.first + (position.second ? 1 : 0), false};
+      const auto *ins = LeafInlineAllocateOfType(
+          LeafInsertNode, head, key, desired, del, insertion);
+#ifdef NO_CC
+#ifndef NO_CC_WO_FLUSH_NODE
+      del->FlushNode();
+#endif
+#endif
+      if (InstallNodeToReplace(snapshot->node_id, ins, head)) {
+        committed = ins->item.second;
+        epoch_manager.LeaveEpoch(epoch);
+        return true;
+      }
+      ins->~LeafInsertNode();
+      del->~LeafDeleteNode();
+    }
+  }
+
   bool Delete(const KeyType &key, const ValueType &value) {
     bwt_printf("Delete called\n");
 
@@ -8634,6 +8717,8 @@ class BwTree : public BwTreeBase {
  public:
 #endif
 
+  uint64_t gc_byte_threshold=0; // Optional per-worker retired-memory budget.
+
   struct GCStats {
     std::atomic<uint64_t> auto_trigger_count{0};
     std::atomic<uint64_t> perform_gc_count{0};
@@ -8774,6 +8859,9 @@ class BwTree : public BwTreeBase {
   }
 
  public:
+  // Configure before starting workers; zero preserves the node-count policy.
+  void SetGCByteThreshold(uint64_t bytes) { gc_byte_threshold=bytes; }
+
   void PrintGCStats(std::ostream &os) const {
     const uint64_t perform_count =
         gc_stats.perform_gc_count.load(std::memory_order_relaxed);
@@ -8797,6 +8885,7 @@ class BwTree : public BwTreeBase {
         gc_stats.flush_1024_bytes_total.load(std::memory_order_relaxed);
 
     os << "BwTree GC stats: threshold_nodes=" << GC_NODE_COUNT_THREADHOLD
+       << " threshold_bytes=" << gc_byte_threshold
        << " auto_triggers="
        << gc_stats.auto_trigger_count.load(std::memory_order_relaxed)
        << " perform_gc_calls=" << perform_count
@@ -8877,7 +8966,7 @@ class BwTree : public BwTreeBase {
           request_ready{false},
           request_done{false} {
       if (enabled == true) {
-        worker_thread = std::thread{[this]() { this->ThreadFunc(); }};
+        worker_thread = bwtree_background_thread([this]() { this->ThreadFunc(); });
       }
     }
 
@@ -9013,9 +9102,18 @@ class BwTree : public BwTreeBase {
   using mapping_table_t = std::array<nt<const BaseNode *>, MAPPING_TABLE_SIZE>;
   mapping_table_t mapping_table;
   #ifdef OPT_IN_USE_FLAG
-    using cached_mapping_table_t = std::array<std::atomic<const BaseNode *>, MAPPING_TABLE_SIZE>;
+    // Bit 0 records leaf-chain membership; publish it with the pointer.
+    using cached_mapping_table_t = std::array<std::atomic<uintptr_t>, MAPPING_TABLE_SIZE>;
+    static_assert(alignof(BaseNode) >= 2, "Cached node pointers need a free low bit");
+    static_assert(sizeof(std::atomic<uintptr_t>) == sizeof(std::atomic<const BaseNode *>),
+                  "Tagged mapping entries must retain the pointer-sized layout");
     #ifndef NT_SIM // NO NT_SIM, use vector
+#if BWTREE_MAPPING_CACHE_DRAM
+      DramMappingCache<cached_mapping_table_t, DEFAULT_MACHINE_COUNT> cached_mapping_table{
+          SimThreadInfo::worker_machine_count > 1};
+#else
       std::array<cached_mapping_table_t, DEFAULT_MACHINE_COUNT> cached_mapping_table{};
+#endif
     #else // define NT_SIM, use only one cached_mapping_table_t
       cached_mapping_table_t cached_mapping_table{};
     #endif
@@ -9030,13 +9128,17 @@ class BwTree : public BwTreeBase {
   // frequently-read root pointer and are updated with the same cooperative
   // protocol used by CLevelHash's replicated meta pointer.
   nt_pointer<BaseNode> global_root_node_p{nullptr};
-  std::vector<nt_pointer<BaseNode>> root_node_replicas;
+  std::vector<nt_pointer<BaseNode>, BwTreeAllocator<nt_pointer<BaseNode>>> root_node_replicas;
   HelpUpdate<BaseNode> *root_help_update{nullptr};
 #endif
 
   // This list holds free NodeID which was removed by remove delta
   // We recycle NodeID in epoch manager
+#ifdef YCSB_UB_TWO_HOST
+  struct UnusedNodeIDFreelist {} free_node_id_list;
+#else
   AtomicStack<NodeID, MAPPING_TABLE_SIZE> free_node_id_list;
+#endif
 
   std::atomic<uint64_t> insert_op_count;
   std::atomic<uint64_t> insert_abort_count;
@@ -9076,9 +9178,28 @@ class BwTree : public BwTreeBase {
 #endif
   }
 
+  static constexpr uintptr_t kCachedLeafBit = uintptr_t{1};
+
+  static inline const BaseNode *DecodeCachedNode(uintptr_t entry) {
+    return reinterpret_cast<const BaseNode *>(entry & ~kCachedLeafBit);
+  }
+
+  static inline bool CachedNodeIsLeaf(uintptr_t entry) {
+    return (entry & kCachedLeafBit) != 0;
+  }
+
+  static inline uintptr_t EncodeCachedNode(const BaseNode *node_p) {
+    if (node_p == nullptr) return 0;
+    const uintptr_t pointer = reinterpret_cast<uintptr_t>(node_p);
+    assert((pointer & kCachedLeafBit) == 0);
+    return pointer | (node_p->IsOnLeafDeltaChain() ? kCachedLeafBit : 0);
+  }
+
   inline void CatchupLocalCacheMappingTable(NodeID node_id, const BaseNode *node_p) {
-    if (GetLocalCacheMappingTable()[node_id].load() != node_p) {
-      GetLocalCacheMappingTable()[node_id].store(node_p);
+    auto &slot = GetLocalCacheMappingTable()[node_id];
+    // The node's type is immutable. Do not re-read its header on unchanged hits.
+    if (DecodeCachedNode(slot.load()) != node_p) {
+      slot.store(EncodeCachedNode(node_p));
     }
   }
 #endif
@@ -9213,9 +9334,9 @@ class BwTree : public BwTreeBase {
      */
     EpochManager(BwTree *p_tree_p) : tree_p{p_tree_p} {
       // Use cacheable allocator for shared memory support
-      std::cout << "[EpochManager] Allocating EpochNode using cacheable.malloc" << std::endl;
+      std::cout << "[EpochManager] Allocating EpochNode using bwtree_memory().malloc" << std::endl;
       std::cout.flush();
-      current_epoch_p = static_cast<EpochNode*>(cacheable.malloc(sizeof(EpochNode)));
+      current_epoch_p = static_cast<EpochNode*>(shared_atomic_memory(bwtree_memory()).malloc(sizeof(EpochNode)));
       std::cout << "[EpochManager] Allocated EpochNode at " << current_epoch_p << std::endl;
       std::cout.flush();
       if (current_epoch_p == nullptr) {
@@ -9347,7 +9468,7 @@ class BwTree : public BwTreeBase {
       bwt_printf("Creating new epoch...\n");
 
       // Use cacheable allocator for shared memory support
-      EpochNode *epoch_node_p = static_cast<EpochNode*>(cacheable.malloc(sizeof(EpochNode)));
+      EpochNode *epoch_node_p = static_cast<EpochNode*>(shared_atomic_memory(bwtree_memory()).malloc(sizeof(EpochNode)));
       new (epoch_node_p) EpochNode{};
 
       epoch_node_p->active_thread_count = 0;
@@ -9392,7 +9513,7 @@ class BwTree : public BwTreeBase {
 
       // These two could be predetermined
 #ifdef USE_CXL
-      GarbageNode *garbage_node_p = static_cast<GarbageNode*>(cacheable.malloc(sizeof(GarbageNode)));
+      GarbageNode *garbage_node_p = static_cast<GarbageNode*>(shared_atomic_memory(bwtree_memory()).malloc(sizeof(GarbageNode)));
       new (garbage_node_p) GarbageNode{};
 #else
       GarbageNode *garbage_node_p = new GarbageNode;
@@ -9625,7 +9746,7 @@ class BwTree : public BwTreeBase {
 
 #ifdef USE_CXL
             ((LeafRemoveNode *)node_p)->~LeafRemoveNode();
-            cacheable.free(const_cast<BaseNode *>(node_p));
+            bwtree_memory().free(const_cast<BaseNode *>(node_p));
 #else
             delete ((LeafRemoveNode *)node_p);
 #endif
@@ -9699,7 +9820,7 @@ class BwTree : public BwTreeBase {
 
 #ifdef USE_CXL
             ((InnerRemoveNode *)node_p)->~InnerRemoveNode();
-            cacheable.free(const_cast<BaseNode *>(node_p));
+            bwtree_memory().free(const_cast<BaseNode *>(node_p));
 #else
             delete ((InnerRemoveNode *)node_p);
 #endif
@@ -9728,7 +9849,7 @@ class BwTree : public BwTreeBase {
             // a problem)
 #ifdef USE_CXL
             ((InnerAbortNode *)node_p)->~InnerAbortNode();
-            cacheable.free(const_cast<BaseNode *>(node_p));
+            bwtree_memory().free(const_cast<BaseNode *>(node_p));
 #else
             delete ((InnerAbortNode *)node_p);
 #endif
@@ -9823,16 +9944,16 @@ class BwTree : public BwTreeBase {
 
           // This invalidates any further reference to its
           // members (so we saved next pointer above)
-          // Use cacheable.free for shared memory support
-          cacheable.free(const_cast<void*>(static_cast<const void*>(garbage_node_p)));
+          // Use bwtree_memory().free for shared memory support
+          bwtree_memory().free(const_cast<void*>(static_cast<const void*>(garbage_node_p)));
         }  // for
 
         // First need to save this in order to delete current node
         // safely
         EpochNode *next_epoch_node_p = head_epoch_p->next_p;
 
-        // Use cacheable.free for shared memory support
-        cacheable.free(static_cast<void*>(head_epoch_p));
+        // Use bwtree_memory().free for shared memory support
+        bwtree_memory().free(static_cast<void*>(head_epoch_p));
 
 #ifdef BWTREE_DEBUG
         epoch_freed++;
@@ -9880,7 +10001,7 @@ class BwTree : public BwTreeBase {
      * called manually
      */
     void StartThread() {
-      thread_p = new std::thread{[this]() { this->ThreadFunc(); }};
+      thread_p = new std::thread(bwtree_background_thread([this]() { this->ThreadFunc(); }));
 
       return;
     }
@@ -10758,7 +10879,7 @@ class BwTree : public BwTreeBase {
   void AddGarbageNode(const BaseNode *node_p, const NodeID node_id = 0) {
     const size_t estimated_bytes = EstimateGCNodeBytes(node_p);
 #ifdef USE_CXL
-    GarbageNode *garbage_node_p = static_cast<GarbageNode*>(cacheable.malloc(sizeof(GarbageNode)));
+    GarbageNode *garbage_node_p = static_cast<GarbageNode*>(shared_atomic_memory(bwtree_memory()).malloc(sizeof(GarbageNode)));
     assert(garbage_node_p != nullptr);
     new (garbage_node_p)
         GarbageNode{GetGlobalEpoch(), (void *)(node_p), node_id,
@@ -10778,12 +10899,14 @@ class BwTree : public BwTreeBase {
 
     // Update the counter
     GetCurrentGCMetaData()->node_count++;
+    GetCurrentGCMetaData()->pending_bytes+=estimated_bytes;
 
     // It is possible that we could not free enough number of nodes to
     // make it less than this threshold
     // So it is important to let the epoch counter be constantly increased
     // to guarantee progress
-    if (GetCurrentGCMetaData()->node_count > GC_NODE_COUNT_THREADHOLD) {
+    if (GetCurrentGCMetaData()->node_count > GC_NODE_COUNT_THREADHOLD ||
+        (gc_byte_threshold && GetCurrentGCMetaData()->pending_bytes >= gc_byte_threshold)) {
       // Use current thread's gc id to perform GC
 #ifndef NT_SIM
 // FIXME(FN): disable performing GC to avoid bugs
@@ -10836,17 +10959,19 @@ class BwTree : public BwTreeBase {
 #ifdef OPT_IN_USE_FLAG
       // should first make sure the node is not in the cache
       for (size_t i = 0; i < DEFAULT_MACHINE_COUNT; i++) {
-        cached_mapping_table[i][garbage_p->node_id].store(nullptr);
+        cached_mapping_table[i][garbage_p->node_id].store(0);
       }
 #endif
 
       // Then free memory
       epoch_manager.FreeEpochDeltaChain((const BaseNode *)garbage_p->node_p);
       RecordReleasedGCBytes(garbage_p->estimated_bytes);
+      assert(GetGCMetaData(thread_id)->pending_bytes >= garbage_p->estimated_bytes);
+      GetGCMetaData(thread_id)->pending_bytes -= garbage_p->estimated_bytes;
 
 #ifdef USE_CXL
       garbage_p->~GarbageNode();
-      cacheable.free(garbage_p);
+      bwtree_memory().free(garbage_p);
 #else
       delete garbage_p;
 #endif

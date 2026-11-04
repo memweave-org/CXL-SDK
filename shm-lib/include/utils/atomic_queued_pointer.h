@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstring>
 #include <vector>
+#include "shm/mm.h"
 
 #include "utils/bypass_cache.h"
 #include "utils/sim_id.h"
@@ -40,7 +41,11 @@ class nt_pointer {
     if (nt) {
       AtomicRequestQueue::pend_load_req(&ptr);     
     }
+#ifdef SHM_LIB_WITH_UBSM
+    return __atomic_load_n(&ptr, (int)__m);
+#else
     return ptr;
+#endif
   }
 
   void store(T *value, std::memory_order __m = std::memory_order_seq_cst,
@@ -50,7 +55,11 @@ class nt_pointer {
              bool nt = false
 #endif
              ) {
+#ifdef SHM_LIB_WITH_UBSM
+    __atomic_store_n(&ptr, value, (int)__m);
+#else
     ptr = value;
+#endif
     if (nt) {
       AtomicRequestQueue::pend_store_req(&ptr);
     }
@@ -67,6 +76,9 @@ class nt_pointer {
       bool nt = false
 #endif
       ) {
+#ifdef SHM_UB_SPLIT
+    ub_assert_atomic_target(&ptr);
+#endif
     bool equal =
         __atomic_compare_exchange_n(&ptr, &expected, desired, 0, (int)__m,
                                     (int)std::__cmpexch_failure_order(__m));
@@ -186,7 +198,12 @@ class nt_pointer<T[]> {
 
   template <typename... Args> void allocate(size_t size, Args &&...args) {
     this->size = size;
-    ptr = (T*)malloc(sizeof(T) * size);
+    #ifdef USE_CXL
+    ptr = static_cast<T*>(shared_atomic_memory().malloc(sizeof(T) * size));
+#else
+    ptr = static_cast<T*>(malloc(sizeof(T) * size));
+#endif
+    if (!ptr) throw std::bad_alloc();
     for (size_t i = 0; i < size; i++) {
       if constexpr (is_nt_pointer<T>::value) {
         new (&ptr[i]) T();
@@ -198,7 +215,7 @@ class nt_pointer<T[]> {
     }
   }
 
-  void flush_elements(size_t size) { clwb((void *)&ptr, sizeof(T) * size); }
+  void flush_elements(size_t size) { clwb((void *)ptr, sizeof(T) * size); }
 
   T *load(std::memory_order __m = std::memory_order_seq_cst,
 #if defined(NO_CC) || defined(USE_NO_CC_QUEUE)
@@ -211,7 +228,11 @@ class nt_pointer<T[]> {
       AtomicRequestQueue::pend_load_req(&ptr);
 
     }
+#ifdef SHM_LIB_WITH_UBSM
+    return __atomic_load_n(&ptr, (int)__m);
+#else
     return ptr;
+#endif
   }
 
   void store(T *newValue,
@@ -221,7 +242,11 @@ class nt_pointer<T[]> {
              bool nt = false
 #endif
              ) {
+#ifdef SHM_LIB_WITH_UBSM
+    __atomic_store_n(&ptr, newValue, __ATOMIC_SEQ_CST);
+#else
     ptr = newValue;
+#endif
     if (nt) {
       AtomicRequestQueue::pend_store_req(&ptr);
 
@@ -237,6 +262,9 @@ class nt_pointer<T[]> {
       bool nt = false
 #endif
       ) {
+#ifdef SHM_UB_SPLIT
+    ub_assert_atomic_target(&ptr);
+#endif
     bool equal =
         __atomic_compare_exchange_n(&ptr, &expected, desired, 0, (int)__m,
                                     (int)std::__cmpexch_failure_order(__m));
@@ -252,7 +280,11 @@ class nt_pointer<T[]> {
       ptr[i].~T(); // 显式调用析构函数
     }
     if (size != 0) {
-      ::free(ptr); // 释放内存
+#ifdef USE_CXL
+      shared_atomic_memory().free(ptr);
+#else
+      ::free(ptr);
+#endif
     }
     store(nullptr);
     size = 0;

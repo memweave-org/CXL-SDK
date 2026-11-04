@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <new>
+#include <utility>
 
 #ifndef CACHE_LINE_SIZE
 #define CACHE_LINE_SIZE (64)
@@ -31,8 +32,11 @@ public:
   virtual ~SystemMemoryMmapper();
 };
 
+#include "shm/ub.h"
+
 class CXLSystemMemoryMmapper : public SystemMemoryMmapper {
 public:
+  CXLSystemMemoryMmapper() = default;
   CXLSystemMemoryMmapper(const char *path, int num_machines, int machine_no);
   void *per_machine_base;
   size_t per_machine_size;
@@ -49,6 +53,8 @@ struct CxlallocCacheableTag {};
 enum class CacheableAllocatorBackend {
   Memkind = 0,
   Cxlalloc = 1,
+  UbCache = 2,
+  UbAtomic = 3,
 };
 
 struct CacheableInitParams {
@@ -68,6 +74,7 @@ struct CacheableInitParams {
 class MemoryManager {
 public:
   MemoryManager();
+  explicit MemoryManager(bool ub_atomic);
   MemoryManager(SystemMemoryMmapper *allocator, void *base, size_t size);
   explicit MemoryManager(CxlallocCacheableTag, size_t reported_size_bytes);
   MemoryManager(const MemoryManager &other) = delete;
@@ -81,12 +88,19 @@ public:
   int clalign(void **memptr, size_t size);
   void free(void *ptr);
 
+  void require_shared_allocations(bool retain_until_exit = false) {
+    strict_shared_ = true;
+    retain_shared_ = retain_until_exit;
+  }
+
   bool is_cxlalloc_backend() const {
     return backend_ == CacheableAllocatorBackend::Cxlalloc;
   }
 
   memkind_t memkind_pool;
 private:
+  bool strict_shared_ = false;
+  bool retain_shared_ = false;
   bool owns_memkind_pointer(const void *ptr) const;
 
   CacheableAllocatorBackend backend_;
@@ -96,6 +110,17 @@ private:
 };
 
 extern MemoryManager cacheable;
+extern MemoryManager ub_atomic_memory;
+inline MemoryManager& shared_atomic_memory(MemoryManager& fallback = cacheable) {
+#ifdef SHM_UB_SPLIT
+  return ub_atomic_memory;
+#else
+  return fallback;
+#endif
+}
+template<class T, class... Args> T& make_shared_atomic(Args&&... args) {
+  return *new (shared_atomic_memory().malloc(sizeof(T))) T(std::forward<Args>(args)...);
+}
 #ifdef ENABLE_UNCACHE_MEM
 extern MemoryManager uncacheable;
 #endif
@@ -111,14 +136,14 @@ public:
     if (n > std::numeric_limits<size_t>::max() / sizeof(T)) {
       throw std::bad_alloc();
     }
-    T *ptr = static_cast<T *>(cacheable.malloc(n * sizeof(T)));
+    T *ptr = static_cast<T *>(shared_atomic_memory().malloc(n * sizeof(T)));
     if (ptr == nullptr) {
       throw std::bad_alloc();
     }
     return ptr;
   }
 
-  void deallocate(T *p, size_t n) { cacheable.free(p); }
+  void deallocate(T *p, size_t n) { shared_atomic_memory().free(p); }
 };
 
 template <typename T, typename U>

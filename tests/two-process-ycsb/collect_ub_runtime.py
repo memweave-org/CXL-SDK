@@ -31,6 +31,9 @@ def collect(library, output, extra):
             match = re.match(r'\s*(\S+)\s+=>\s+(/.*?)\s+\(0x[0-9a-fA-F]+\)', line)
             if match:
                 name, path = match.groups()
+                # Some ldd versions print the ELF interpreter as an absolute => entry.
+                if Path(name).name.startswith(('ld-linux', 'ld64.')):
+                    continue
                 if '/' in name:  # Absolute DT_NEEDED would bypass this bundle.
                     raise RuntimeError(f'Absolute dependency {name}; mount its path explicitly')
                 files[name] = Path(path).resolve(strict=True)

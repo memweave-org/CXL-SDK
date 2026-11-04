@@ -2,6 +2,8 @@
 #include <atomic>
 #include <vector>
 #include <chrono>
+#include <iomanip>
+#include "core/ub_session.h"
 
 #include "connection/establish.h"
 #include "core/client.h"
@@ -16,6 +18,11 @@
 #include "utils/sim_id.h"
 
 namespace ycsbc {
+#ifdef YCSB_UB_TWO_HOST
+template<class T> using ControllerAtomic=nt<T>;
+#else
+template<class T> using ControllerAtomic=std::atomic<T>;
+#endif
 #ifdef INT_KEY_ADDR
 using Operation = OpGeneratorIntKeyAddr::Operation;
 #elif defined(INT_YCSBC_KEY)
@@ -34,33 +41,55 @@ public:
     threads_.resize(SimThreadInfo::dispatcher_thread_count);
     thread_args_.reserve(SimThreadInfo::dispatcher_thread_count);
     for (uint32_t i = 0; i < SimThreadInfo::dispatcher_thread_count; ++i) {
+#ifdef YCSB_UB_TWO_HOST
+      thread_args_.push_back({this, i < unsigned(ycsbc_ub::threads(0)) ? 0U : 1U, i});
+#else
       thread_args_.push_back({this,
                               i / (SimThreadInfo::dispatcher_thread_count /
                                    SimThreadInfo::worker_machine_count),
                               i});
+#endif
     }
   }
 
   void StartThreads() {
     uint32_t mid = SimThreadInfo::worker_machine_id;
+#ifdef YCSB_UB_TWO_HOST
+    uint32_t first=ycsbc_ub::first_thread(mid), last=first+ycsbc_ub::threads(mid);
+#else
     uint32_t dispatcher_per_machine = SimThreadInfo::dispatcher_thread_count /
                                       SimThreadInfo::worker_machine_count;
-    for (uint32_t i = mid * dispatcher_per_machine;
-         i < (mid + 1) * dispatcher_per_machine; i++) {
+    uint32_t first=mid*dispatcher_per_machine, last=(mid+1)*dispatcher_per_machine;
+#endif
+    for (uint32_t i = first; i < last; i++) {
 #ifndef SNIPER
       pthread_attr_t *attr = new pthread_attr_t;
       int cpu_id;
-#ifdef USE_MSG_QUEUE
+#if defined(YCSB_UB_TWO_HOST)
+      cpu_id=0;
+#elif defined(USE_MSG_QUEUE)
       // When using message queue, bind client threads to node 0, bind other thread pool threads to node 123
       cpu_id = cpu_allocator.allocate_cpu(0);
 #else
       // When not using message queue, bind threads to node 123, allocate shared memory on node 0
       cpu_id = cpu_allocator.allocate_cpu(1);
 #endif
+#ifdef YCSB_UB_TWO_HOST
+      cpu_id=ycsbc_ub::cpu_start()+i-first;
+      cpu_set_t allowed, selected; CPU_ZERO(&selected);
+      if(cpu_id<0 || cpu_id>=CPU_SETSIZE || sched_getaffinity(0,sizeof(allowed),&allowed) || !CPU_ISSET(cpu_id,&allowed))
+        throw std::runtime_error("Requested UB worker CPU is unavailable");
+      CPU_SET(cpu_id,&selected);
+      pthread_attr_init(attr);
+      if(pthread_attr_setaffinity_np(attr,sizeof(selected),&selected)) throw std::runtime_error("pthread affinity failed");
+#else
       set_pthread_affinity_attr(cpu_id, attr);
-      pthread_create(&threads_[i], attr,
+#endif
+      int rc=pthread_create(&threads_[i], attr,
                      &TransactionThreadController::DelegateClientTransWrapper,
                      (void *)&thread_args_[i]);
+      pthread_attr_destroy(attr); delete attr;
+      if(rc) throw std::runtime_error("pthread_create failed");
 #else
       pthread_create(&threads_[i], nullptr,
                      &TransactionThreadController::DelegateClientTransWrapper,
@@ -73,17 +102,24 @@ public:
 
   void WaitForLocalThreads() {
     uint32_t mid = SimThreadInfo::worker_machine_id;
+#ifdef YCSB_UB_TWO_HOST
+    uint32_t first=ycsbc_ub::first_thread(mid), last=first+ycsbc_ub::threads(mid);
+#else
     uint32_t dispatcher_per_machine = SimThreadInfo::dispatcher_thread_count /
                                       SimThreadInfo::worker_machine_count;
-    for (uint32_t i = mid * dispatcher_per_machine;
-         i < (mid + 1) * dispatcher_per_machine; i++) {
+    uint32_t first=mid*dispatcher_per_machine, last=(mid+1)*dispatcher_per_machine;
+#endif
+    for (uint32_t i = first; i < last; i++) {
       void *tmp;
       int ret = pthread_join(threads_[i], &tmp);
       if (ret != 0) {
         std::cerr << "pthread_join failed, thread id: " << i << std::endl;
       }
       if (tmp != nullptr) {
-        sum += *(int *)tmp;
+        sum.fetch_add(*(int *)tmp);
+#ifdef YCSB_UB_TWO_HOST
+        local_success[mid].fetch_add(*(int *)tmp);
+#endif
         delete (int *)tmp;
       } else {
         std::cerr << "pthread_join returned nullptr, thread id: " << i << std::endl;
@@ -105,6 +141,33 @@ public:
     sum = this->sum.load(std::memory_order_acquire);
   }
 
+#ifdef YCSB_UB_TWO_HOST
+  void WaitForLocalReady() {
+    auto mid=SimThreadInfo::worker_machine_id;
+    while(local_ready[mid].load()!=unsigned(ycsbc_ub::threads(mid))) std::this_thread::yield();
+  }
+  void WaitForAllReady() {
+    for(int mid=0;mid<2;++mid)
+      while(local_ready[mid].load()!=unsigned(ycsbc_ub::threads(mid))) std::this_thread::yield();
+  }
+  void ReportLocal(double seconds, uint64_t total=0) {
+    auto mid=SimThreadInfo::worker_machine_id;
+    uint64_t reads=0,writes=0;
+    for(int t=ycsbc_ub::first_thread(mid);t<ycsbc_ub::first_thread(mid)+ycsbc_ub::threads(mid);++t)
+      for(const auto& op:op_groups[t]) { if(op.type==READ) ++reads; else ++writes; }
+    auto errors=reads+writes-local_success[mid].load();
+    std::cout<<"UBYCSB RESULT {\"role\":\""<<(mid==0?"B":"A")
+      <<"\",\"reads\":"<<reads<<",\"writes\":"<<writes<<",\"errors\":"<<errors
+      <<",\"seconds\":"<<std::setprecision(12)<<seconds<<",\"framework_total_operations\":"<<total
+      <<",\"bwtree_opt\":"
+#ifdef OPT_IN_USE_FLAG
+      <<"true"
+#else
+      <<"false"
+#endif
+      <<"}"<<std::endl;
+  }
+#endif
 private:
   struct ThreadArgsDeleTrans {
     TransactionThreadController *manager;
@@ -114,11 +177,14 @@ private:
 
   cxl_vector<pthread_t> threads_;
   cxl_vector<ThreadArgsDeleTrans> thread_args_;
-  std::atomic<uint64_t> sum;
+  ControllerAtomic<uint64_t> sum;
   cxl_vector<ycsbc::DB *> *dbs_;
-  std::atomic<int> sync_var_;
+  ControllerAtomic<int> sync_var_;
   cxl_vector<cxl_vector<Operation>> op_groups;
-  cxl_vector<std::atomic<int>> finish_flags;
+  cxl_vector<ControllerAtomic<int>> finish_flags;
+#ifdef YCSB_UB_TWO_HOST
+  nt<uint64_t> local_ready[2], local_success[2];
+#endif
 #ifdef ASYNC_CLIENT
   // The number of requests that a client can send simultaneously
   const int virtual_clients = 128;
@@ -163,6 +229,9 @@ private:
   }
 #endif
 
+#ifdef YCSB_UB_TWO_HOST
+    local_ready[arg->sim_machine_id].fetch_add(1);
+#endif
     while (sync_var_.load(std::memory_order_acquire) != 1) {
       // wait for the global state to be set
       std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -199,7 +268,7 @@ private:
       finish_flag[pos].store(0, std::memory_order_relaxed);
       oks += client.DoTransaction(ops[i], finish_flag[pos], result[last_pos],
                                   read_value[last_pos]);
-      #ifdef USE_MWAIT
+      #if defined(USE_MWAIT) && defined(__x86_64__) && defined(__WAITPKG__)
       _umonitor(&finish_flag[pos]);
       while (finish_flag[pos].load(std::memory_order_acquire) == 0) {
         _umwait(0, 1);

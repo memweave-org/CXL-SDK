@@ -74,7 +74,7 @@ DB *DBFactory::CreateDB(utils::Properties &props) {
 #ifdef ENABLE_BWTREE_DB
       if (props["dbname"] == "bwtree") {
     // return new BwTreeDB(db_thread);
-    return ALLOC_AND_CONSTRUCT(BwTreeDB, cacheable.malloc, db_thread);
+    return ALLOC_AND_CONSTRUCT(BwTreeDB, shared_atomic_memory().malloc, db_thread);
   } else
 #endif
 #ifdef ENABLE_BTREE_DB

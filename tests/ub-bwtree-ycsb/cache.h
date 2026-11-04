@@ -2,7 +2,8 @@
 // Benchmark-only cache backend: full-system completion, no simulated latency.
 #define NO_CC
 #include "utils/config.h"
-#undef QUEUE_SIM_CAS
+#define SHM_LIB_WITH_UBSM
+#define SHM_UB_SPLIT
 #define BYPASS_CACHE_HH
 #include <cstddef>
 #include <cstdint>
@@ -24,8 +25,9 @@ inline size_t cache_line_bytes() {
   return 64;
 #endif
 }
+bool is_nc_address(const void* p, size_t n);
 inline void maintain(const void* p, size_t n, bool writeback, bool fence=true) {
-  if (!n) return;
+  if (!n || is_nc_address(p,n)) return;
   const size_t line=cache_line_bytes();
   if (fence) mfence();
   for (uintptr_t a=reinterpret_cast<uintptr_t>(p)&~(line-1), end=reinterpret_cast<uintptr_t>(p)+n; a<end; a+=line) {

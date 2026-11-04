@@ -19,7 +19,7 @@ class Worker:
         self.role = args.role
         self.process = subprocess.Popen([args.binary, args.role, name, provider,
             str(args.size_mb), str(args.threads), str(args.records), str(args.ops),
-            args.spec, str(args.cpu)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            args.spec, str(args.cpu), str(args.nc_size_mb), str(args.thread_slots)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT, text=True, bufsize=1)
         def read():
             for line in self.process.stdout:
@@ -76,8 +76,8 @@ def summary(a, b, seconds, ops):
             'common_seconds': seconds, 'total_ops_per_second': 2*ops/seconds,
             'total_mops': 2*ops/seconds/1e6, 'update_semantics': 'fresh-insert',
             'B_observed_read_fraction': b['reads']/ops,
-            'cache_policy': 'writer-writeback-reader-invalidate',
-            'reclamation': 'retain-until-both-processes-exit', 'bwtree_opt': False}
+            'cache_policy': 'bwtree-original-nc-metadata-cache-data',
+            'reclamation': 'retain-until-both-processes-exit', 'bwtree_opt': b.get('bwtree_opt', False)}
 
 
 def main():
@@ -92,6 +92,7 @@ def main():
     p.add_argument('--threads', type=int, default=1)
     p.add_argument('--cpu', type=int, default=min(os.sched_getaffinity(0)))
     p.add_argument('--size-mb', type=int, default=4096)
+    p.add_argument('--nc-size-mb', type=int, default=512)
     p.add_argument('--records', type=int, default=100000)
     p.add_argument('--ops', type=int, default=1000000)
     p.add_argument('--timeout', type=int, default=1200)
@@ -143,14 +144,15 @@ def main():
         identity = {'host':socket.gethostname(), 'role':args.role, 'provider':args.provider,
                     'binary_sha256':hashlib.sha256(Path(args.binary).read_bytes()).hexdigest(),
                     'spec_sha256':hashlib.sha256(Path(args.spec).read_bytes()).hexdigest(),
-                    'size_mb':args.size_mb,'records':args.records,'ops':args.ops}
+                    'threads':args.threads,'size_mb':args.size_mb,'nc_size_mb':args.nc_size_mb,'records':args.records,'ops':args.ops}
         status('TCP connected; exchanging configuration and binary hashes')
         send(identity); peer = receive()
         if peer['role'] == args.role or peer['host'] == identity['host']:
             raise RuntimeError('expected two different physical hosts and roles')
-        for key in ('provider','binary_sha256','spec_sha256','size_mb','records','ops'):
+        for key in ('provider','binary_sha256','spec_sha256','size_mb','nc_size_mb','records','ops'):
             if identity[key] != peer[key]:
                 raise RuntimeError('configuration mismatch: '+key)
+        args.thread_slots=2*max(args.threads, peer['threads'])+2
         provider = args.provider or (identity['host'] if args.role=='B' else peer['host'])
         status(f'Handshake complete; UB provider={provider}')
         if args.role=='B':

@@ -4,6 +4,7 @@
 
 #include "core/core_workload.h"
 #include "core/db.h"
+#include "core/ub_session.h"
 #include "shm/cxl_type.h"
 
 namespace ycsbc {
@@ -25,8 +26,16 @@ class OpGenerator {
       ops[i].reserve(1.1 * num_ops / group_size);
     }
     for (int i = 0; i < num_ops; ++i) {
+#ifdef YCSB_UB_TWO_HOST
+      // Keep the framework generator; only select the host and its read/write mix.
+      const int machine=i<num_ops/2?0:1;
+      int group=ycsbc_ub::first_thread(machine)+workload_->NextGroup(ycsbc_ub::threads(machine));
+      auto operation=machine==1?READ:workload_->NextOperation();
+#else
       int group = workload_->NextGroup(group_size);
-      switch (workload_->NextOperation()) {
+      auto operation=workload_->NextOperation();
+#endif
+      switch (operation) {
         case READ:
           GenerateRead(ops[group]);
           break;

@@ -1,4 +1,6 @@
 #include "utils/atomic_queued_variable.h"
+#include <cstdlib>
+#include <cstring>
 // #include <algorithm>
 // #include <array>
 // #include <atomic>
@@ -10,6 +12,12 @@
 std::array<std::atomic<AtomicRequestQueue::time_point>,
            AtomicRequestQueue::bucket_count>
     AtomicRequestQueue::req_queue;
+std::array<AtomicRequestQueue::IsolatedBucket, AtomicRequestQueue::bucket_count>
+    AtomicRequestQueue::isolated_req_queue;
+const bool AtomicRequestQueue::isolated_buckets = [] {
+  const char* mode=std::getenv("PCC_ISOLATE_TIMING_BUCKETS");
+  return mode && std::strcmp(mode,"1")==0;
+}();
 uint64_t AtomicRequestQueue::blocked_cnt = 0;
 
 // // Definitions of static member functions

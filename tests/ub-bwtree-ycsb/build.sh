@@ -11,8 +11,14 @@ cp "$ROOT"/ds/BwTree/src/*.h "$staged/"
 python3 "$HERE/prepare_source.py" "$ROOT/ds/BwTree/src/bwtree.h" "$staged/bwtree.h"
 # Compile the copied header consistently in all translation units.
 cp "$ROOT/ds/BwTree/src/bwtree.cpp" "$staged/"
+opt_flags=()
+case ${OPT:-1} in
+  1) opt_flags=(-DOPT_GC -DOPT_ROOT_READ -DOPT_IN_USE_FLAG -DOPT_REPLICATE_META -DOPT_BATCH_FLUSH) ;;
+  0) ;;
+  *) echo 'OPT must be 0 or 1' >&2; exit 1 ;;
+esac
 c++ -std=c++17 -O3 -g -fno-pie -no-pie -pthread -UNDEBUG \
-  -DBWTREE_MAPPING_TABLE_BITS="${MAPPING_BITS:-20}" -DSHM_DISABLE_CAS128 \
+  "${opt_flags[@]}" -DBWTREE_MAPPING_CACHE_DRAM=0 -DBWTREE_MAPPING_TABLE_BITS="${MAPPING_BITS:-20}" -DSHM_DISABLE_CAS128 \
   -I"$HERE" -I"$staged" -I"$ROOT/shm-lib/include" -I"$ROOT/tests/YCSB-C/include" \
   -I"$UBSM_INCLUDE_DIR" -include "$HERE/cache.h" \
   "$HERE/worker.cc" "$HERE/arena.cc" "$staged/bwtree.cpp" \

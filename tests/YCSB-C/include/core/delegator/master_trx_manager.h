@@ -45,7 +45,7 @@ public:
     auto ops = op_gen.GenerateOperations(
         total_ops, SimThreadInfo::dispatcher_thread_count);
     trx_thread_controller_ = ALLOC_AND_CONSTRUCT(
-        TransactionThreadController, cacheable.malloc, dbs, std::move(ops));
+        TransactionThreadController, shared_atomic_memory().malloc, dbs, std::move(ops));
   }
 
   void Execute(utils::Properties &props, double &duration, uint64_t &sum) {
@@ -54,6 +54,11 @@ public:
       WakeupFollowers(props);
     }
     trx_thread_controller_->StartThreads();
+#ifdef YCSB_UB_TWO_HOST
+    trx_thread_controller_->WaitForLocalReady();
+    ycsbc_ub::ready();
+    trx_thread_controller_->WaitForAllReady();
+#endif
 
 #ifdef SNIPER
     SimRoiStart();
@@ -70,11 +75,14 @@ public:
     SimRoiEnd();
 #endif
     duration = timer_.End();
+#ifdef YCSB_UB_TWO_HOST
+    trx_thread_controller_->ReportLocal(duration, sum);
+#endif
   }
 
   ~MasterTransactionManager() {
     DESTROY_AND_DEALLOC(trx_thread_controller_, TransactionThreadController,
-                        cacheable.free);
+                        shared_atomic_memory().free);
   }
 
 private:
@@ -87,12 +95,18 @@ private:
 #endif
 
   void WakeupFollowers(utils::Properties &props) {
-    void *tmp_g_var_addr = cacheable.malloc(sizeof(GlobalVariables));
+#ifdef YCSB_UB_TWO_HOST
+    g_var_struct = new (ycsbc_ub::control_header()) GlobalVariables{};
+    g_var_struct->trx_thread_controller = trx_thread_controller_;
+    mfence();
+#else
+    void *tmp_g_var_addr = shared_atomic_memory().malloc(sizeof(GlobalVariables));
     g_var_struct = new (tmp_g_var_addr) GlobalVariables();
     g_var_struct->trx_thread_controller = trx_thread_controller_;
     follower_manager_.start_followers([&props](uint32_t id) -> std::string {
       return CommandBuilder::build(props, id);
     });
+#endif
   }
 };
 } // namespace ycsbc

@@ -2,6 +2,12 @@
 
 set -e
 
+# Real two-host UB: Docker builds; each physical host runs its local worker.
+if [[ ${1:-} == -mode=ub_two_host ]]; then
+    shift
+    exec bash "$(dirname -- "${BASH_SOURCE[0]}")/run.sh" "$@"
+fi
+
 export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}:/usr/local/lib"
 
 db_types=("clht" "clevelhash" "hot" "btree_olc" "bwtree" "masstree" "radix_art_olc")

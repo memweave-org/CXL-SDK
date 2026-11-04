@@ -11,3 +11,6 @@ OPS=1000000 # 每台机器的操作数
 SIZE_MB=4096
 SPEC=workloadb_90read.spec
 # 可选 CPU_A=2 CPU_B=2；线程顺序绑定从该 CPU 开始的连续核心。
+
+OPT=${OPT:-1} # 1: 原 BwTree OPT；0: NOOPT
+NC_SIZE_MB=512 # A/B 都可读写的独立 NONCACHE 对象

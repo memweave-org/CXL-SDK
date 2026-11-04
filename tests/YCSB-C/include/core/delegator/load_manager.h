@@ -1,6 +1,7 @@
 #pragma once
 #include "core/core_workload.h"
 #include "core/db.h"
+#include "core/ub_session.h"
 #include "core/insert_client.h"
 #include "shm/cxl_type.h"
 #include <cassert>
@@ -19,10 +20,14 @@ public:
     int loader_nr = std::min(dispatcher_nr, 16);
     cur_op_count = total_ops / loader_nr;
     for (int i = 0; i < loader_nr; ++i) {
+#ifdef YCSB_UB_TWO_HOST
+      IDPair ids(0, i); // Every loader runs on B; A only attaches after loading.
+#else
       IDPair ids(i / (loader_nr / machine_nr), i);
+#endif
       actual_ops.emplace_back(std::async(std::launch::async,
                                          &LoadManager::DelegateLoadWorker, this,
-                                         cur_op_count, ids));
+                                         cur_op_count + (i < total_ops % loader_nr), ids));
     }
     assert((int)actual_ops.size() == loader_nr);
 

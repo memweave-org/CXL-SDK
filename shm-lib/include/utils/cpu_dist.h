@@ -31,15 +31,13 @@ private:
   std::vector<int>
       next_cpu_idx_in_node; // 为每个节点存储下一个CPU的起始搜索索引
   // System specific, equals to the NUMA node count that has CPUs
-  const int max_node = 4;
+  int max_node = 1;
   std::mutex mtx;
 
 public:
   CpuAllocator() {
-    if (numa_available() == -1) {
-      std::cerr << "NUMA is not available on this system." << std::endl;
-      exit(1);
-    }
+    const bool has_numa = numa_available() >= 0;
+    if (has_numa) max_node = numa_max_node() + 1;
 
     node_cpus.resize(max_node);
     next_cpu_idx_in_node.resize(max_node,
@@ -49,6 +47,19 @@ public:
     CPU_ZERO(&allowed_cpus);
     const bool has_affinity =
         sched_getaffinity(0, sizeof(allowed_cpus), &allowed_cpus) == 0;
+
+    if (!has_numa) {
+      // Container seccomp can block NUMA syscalls even when CPU affinity works.
+      // Keep allocation within the process's allowed CPUs without requiring
+      // privileged containers or inventing a physical NUMA topology.
+      if (!has_affinity) {
+        std::cerr << "Cannot discover allowed CPUs without NUMA or affinity" << std::endl;
+        exit(1);
+      }
+      for (int cpu=0;cpu<CPU_SETSIZE;++cpu)
+        if (CPU_ISSET(cpu,&allowed_cpus)) node_cpus[0].push_back(cpu);
+      return;
+    }
 
     // 获取并存储每个节点的CPU信息
     for (int node = 0; node < max_node; ++node) {

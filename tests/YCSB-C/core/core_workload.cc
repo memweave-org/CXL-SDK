@@ -232,12 +232,19 @@ void *CoreWorkload::BuildPrefillValue() {
     value_size = 8;
   }
   assert(value_size != 0);
+#ifdef YCSB_UB_TWO_HOST
+  void *value = cacheable.malloc(value_size);
+#else
   void *value = malloc(value_size);
+#endif
   assert(value != nullptr);
   size_t copy_size = sizeof(value_size);
   for (size_t i = 0; i + copy_size <= value_size; i += copy_size) {
     memcpy(static_cast<char *>(value) + i, &value_size, copy_size);
   }
+#ifdef YCSB_UB_TWO_HOST
+  clwb(value, value_size);
+#endif
   return value;
 }
 
@@ -246,11 +253,18 @@ void *CoreWorkload::BuildTransactionValue() {
   if (value_size == 0) {
     value_size = 8;
   }
+#ifdef YCSB_UB_TWO_HOST
+  void *value = cacheable.malloc(value_size);
+#else
   void *value = malloc(value_size);
+#endif
   assert(value != nullptr);
   size_t copy_size = sizeof(value_size);
   for (size_t i = 0; i + copy_size <= value_size; i += copy_size) {
     memcpy(static_cast<char *>(value) + i, &value_size, copy_size);
   }
+#ifdef YCSB_UB_TWO_HOST
+  clwb(value, value_size);
+#endif
   return value;
 }

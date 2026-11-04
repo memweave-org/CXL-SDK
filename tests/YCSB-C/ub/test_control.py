@@ -8,6 +8,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from types import SimpleNamespace
 sys.dont_write_bytecode=True
@@ -21,6 +22,7 @@ role=sys.argv[sys.argv.index('--role')+1]
 peer.socket.gethostname=lambda:'fake-'+role
 class Process:
     stdin=io.StringIO()
+    def poll(self): return 0
     def wait(self,timeout): return 0
     def terminate(self): pass
 class Reader:
@@ -34,6 +36,7 @@ class Worker:
         self.process=Process();self.reader=Reader();self.protocol_reader=Reader();self.q=queue.Queue()
         self.q.put('READY')
     def receive(self): return self.q.get(timeout=5)
+    def check_alive(self): pass
     def send(self,command):
         assert command=='run'
         result={'role':role,'reads':100 if role=='A' else 90,
@@ -49,6 +52,72 @@ raise SystemExit(peer.main())
 '''
 
 class ControlTests(unittest.TestCase):
+    def test_running_worker_failure_stops_peer(self):
+        for role, drop_report in (('A',False),('B',False),('A',True)):
+            with self.subTest(role=role,drop_report=drop_report), tempfile.TemporaryDirectory() as directory:
+                root=Path(directory)
+                binary=root/'worker'
+                binary.write_text('#!'+sys.executable+'\n'+r'''
+import os, signal, sys, time
+from pathlib import Path
+role='B' if sys.argv[sys.argv.index('-machineno')+1]=='0' else 'A'
+Path(os.environ['PID_DIR'],role+'.pid').write_text(str(os.getpid()))
+fd=int(os.environ['YCSB_UB_CONTROL_FD'])
+os.write(fd,b'READY\n')
+assert sys.stdin.readline().strip()=='run'
+if role==os.environ['CRASH_ROLE']:
+    os._exit(17)
+# Force the controller to exercise SIGKILL escalation, not just graceful stdin EOF.
+signal.signal(signal.SIGTERM,signal.SIG_IGN)
+while True: time.sleep(1)
+''')
+                binary.chmod(0o700)
+                spec=root/'spec';spec.write_text('unused')
+                with socket.socket() as sock:
+                    sock.bind(('127.0.0.1',0));port=sock.getsockname()[1]
+                children=[]
+                started=time.monotonic()
+                try:
+                    for host in ('B','A'):
+                        output=root/host;output.mkdir()
+                        harness=r'''
+import os, sys, peer
+role=sys.argv[sys.argv.index('--role')+1]
+peer.socket.gethostname=lambda:'fake-'+role
+original_send=peer.PeerChannel.send
+def send(channel,message):
+    if os.environ['DROP_REPORT']=='1' and role==os.environ['CRASH_ROLE'] and isinstance(message,dict) and message.get('type')=='ERROR':
+        channel.connection.shutdown(peer.socket.SHUT_RDWR)
+        raise OSError('injected disconnect before error report')
+    return original_send(channel,message)
+peer.PeerChannel.send=send
+sys.exit(peer.main())
+'''
+                        children.append(subprocess.Popen([sys.executable,'-c',harness,
+                            '--role',host,'--peer','127.0.0.1','--port',str(port),
+                            '--binary',str(binary),'--spec',str(spec),'--ini',str(spec),
+                            '--timeout','60','--output',str(output)],cwd=HERE,
+                            env=dict(os.environ,CRASH_ROLE=role,PID_DIR=str(root),DROP_REPORT=str(int(drop_report))),
+                            stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True))
+                    for child in children:
+                        output,_=child.communicate(timeout=10)
+                        self.assertEqual(child.returncode,1,output)
+                    self.assertLess(time.monotonic()-started,10)
+                    for host in ('A','B'):
+                        report=json.loads((root/host/'result.json').read_text())
+                        self.assertFalse(report['pass'])
+                        expected='peer disconnected' if drop_report and host!=role else 'worker exited with code 17'
+                        self.assertIn(expected,report['error'])
+                        pid=int((root/(host+'.pid')).read_text())
+                        with self.assertRaises(ProcessLookupError): os.kill(pid,0)
+                finally:
+                    for child in children:
+                        if child.poll() is None: child.kill()
+                        child.wait()
+                    for path in root.glob('*.pid'):
+                        try: os.kill(int(path.read_text()),9)
+                        except ProcessLookupError: pass
+
     def test_control_pipe_ignores_sdk_output(self):
         with tempfile.TemporaryDirectory() as directory:
             binary=Path(directory)/'noisy-worker'

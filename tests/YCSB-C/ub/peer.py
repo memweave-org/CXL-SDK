@@ -20,11 +20,77 @@ class PeerFailure(RuntimeError):
         super().__init__(f"peer {details.get('role')} failed at {details.get('stage')}: {details.get('error')}")
 
 
+class PeerChannel:
+    """Continuously consume peer messages even while the main thread awaits a worker."""
+    def __init__(self, connection, timeout):
+        self.connection = connection
+        self.stream = connection.makefile('rwb')
+        self.timeout = timeout
+        self.messages = queue.Queue()
+        self.failure = None
+        self.closing = threading.Event()
+        self.reader = threading.Thread(target=self._read, daemon=True)
+        self.reader.start()
+
+    def _read(self):
+        try:
+            while not self.closing.is_set():
+                data = self.stream.readline(65536)
+                if not data:
+                    raise RuntimeError('peer disconnected without an error report')
+                message = json.loads(data)
+                if isinstance(message, dict) and message.get('type') == 'ERROR':
+                    raise PeerFailure(message)
+                self.messages.put(message)
+        except Exception as error:
+            if not self.closing.is_set():
+                self.failure = error
+
+    def check(self):
+        if self.failure is not None:
+            raise self.failure
+
+    def send(self, message):
+        self.stream.write((json.dumps(message)+'\n').encode())
+        self.stream.flush()
+
+    def receive(self, check_worker=lambda: None):
+        deadline = time.monotonic()+self.timeout
+        while True:
+            # Deliver a final report already received before normal peer shutdown.
+            try:
+                return self.messages.get_nowait()
+            except queue.Empty:
+                pass
+            self.check()
+            check_worker()
+            if time.monotonic() >= deadline:
+                raise TimeoutError('peer response timed out')
+            try:
+                return self.messages.get(timeout=0.1)
+            except queue.Empty:
+                pass
+
+    def close(self):
+        self.closing.set()
+        try:
+            self.connection.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        self.reader.join(timeout=1)
+        try:
+            self.stream.close()
+        except OSError:
+            pass
+
+
 class Worker:
     def __init__(self, args, name, provider, log):
         self.queue = queue.Queue()
         self.role = args.role
         self.last_stage = 'process launch'
+        self.peer_check = lambda: None
+        self.finished = False
         self.log_tail = deque(maxlen=12)
         env=dict(os.environ, YCSB_UB_NAME=name, YCSB_UB_PROVIDER=provider,
                  YCSB_UB_THREADS_A=str(args.threads_a), YCSB_UB_THREADS_B=str(args.threads_b),
@@ -71,25 +137,36 @@ class Worker:
     def receive(self):
         start = time.monotonic()
         deadline = start + self.timeout
+        next_notice = start + 10
         while True:
+            self.peer_check()
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError(f'worker pid={self.process.pid} response timed out after {self.timeout}s; last stage: {self.last_stage}; inspect worker.log')
             try:
-                response = self.queue.get(timeout=min(10, remaining))
+                response = self.queue.get(timeout=min(0.1, remaining))
                 break
             except queue.Empty:
-                print(f'[{self.role}] Waiting for worker response ({time.monotonic()-start:.0f}s); pid={self.process.pid}; last stage: {self.last_stage}', flush=True)
+                if time.monotonic() >= next_notice:
+                    print(f'[{self.role}] Waiting for worker response ({time.monotonic()-start:.0f}s); pid={self.process.pid}; last stage: {self.last_stage}', flush=True)
+                    next_notice = time.monotonic()+10
         if response == 'EOF':
-            try:
-                code = self.process.wait(timeout=0.2)
-            except subprocess.TimeoutExpired:
-                code = None
-            self.reader.join(timeout=0.2)
-            state = f'worker exited with code {code}' if code is not None else 'worker control pipe closed while process is still running'
-            raise RuntimeError(f'{state}; pid={self.process.pid}; last stage: {self.last_stage}; '
-                               'recent worker output:\n' + '\n'.join(list(self.log_tail)))
+            self.raise_exit_error()
         return response
+
+    def raise_exit_error(self):
+        try:
+            code = self.process.wait(timeout=0.2)
+        except subprocess.TimeoutExpired:
+            code = None
+        self.reader.join(timeout=0.2)
+        state = f'worker exited with code {code}' if code is not None else 'worker control pipe closed while process is still running'
+        raise RuntimeError(f'{state}; pid={self.process.pid}; last stage: {self.last_stage}; '
+                           'recent worker output:\n' + '\n'.join(list(self.log_tail)))
+
+    def check_alive(self):
+        if not self.finished and self.process.poll() is not None:
+            self.raise_exit_error()
 
     def send(self, command):
         self.process.stdin.write(command + '\n')
@@ -103,8 +180,15 @@ class Worker:
 
     def finish(self, command):
         self.command(command, 'CLOSED')
-        if self.process.wait(timeout=self.timeout):
-            raise RuntimeError('worker cleanup failed')
+        deadline = time.monotonic()+self.timeout
+        while self.process.poll() is None:
+            self.peer_check()
+            if time.monotonic() >= deadline:
+                raise TimeoutError('worker cleanup timed out')
+            time.sleep(0.1)
+        if self.process.returncode:
+            self.raise_exit_error()
+        self.finished = True
         self.process.stdin.close()
         self.protocol_reader.join(timeout=1)
 
@@ -146,7 +230,7 @@ def main():
     p.add_argument('--ops', type=int, default=1000000)
     p.add_argument('--timeout', type=int, default=1200)
     args = p.parse_args()
-    worker = stream = connection = server = None
+    worker = channel = connection = server = None
     report = {'pass': False}
     log = (args.output/'worker.log').open('w')
     control_log = (args.output/'control.log').open('w')
@@ -158,15 +242,9 @@ def main():
         print(line, flush=True)
         control_log.write(line + '\n'); control_log.flush()
     def send(message):
-        stream.write((json.dumps(message)+'\n').encode()); stream.flush()
+        channel.send(message)
     def receive():
-        data = stream.readline(65536)
-        if not data:
-            raise RuntimeError(f'peer disconnected without an error report while {stage}; inspect the other host result.json and worker.log')
-        message = json.loads(data)
-        if isinstance(message, dict) and message.get('type') == 'ERROR':
-            raise PeerFailure(message)
-        return message
+        return channel.receive(worker.check_alive if worker else lambda: None)
     try:
         if args.role == 'B':
             server = socket.socket()
@@ -192,7 +270,7 @@ def main():
                         last_notice = time.monotonic()
                     time.sleep(1)
         connection.settimeout(args.timeout)
-        stream = connection.makefile('rwb')
+        channel = PeerChannel(connection, args.timeout)
         identity = {'host':socket.gethostname(), 'role':args.role, 'provider':args.provider,
                     'binary_sha256':hashlib.sha256(Path(args.binary).read_bytes()).hexdigest(),
                     'spec_sha256':hashlib.sha256(Path(args.spec).read_bytes()).hexdigest(),
@@ -219,6 +297,7 @@ def main():
                                                         'workload':Path(args.spec).read_text()},default=str,indent=2))
         status('Starting host worker: UB mapping, initial load (B only), and trace generation')
         worker=Worker(args,name,provider,log)
+        worker.peer_check = channel.check
         if worker.receive()!='READY': raise RuntimeError('expected READY')
         status('Host worker READY')
         if args.role=='B':
@@ -252,7 +331,7 @@ def main():
         report.update({'pass':False,'error':str(error),'stage':stage,'object_may_remain':True})
         if isinstance(error, PeerFailure):
             report['peer_error'] = error.details
-        elif stream is not None:
+        elif channel is not None:
             # Tell the peer the original failure before closing TCP or waiting for cleanup.
             try:
                 send({'type':'ERROR','role':args.role,'stage':stage,'error':str(error)[:16000]})
@@ -262,13 +341,21 @@ def main():
         control_log.write(f'ERROR at {stage}: {error}\n'); control_log.flush()
     finally:
         if worker:
-            try:
-                worker.process.stdin.close(); worker.process.wait(timeout=5)
-            except (OSError, subprocess.TimeoutExpired):
-                worker.process.terminate(); report['worker_exit_unconfirmed']=True
+            if not report['pass'] and worker.process.poll() is None:
+                worker.process.terminate()
+                try:
+                    worker.process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    worker.process.kill()
+                    try:
+                        worker.process.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        report['worker_exit_unconfirmed']=True
+            worker.process.stdin.close()
             worker.reader.join(timeout=1)
             worker.protocol_reader.join(timeout=1)
-        for handle in (stream, connection, server):
+        if channel: channel.close()
+        for handle in (connection, server):
             if handle: handle.close()
         if not worker or not worker.reader.is_alive(): log.close()
         control_log.close()

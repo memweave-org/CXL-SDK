@@ -78,3 +78,7 @@ python3 tests/YCSB-C/ub/test_framework.py --binary /absolute/path/ycsbc_nocc_no_
 （`YCSB_UB_CONTROL_FD`）传给控制器；stdin 只接收控制命令，stdout/stderr 只作日志。
 控制器不从日志解析协议，SDK 并发打印或不换行不会吞掉 READY。
 A/B 之间仍走独立 TCP 连接。worker 必须通过 run.sh/peer.py 启动。
+
+控制器持续接收对端状态；等待本地 READY、RESULT 或 CLOSED 时也检查对端失败和断连。
+任一端失败，另一端中止本轮 worker；SIGTERM 后 2 秒仍未退出则发送 SIGKILL 并等待确认。
+仅操作控制器自己启动的子进程，失败结果标记 pass=false，UB 对象仍保留供诊断。

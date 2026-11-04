@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Launch the original ycsbc executable on each host; B is its master, A its follower."""
 import argparse
+from collections import deque
 import hashlib
 import json
 import os
@@ -13,11 +14,18 @@ import time
 import uuid
 
 
+class PeerFailure(RuntimeError):
+    def __init__(self, details):
+        self.details = details
+        super().__init__(f"peer {details.get('role')} failed at {details.get('stage')}: {details.get('error')}")
+
+
 class Worker:
     def __init__(self, args, name, provider, log):
         self.queue = queue.Queue()
         self.role = args.role
         self.last_stage = 'process launch'
+        self.log_tail = deque(maxlen=12)
         env=dict(os.environ, YCSB_UB_NAME=name, YCSB_UB_PROVIDER=provider,
                  YCSB_UB_THREADS_A=str(args.threads_a), YCSB_UB_THREADS_B=str(args.threads_b),
                  YCSB_UB_SIZE_MB=str(args.size_mb), YCSB_UB_NC_SIZE_MB=str(args.nc_size_mb),
@@ -48,6 +56,7 @@ class Worker:
         def read():
             with self.process.stdout:
                 for line in self.process.stdout:
+                    self.log_tail.append(line.rstrip()[-512:])
                     log.write(line)
                     log.flush()
                     if line.startswith(('UB_', 'YCSB_STAGE ')):
@@ -72,7 +81,14 @@ class Worker:
             except queue.Empty:
                 print(f'[{self.role}] Waiting for worker response ({time.monotonic()-start:.0f}s); pid={self.process.pid}; last stage: {self.last_stage}', flush=True)
         if response == 'EOF':
-            raise RuntimeError('worker exited; inspect worker.log')
+            try:
+                code = self.process.wait(timeout=0.2)
+            except subprocess.TimeoutExpired:
+                code = None
+            self.reader.join(timeout=0.2)
+            state = f'worker exited with code {code}' if code is not None else 'worker control pipe closed while process is still running'
+            raise RuntimeError(f'{state}; pid={self.process.pid}; last stage: {self.last_stage}; '
+                               'recent worker output:\n' + '\n'.join(list(self.log_tail)))
         return response
 
     def send(self, command):
@@ -146,8 +162,11 @@ def main():
     def receive():
         data = stream.readline(65536)
         if not data:
-            raise RuntimeError('peer disconnected')
-        return json.loads(data)
+            raise RuntimeError(f'peer disconnected without an error report while {stage}; inspect the other host result.json and worker.log')
+        message = json.loads(data)
+        if isinstance(message, dict) and message.get('type') == 'ERROR':
+            raise PeerFailure(message)
+        return message
     try:
         if args.role == 'B':
             server = socket.socket()
@@ -231,6 +250,16 @@ def main():
             send(report)
     except Exception as error:
         report.update({'pass':False,'error':str(error),'stage':stage,'object_may_remain':True})
+        if isinstance(error, PeerFailure):
+            report['peer_error'] = error.details
+        elif stream is not None:
+            # Tell the peer the original failure before closing TCP or waiting for cleanup.
+            try:
+                send({'type':'ERROR','role':args.role,'stage':stage,'error':str(error)[:16000]})
+            except (OSError, ValueError):
+                pass
+        print(f'[{args.role}] ERROR at {stage}: {error}', flush=True)
+        control_log.write(f'ERROR at {stage}: {error}\n'); control_log.flush()
     finally:
         if worker:
             try:

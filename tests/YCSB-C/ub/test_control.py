@@ -14,7 +14,7 @@ sys.dont_write_bytecode=True
 from peer import summary, Worker
 HERE=Path(__file__).resolve().parent
 HARNESS=r'''
-import io, json, queue, sys
+import io, json, os, queue, sys
 sys.dont_write_bytecode=True
 import peer
 role=sys.argv[sys.argv.index('--role')+1]
@@ -29,6 +29,8 @@ class Reader:
 class Worker:
     def __init__(self,args,name,provider,log):
         assert provider=='fake-B'
+        if os.environ.get('FAIL_ROLE') == role:
+            raise RuntimeError('injected UB map failure on '+role)
         self.process=Process();self.reader=Reader();self.protocol_reader=Reader();self.q=queue.Queue()
         self.q.put('READY')
     def receive(self): return self.q.get(timeout=5)
@@ -96,6 +98,23 @@ os.write(fd,b'CLOSED\n')
         with self.assertRaises(RuntimeError): summary({**a,'writes':1},b,2,100)
 
     def test_two_peers(self):
+        a,b=self.run_two_peers()
+        self.assertEqual(a,b)
+        self.assertTrue(a['pass'])
+        self.assertEqual(a['framework'], 'tests/YCSB-C/ycsbc')
+        self.assertEqual(a['total_mops'], 0.02)
+
+    def test_peer_receives_original_failure(self):
+        for role in ('A','B'):
+            with self.subTest(role=role):
+                reports=self.run_two_peers(role)
+                for report in reports:
+                    self.assertFalse(report['pass'])
+                    self.assertIn('injected UB map failure on '+role,report['error'])
+                peer=reports[1 if role=='A' else 0]
+                self.assertEqual(peer['peer_error']['role'],role)
+
+    def run_two_peers(self, fail_role=''):
         with socket.socket() as sock:
             sock.bind(('127.0.0.1',0));port=sock.getsockname()[1]
         with tempfile.TemporaryDirectory() as directory:
@@ -109,15 +128,13 @@ os.write(fd,b'CLOSED\n')
                         '--role',role,'--peer','127.0.0.1','--port',str(port),
                         '--binary',str(binary),'--spec',str(spec),'--ini',str(spec),'--records','100',
                         '--ops','100','--output',str(output)],cwd=HERE,
+                        env=dict(os.environ,FAIL_ROLE=fail_role),
                         stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True))
                 for child in children:
                     output,_=child.communicate(timeout=15)
-                    self.assertEqual(child.returncode,0,output)
+                    self.assertEqual(child.returncode,1 if fail_role else 0,output)
                 a,b=[json.loads((root/role/'result.json').read_text()) for role in ('A','B')]
-                self.assertEqual(a,b)
-                self.assertTrue(a['pass'])
-                self.assertEqual(a['framework'], 'tests/YCSB-C/ycsbc')
-                self.assertEqual(a['total_mops'], 0.02)
+                return a,b
             finally:
                 for child in children:
                     if child.poll() is None: child.kill()

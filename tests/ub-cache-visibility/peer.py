@@ -23,11 +23,17 @@ def main():
     p.add_argument('--output', type=Path, required=True)
     p.add_argument('--cpu', type=int, default=min(os.sched_getaffinity(0)))
     args = p.parse_args()
-    args.timeout = 60
+    nc = os.environ.get('UB_MICRO_NC') is not None
+    args.timeout = int(os.environ.get('NC_TIMEOUT', '120')) if nc else 60
     args.cpu_a = args.cpu_b = args.cpu
     args.size_mb, args.base, args.offset = 128, '0x300000000000', '0'
+    if nc:
+        args.size_mb = int(os.environ.get('NC_SIZE_MB', '4'))
+        args.base = '0x400000000000'
+    mode = {'nc': nc, 'size_mb': args.size_mb, 'base': args.base,
+            'map_mode': os.environ.get('NC_MAP_MODE', 'noreplace')}
     worker = connection = server = stream = None
-    report = {'pass': False}
+    report = {'pass': False, **mode}
     log = (args.output / 'worker.log').open('w')
     def send(value):
         stream.write((json.dumps(value) + '\n').encode())
@@ -73,10 +79,12 @@ def main():
         connection.settimeout(args.timeout)
         stream = connection.makefile('rwb')
         # Both builds have finished before UB initialization.
-        send({'host': socket.gethostname(), 'provider': args.provider})
+        send({'host': socket.gethostname(), 'provider': args.provider, **mode})
         peer = receive()
         if peer['host'] == socket.gethostname() or peer['provider'] != args.provider:
             raise RuntimeError('hosts must differ and provider must match')
+        if any(peer[key] != value for key, value in mode.items()):
+            raise RuntimeError('A/B NC configuration mismatch')
         args.provider = args.provider or (socket.gethostname() if args.role == 'B' else peer['host'])
         print('UB provider: ' + args.provider, flush=True)
         if args.role == 'B':
@@ -92,10 +100,13 @@ def main():
             raise RuntimeError('worker did not initialize')
         if args.role == 'B':
             send('READY')
-            for expected in ('write', 'flush', 'release'):
+            for expected in (('write', 'verify', 'release') if nc else ('write', 'flush', 'release')):
                 if receive() != expected:
                     raise RuntimeError('unexpected protocol command')
-                local(expected, 'CLOSED' if expected == 'release' else 'OK')
+                if expected == 'verify':
+                    local('read', 'VALUE ' + str(OLD))
+                else:
+                    local(expected, 'CLOSED' if expected == 'release' else 'OK')
                 if expected == 'release' and worker.process.wait(timeout=args.timeout):
                     raise RuntimeError('B cleanup failed')
                 send('OK')
@@ -106,20 +117,32 @@ def main():
                 if not response.startswith('VALUE '):
                     raise RuntimeError('expected VALUE')
                 return int(response.split()[1])
-            report['initial'] = value('prime')
-            if report['initial'] != OLD:
-                raise RuntimeError('initial value is not OLD')
-            remote('write')
-            report['after_write'] = value('read')
-            remote('flush')
-            report['after_flush_invalidate'] = value('invalidate')
-            report['case1_old'] = report['after_write'] == OLD
-            report['case2_new'] = report['after_flush_invalidate'] == NEW
+            if nc:
+                report['initial'] = value('read')
+                if report['initial'] != OLD:
+                    raise RuntimeError('A did not read B initial value')
+                remote('write')
+                report['A_reads_B'] = value('read')
+                if report['A_reads_B'] != NEW:
+                    raise RuntimeError('A did not observe B write')
+                local('write', 'OK')
+                remote('verify')
+                report['B_reads_A'] = OLD
+            else:
+                report['initial'] = value('prime')
+                if report['initial'] != OLD:
+                    raise RuntimeError('initial value is not OLD')
+                remote('write')
+                report['after_write'] = value('read')
+                remote('flush')
+                report['after_flush_invalidate'] = value('invalidate')
+                report['case1_old'] = report['after_write'] == OLD
+                report['case2_new'] = report['after_flush_invalidate'] == NEW
             local('close', 'CLOSED')
             if worker.process.wait(timeout=args.timeout):
                 raise RuntimeError('A cleanup failed; retain object')
             remote('release')
-            report['pass'] = report['case1_old'] and report['case2_new']
+            report['pass'] = True if nc else report['case1_old'] and report['case2_new']
             send(report)
     except Exception as error:
         report.update(error=str(error), object_may_remain=True, **{'pass': False})

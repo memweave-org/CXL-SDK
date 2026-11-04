@@ -3,6 +3,7 @@
 set -euo pipefail
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")"
 source ./config.sh
+if [[ -n ${UB_MICRO_NC:-} ]]; then PORT=${NC_PORT:-18983}; fi
 role=$(python3 - "$A_IP" "$B_IP" <<'PYROLE'
 import json, subprocess, sys
 interfaces = json.loads(subprocess.check_output(['ip', '-j', '-4', 'addr', 'show'], text=True))
@@ -19,7 +20,7 @@ if [[ ! -f $SDK_LIBRARY && -f $SDK_ROOT/lib64/libubsm_sdk.so ]]; then
   SDK_LIBRARY=$SDK_ROOT/lib64/libubsm_sdk.so
 fi
 export LD_LIBRARY_PATH="$(dirname -- "$SDK_LIBRARY"):$SDK_ROOT/lib:$SDK_ROOT/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-out=$(mktemp -d "$PWD/result-$role-XXXXXX")
+out=$(mktemp -d "$PWD/result-${UB_MICRO_NC:+nc-}$role-XXXXXX")
 context="$out/context"
 mkdir -p "$context"
 cp -Lr "$SDK_ROOT/include" "$context/include"

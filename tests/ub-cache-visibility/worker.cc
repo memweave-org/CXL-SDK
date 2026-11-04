@@ -5,6 +5,7 @@
 #include <sched.h>
 #include <unistd.h>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <stdexcept>
@@ -73,26 +74,50 @@ int main(int argc, char** argv) {
       throw std::runtime_error("invalid address, offset or CPU");
     cpu_set_t cpus; CPU_ZERO(&cpus); CPU_SET(cpu,&cpus);
     if (sched_setaffinity(0,sizeof(cpus),&cpus)) throw std::runtime_error("CPU affinity failed");
+    const bool nc = std::getenv("UB_MICRO_NC") != nullptr;
+    const std::string map_mode = std::getenv("NC_MAP_MODE") ? std::getenv("NC_MAP_MODE") : "noreplace";
+    if (map_mode!="shared" && map_mode!="noreplace") throw std::runtime_error("invalid NC_MAP_MODE");
+    const int map_flags = MAP_SHARED | ((nc && map_mode=="shared") ? 0 : MAP_FIXED_NOREPLACE);
+    const uint64_t allocation_flags = nc ? UBSM_FLAG_NONCACHE | UBSM_FLAG_WR_DELAY_COMP : UBSM_FLAG_CACHE;
+    std::cerr << "CONFIG role=" << role << " mode=" << (nc ? "NC" : "CACHE")
+              << " bytes=" << bytes << " allocation_flags=" << allocation_flags
+              << " map_flags=" << map_flags << " base=" << reinterpret_cast<void*>(base) << std::endl;
     ubsmem_options_t options{};
+    std::cerr << "BEGIN attributes" << std::endl;
     check("attributes",ubsmem_init_attributes(&options));
+    std::cerr << "BEGIN initialize" << std::endl;
     check("initialize",ubsmem_initialize(&options)); initialized=true;
     if (role=="B") {
-      check("allocate CACHE",ubsmem_shmem_allocate_with_provider(&provider,name.c_str(),bytes,0660,UBSM_FLAG_CACHE));
+      std::cerr << "BEGIN allocate" << std::endl;
+      check("allocate",ubsmem_shmem_allocate_with_provider(&provider,name.c_str(),bytes,0660,allocation_flags));
       created=true;
     }
-    int prot=role=="A" ? PROT_READ : PROT_READ|PROT_WRITE;
-    check("map",ubsmem_shmem_map(reinterpret_cast<void*>(base),bytes,prot,MAP_SHARED|MAP_FIXED_NOREPLACE,name.c_str(),0,&address));
+    int prot=nc || role=="B" ? PROT_READ|PROT_WRITE : PROT_READ;
+    std::cerr << "BEGIN map name=" << name << " prot=" << prot << std::endl;
+    check("map",ubsmem_shmem_map(reinterpret_cast<void*>(base),bytes,prot,map_flags,name.c_str(),0,&address));
     if (address!=reinterpret_cast<void*>(base)) throw std::runtime_error("SDK did not honor exact VA");
-    check("ownership",ubsmem_shmem_set_ownership(name.c_str(),address,bytes,prot)); owned=true;
+    if (!nc) {
+      std::cerr << "BEGIN ownership" << std::endl;
+      check("ownership",ubsmem_shmem_set_ownership(name.c_str(),address,bytes,prot)); owned=true;
+    }
     void* target=static_cast<char*>(address)+offset;
     auto* word=static_cast<volatile uint64_t*>(target);
     std::cerr << "role=" << role << " name=" << name << " base=" << address << " target=" << target
               << " bytes=" << bytes << " prot=" << prot << " cpu=" << cpu << std::endl;
-    if (role=="B") { *word=OLD; flush(target); }
+    if (role=="B") {
+      std::cerr << "BEGIN initial write" << std::endl;
+      *word=OLD; if (nc) barrier(); else flush(target);
+    }
     std::cout << "UBMICRO READY" << std::endl;
     std::string command;
     while (std::getline(std::cin,command)) {
-      if (command=="prime" && role=="A") {
+      if (nc && command=="read") {
+        barrier(); auto value=*word; barrier();
+        std::cout << "UBMICRO VALUE " << value << std::endl;
+      } else if (nc && command=="write") {
+        *word=role=="B" ? NEW : OLD; barrier();
+        std::cout << "UBMICRO OK" << std::endl;
+      } else if (!nc && command=="prime" && role=="A") {
         invalidate(target); auto value=*word; barrier();
         std::cout << "UBMICRO VALUE " << value << std::endl;
       } else if (command=="read" && role=="A") {
@@ -100,13 +125,15 @@ int main(int argc, char** argv) {
         std::cout << "UBMICRO VALUE " << value << std::endl;
       } else if (command=="write" && role=="B") {
         *word=NEW; barrier(); std::cout << "UBMICRO OK" << std::endl;
-      } else if (command=="flush" && role=="B") {
+      } else if (!nc && command=="flush" && role=="B") {
         flush(target); std::cout << "UBMICRO OK" << std::endl;
-      } else if (command=="invalidate" && role=="A") {
+      } else if (!nc && command=="invalidate" && role=="A") {
         invalidate(target); auto value=*word; barrier();
         std::cout << "UBMICRO VALUE " << value << std::endl;
       } else if (command=="close" || (command=="release" && role=="B")) {
-        check("ownership NONE",ubsmem_shmem_set_ownership(name.c_str(),address,bytes,PROT_NONE)); owned=false;
+        if (owned) {
+          check("ownership NONE",ubsmem_shmem_set_ownership(name.c_str(),address,bytes,PROT_NONE)); owned=false;
+        }
         check("unmap",ubsmem_shmem_unmap(address,bytes)); address=nullptr;
         // Coordinator sends release only after A has finalized and exited successfully.
         if (command=="release") { check("deallocate",ubsmem_shmem_deallocate(name.c_str())); created=false; }

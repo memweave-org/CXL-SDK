@@ -19,6 +19,7 @@ class Worker:
         command = [binary, role, args.name, args.provider, str(args.size_mb),
                    args.base, args.offset, str(args.cpu_a if role == 'A' else args.cpu_b)]
         self.log = log
+        self.last_stage = 'process launch'
         self.messages = queue.Queue()
         launch = command if host is None else [
             'ssh', '-T', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', host, shlex.join(command)]
@@ -29,6 +30,10 @@ class Worker:
             for line in self.process.stdout:
                 log.write(line)
                 log.flush()
+                if line.startswith(('BEGIN ', 'CONFIG ')):
+                    self.last_stage = line.strip()
+                if host is None:
+                    print(f'[{role} worker] {line.rstrip()}', flush=True)
                 if line.startswith('UBMICRO '):
                     self.messages.put(line.strip()[8:])
             self.messages.put('EOF')
@@ -45,7 +50,7 @@ class Worker:
             if message == 'EOF':
                 raise RuntimeError('worker exited unexpectedly; inspect logs')
             return message
-        raise TimeoutError('worker timed out; inspect logs and remote processes')
+        raise TimeoutError(f'worker pid={self.process.pid} timed out; last stage: {self.last_stage}; inspect worker.log')
 
     def command(self, command, args):
         self.process.stdin.write(command + '\n')

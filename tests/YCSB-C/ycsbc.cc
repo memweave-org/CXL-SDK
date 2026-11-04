@@ -229,6 +229,7 @@ void master_process(utils::Properties &props) {
 void follower_process(utils::Properties &props) {
 #ifdef YCSB_UB_TWO_HOST
   g_var_struct=static_cast<GlobalVariables*>(ycsbc_ub::control_header());
+  ycsbc_ub::stage("A reading shared controller pointer");
 #else
   std::string hexAddrStr = props.GetProperty("share_var");
   void *addr = nullptr;
@@ -241,9 +242,14 @@ void follower_process(utils::Properties &props) {
 
   auto trx_thread_controller = g_var_struct->trx_thread_controller;
 
+#ifdef YCSB_UB_TWO_HOST
+  ycsbc_ub::stage("A starting local threads");
+#endif
   trx_thread_controller->StartThreads();
 #ifdef YCSB_UB_TWO_HOST
+  ycsbc_ub::stage("A waiting for local thread registration");
   trx_thread_controller->WaitForLocalReady();
+  ycsbc_ub::stage("A local threads ready");
   ycsbc_ub::ready();
   utils::Timer<double> local_timer; local_timer.Start();
 #endif

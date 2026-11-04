@@ -1,4 +1,5 @@
 #pragma once
+#include <sstream>
 #include <atomic>
 #include <vector>
 #include <chrono>
@@ -156,7 +157,8 @@ public:
     for(int t=ycsbc_ub::first_thread(mid);t<ycsbc_ub::first_thread(mid)+ycsbc_ub::threads(mid);++t)
       for(const auto& op:op_groups[t]) { if(op.type==READ) ++reads; else ++writes; }
     auto errors=reads+writes-local_success[mid].load();
-    std::cout<<"UBYCSB RESULT {\"role\":\""<<(mid==0?"B":"A")
+    std::ostringstream response;
+    response<<"RESULT {\"role\":\""<<(mid==0?"B":"A")
       <<"\",\"reads\":"<<reads<<",\"writes\":"<<writes<<",\"errors\":"<<errors
       <<",\"seconds\":"<<std::setprecision(12)<<seconds<<",\"framework_total_operations\":"<<total
       <<",\"bwtree_opt\":"
@@ -165,7 +167,8 @@ public:
 #else
       <<"false"
 #endif
-      <<"}"<<std::endl;
+      <<"}";
+    ycsbc_ub::reply(response.str());
   }
 #endif
 private:
@@ -204,7 +207,13 @@ private:
 #else
     SimThreadInfo::setup_worker_ids(arg->sim_machine_id, arg->sim_thread_id);
 #endif
+#ifdef YCSB_UB_TWO_HOST
+    ycsbc_ub::stage("thread " + std::to_string(arg->sim_thread_id) + " registering with BwTree");
+#endif
     InitDelegateClient(thread_ids);
+#ifdef YCSB_UB_TWO_HOST
+    ycsbc_ub::stage("thread " + std::to_string(arg->sim_thread_id) + " registered; constructing Client");
+#endif
 #ifdef TIMING_LOAD_BALANCE
     for (auto db : *thread_args->dbs) {
       db->pool->start_sample = true;
@@ -230,7 +239,9 @@ private:
 #endif
 
 #ifdef YCSB_UB_TWO_HOST
+    ycsbc_ub::stage("thread " + std::to_string(arg->sim_thread_id) + " publishing ready flag");
     local_ready[arg->sim_machine_id].fetch_add(1);
+    ycsbc_ub::stage("thread " + std::to_string(arg->sim_thread_id) + " ready flag published");
 #endif
     while (sync_var_.load(std::memory_order_acquire) != 1) {
       // wait for the global state to be set

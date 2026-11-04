@@ -37,13 +37,18 @@ bool initialized = false;
 void initialize() {
   if (initialized) return;
   ubsmem_options_t options{};
+  std::cerr << "UB_INIT_ATTRIBUTES_CALL" << std::endl;
   checked(ubsmem_init_attributes(&options), "ubsmem_init_attributes");
+  std::cerr << "UB_INITIALIZE_CALL" << std::endl;
   checked(ubsmem_initialize(&options), "ubsmem_initialize");
+  std::cerr << "UB_INITIALIZE_RETURN rc=0" << std::endl;
   initialized = true;
 }
 void finalize() {
   if (initialized && mappings.empty()) {
+    std::cerr << "UB_FINALIZE_CALL" << std::endl;
     checked(ubsmem_finalize(), "ubsmem_finalize");
+    std::cerr << "UB_FINALIZE_RETURN rc=0" << std::endl;
     initialized = false;
   }
 }
@@ -72,9 +77,16 @@ void* map_ub_memory(const char* name, void* base, size_t size, UbMappingMode mod
   validate_name(name);
   if (mode == UbMappingMode::Cacheable && cache_begin.load())
     throw std::runtime_error("Only one cacheable UB arena is supported");
+  std::cerr << "UB_MAP_BEGIN name=" << name << " address=" << base
+            << " bytes=" << size << " prot=" << protection
+            << " stage=initialize" << std::endl;
   initialize();
+  static unsigned map_call_count=0;
+  std::cerr << "UB_MAP_CALL index=" << ++map_call_count << " name=" << name << std::endl;
   const int rc = ubsmem_shmem_map(base, size, protection,
       MAP_SHARED | (base ? MAP_FIXED_NOREPLACE : 0), name, 0, &p);
+  std::cerr << "UB_MAP_RETURN name=" << name << " rc=" << rc
+            << " address=" << p << std::endl;
   if (rc) {
     finalize();
     checked(rc, "ubsmem_shmem_map");
@@ -100,7 +112,9 @@ void* map_ub_memory(const char* name, void* base, size_t size, UbMappingMode mod
 #endif
 #ifdef SHM_LIB_WITH_UBSM
   if (mode == UbMappingMode::Cacheable) {
+    std::cerr << "UB_OWNERSHIP_CALL name=" << name << " prot=" << protection << std::endl;
     const int rc = ubsmem_shmem_set_ownership(name, p, size, protection);
+    std::cerr << "UB_OWNERSHIP_RETURN name=" << name << " rc=" << rc << std::endl;
     if (rc) {
       checked(ubsmem_shmem_unmap(p, size), "unmap after ownership failure");
       finalize(); checked(rc, "ubsmem_shmem_set_ownership(RW)");
@@ -161,7 +175,10 @@ void create_ub_memory(const char* name, size_t size, const char* host, uint32_t 
   initialize();
   const uint64_t flags = mode == UbMappingMode::Cacheable ? UBSM_FLAG_CACHE :
       (mode == UbMappingMode::Noncacheable ? UBSM_FLAG_NONCACHE : UBSM_FLAG_ONLY_IMPORT_NONCACHE) | UBSM_FLAG_WR_DELAY_COMP;
+  std::cerr << "UB_ALLOCATE_CALL name=" << name << " bytes=" << size
+            << " flags=" << flags << std::endl;
   const int rc = ubsmem_shmem_allocate_with_provider(&provider, name, size, 0660, flags);
+  std::cerr << "UB_ALLOCATE_RETURN name=" << name << " rc=" << rc << std::endl;
   if (!rc) std::cout << "UB_OBJECT_CREATED name=" << name
                      << " requested_provider=" << host << " numa=" << numa
                      << " mode=" << int(mode) << " flags=" << flags << std::endl;

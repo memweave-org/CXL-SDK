@@ -43,6 +43,12 @@ def main():
             a.finish('close');b.finish('release')
             assert not list((root/'objects').iterdir())
             atext=(root/'A.log').read_text();btext=(root/'B.log').read_text()
+            for log in (atext,btext):
+                calls=[line for line in log.splitlines() if line.startswith('UB_MAP_CALL ')]
+                assert len(calls)==2, calls
+                assert 'index=1 name=native-framework-test-nc' in calls[0], calls
+                assert 'index=2 name=native-framework-test' in calls[1], calls
+            assert 'YCSB_STAGE A local threads ready' in atext
             assert 'address=0x300000000000 prot=1' in atext
             assert 'address=0x400000000000 prot=3' in atext
             assert 'address=0x300000000000 prot=3' in btext
@@ -59,5 +65,6 @@ def main():
             for worker in workers:
                 if worker.process.poll() is None: worker.process.terminate()
                 worker.process.wait(timeout=5);worker.reader.join(timeout=1)
+                worker.protocol_reader.join(timeout=1)
             for log in logs:log.close()
 if __name__=='__main__':main()

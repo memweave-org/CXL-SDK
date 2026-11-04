@@ -9,6 +9,10 @@
 #include <stdexcept>
 #include <string>
 #include <climits>
+#include <mutex>
+#include <cerrno>
+#include <fcntl.h>
+#include <unistd.h>
 namespace ycsbc_ub {
 namespace {
 constexpr uintptr_t data_base=0x300000000000, nc_base=0x400000000000;
@@ -20,6 +24,17 @@ const char* env(const char* key) {
   const char* value=std::getenv(key);
   if(!value || !*value) throw std::runtime_error(std::string("Missing ")+key);
   return value;
+}
+int control_fd() {
+  static const int fd=[] {
+    std::string value=env("YCSB_UB_CONTROL_FD");
+    size_t end=0;
+    int descriptor=std::stoi(value,&end);
+    if(end!=value.size() || descriptor<3 || fcntl(descriptor,F_GETFD)==-1)
+      throw std::runtime_error("Invalid YCSB_UB_CONTROL_FD");
+    return descriptor;
+  }();
+  return fd;
 }
 void command(const char* expected) {
   std::string value;
@@ -33,6 +48,25 @@ size_t megabytes(const char* key) {
   return mb<<20;
 }
 }
+void stage(const std::string& message) {
+  static std::mutex log_mutex;
+  std::lock_guard<std::mutex> guard(log_mutex);
+  std::cerr << "YCSB_STAGE " << message << std::endl;
+}
+void reply(const std::string& message) {
+  if(message.find('\n')!=std::string::npos || message.size()>4095)
+    throw std::runtime_error("Invalid controller reply");
+  const std::string line=message+"\n";
+  static std::mutex reply_mutex;
+  std::lock_guard<std::mutex> guard(reply_mutex);
+  size_t sent=0;
+  while(sent<line.size()) {
+    ssize_t n=write(control_fd(),line.data()+sent,line.size()-sent);
+    if(n<0 && errno==EINTR) continue;
+    if(n<=0) throw std::runtime_error("Controller reply pipe write failed");
+    sent+=static_cast<size_t>(n);
+  }
+}
 int threads(int machine) {
   int n=std::stoi(env(machine==0?"YCSB_UB_THREADS_B":"YCSB_UB_THREADS_A"));
   if(n<1 || n>192) throw std::runtime_error("Threads must be 1..192 per host");
@@ -41,6 +75,8 @@ int threads(int machine) {
 int first_thread(int machine) { return machine==0?0:threads(0); }
 int cpu_start() { return std::stoi(env("YCSB_UB_CPU")); }
 void prepare(utils::Properties& props) {
+  (void)control_fd(); // Fail before allocating UB objects if launched without a controller.
+  stage("prepare UB session");
   owner=SimThreadInfo::is_master();
   name=env("YCSB_UB_NAME");
   data_size=megabytes("YCSB_UB_SIZE_MB"); nc_size=megabytes("YCSB_UB_NC_SIZE_MB");
@@ -69,12 +105,13 @@ void prepare(utils::Properties& props) {
   // A never allocates data. Leaving its CACHE allocator unconfigured catches violations.
   if(owner) ub_configure_arena(false,data,data_size);
   cacheable=MemoryManager(false);
+  stage("both UB mappings ready; allocators configured");
   std::cerr<<"YCSB framework UB role="<<(owner?"B":"A")<<" CACHE="<<(owner?"RW":"READ")<<" NC=RW"<<std::endl;
 }
 void* control_header() { return nc; }
 void ready() {
   mfence();
-  std::cout<<"UBYCSB READY"<<std::endl;
+  reply("READY");
   command("run");
 }
 void await_cleanup() { command(owner?"release":"close"); }
@@ -82,7 +119,7 @@ void finish() {
   unmap_ub_memory(data,data_size); data=nullptr;
   unmap_ub_memory(nc,nc_size); nc=nullptr;
   if(owner) { destroy_ub_memory(name.c_str());destroy_ub_memory((name+"-nc").c_str()); }
-  std::cout<<"UBYCSB CLOSED"<<std::endl;
+  reply("CLOSED");
 }
 }
 #endif

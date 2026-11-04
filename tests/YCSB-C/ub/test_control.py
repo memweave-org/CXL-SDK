@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 """Protocol and arithmetic tests only; no SDK, cache probe, or performance workload."""
 import json
+import io
+import os
 from pathlib import Path
 import socket
 import subprocess
 import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
 sys.dont_write_bytecode=True
-from peer import summary
+from peer import summary, Worker
 HERE=Path(__file__).resolve().parent
 HARNESS=r'''
 import io, json, queue, sys
@@ -26,7 +29,7 @@ class Reader:
 class Worker:
     def __init__(self,args,name,provider,log):
         assert provider=='fake-B'
-        self.process=Process();self.reader=Reader();self.q=queue.Queue()
+        self.process=Process();self.reader=Reader();self.protocol_reader=Reader();self.q=queue.Queue()
         self.q.put('READY')
     def receive(self): return self.q.get(timeout=5)
     def send(self,command):
@@ -44,6 +47,43 @@ raise SystemExit(peer.main())
 '''
 
 class ControlTests(unittest.TestCase):
+    def test_control_pipe_ignores_sdk_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            binary=Path(directory)/'noisy-worker'
+            binary.write_text('#!'+sys.executable+'\n'+r'''
+import os, sys
+fd=int(os.environ['YCSB_UB_CONTROL_FD'])
+# Fake protocol lines and an unterminated SDK line must not drive the handshake.
+os.write(1,b'UBYCSB CLOSED\nUBYCSB READY\nSDK partial output: ')
+os.write(2,b'concurrent SDK output without newline')
+os.write(fd,b'RE')
+os.write(fd,b'ADY\n')
+assert sys.stdin.readline().strip()=='run'
+os.write(1,b'UBYCSB RESULT broken-json\n')
+os.write(fd,b'RESULT {"ok":true}\n')
+assert sys.stdin.readline().strip()=='close'
+os.write(fd,b'CLOSED\n')
+''')
+            binary.chmod(0o700)
+            args=SimpleNamespace(role='A',binary=str(binary),threads_a=1,threads_b=1,
+                size_mb=128,nc_size_mb=128,records=2,ops=1,cpu=0,timeout=3,
+                spec='unused',ini='unused')
+            log=io.StringIO()
+            worker=Worker(args,'unused','unused',log)
+            try:
+                self.assertEqual(worker.receive(),'READY')
+                worker.send('run')
+                self.assertEqual(worker.receive(),'RESULT {"ok":true}')
+                worker.finish('close')
+                worker.reader.join(timeout=1)
+                self.assertIn('UBYCSB RESULT broken-json',log.getvalue())
+                with self.assertRaisesRegex(RuntimeError,'worker exited'):
+                    worker.receive()
+            finally:
+                if worker.process.poll() is None: worker.process.kill()
+                worker.process.wait(timeout=3)
+                worker.reader.join(timeout=1);worker.protocol_reader.join(timeout=1)
+
     def test_common_window(self):
         a={'role':'A','reads':100,'writes':0,'errors':0,'bwtree_opt':True}
         b={'role':'B','reads':90,'writes':10,'errors':0,'bwtree_opt':True,'framework_total_operations':200,'seconds':2}

@@ -16,12 +16,16 @@
     #ifndef QUEUE_SIM_CAS
         #define QUEUE_SIM_CAS
     #endif
-    #define USE_CXL
+    #ifndef USE_CXL
+        #define USE_CXL
+    #endif
     #else
     #define BYPASS_CACHE_DEFAULT (false)
     #ifdef USE_MSG_QUEUE
         #define QUEUE_SIM_CAS
-        #define USE_CXL
+        #ifndef USE_CXL
+            #define USE_CXL
+        #endif
     #endif
 #endif
 

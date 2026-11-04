@@ -17,6 +17,7 @@ class Worker:
     def __init__(self, args, name, provider, log):
         self.queue = queue.Queue()
         self.role = args.role
+        self.last_stage = 'process launch'
         env=dict(os.environ, YCSB_UB_NAME=name, YCSB_UB_PROVIDER=provider,
                  YCSB_UB_THREADS_A=str(args.threads_a), YCSB_UB_THREADS_B=str(args.threads_b),
                  YCSB_UB_SIZE_MB=str(args.size_mb), YCSB_UB_NC_SIZE_MB=str(args.nc_size_mb),
@@ -25,17 +26,35 @@ class Worker:
                  '-machineno', '0' if args.role=='B' else '1',
                  '-server_threads', str(args.threads_a+args.threads_b),
                  '-dbnum', '1', '-valuesize', '8', '-P', args.spec, '-C', args.ini]
-        self.process = subprocess.Popen(command, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT, text=True, bufsize=1)
+        # SDK output can interleave at byte boundaries. Never parse stdout for control.
+        read_fd, write_fd = os.pipe()
+        env['YCSB_UB_CONTROL_FD'] = str(write_fd)
+        try:
+            self.process = subprocess.Popen(command, env=env, pass_fds=(write_fd,),
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT, text=True, bufsize=1)
+        except BaseException:
+            os.close(read_fd)
+            raise
+        finally:
+            os.close(write_fd)
+        def read_control():
+            try:
+                with os.fdopen(read_fd, 'r') as control:
+                    for line in control:
+                        self.queue.put(line.rstrip('\n'))
+            finally:
+                self.queue.put('EOF')
         def read():
-            for line in self.process.stdout:
-                log.write(line)
-                log.flush()
-                if line.startswith('UBYCSB '):
-                    self.queue.put(line.strip()[7:])
-                else:
+            with self.process.stdout:
+                for line in self.process.stdout:
+                    log.write(line)
+                    log.flush()
+                    if line.startswith(('UB_', 'YCSB_STAGE ')):
+                        self.last_stage = line.strip()
                     print(f'[{args.role} worker] {line.rstrip()}', flush=True)
-            self.queue.put('EOF')
+        self.protocol_reader = threading.Thread(target=read_control, daemon=True)
+        self.protocol_reader.start()
         self.reader = threading.Thread(target=read, daemon=True)
         self.reader.start()
         self.timeout = args.timeout
@@ -46,12 +65,12 @@ class Worker:
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise TimeoutError(f'worker response timed out after {self.timeout}s; inspect worker.log')
+                raise TimeoutError(f'worker pid={self.process.pid} response timed out after {self.timeout}s; last stage: {self.last_stage}; inspect worker.log')
             try:
                 response = self.queue.get(timeout=min(10, remaining))
                 break
             except queue.Empty:
-                print(f'[{self.role}] Waiting for worker response ({time.monotonic()-start:.0f}s); see worker.log', flush=True)
+                print(f'[{self.role}] Waiting for worker response ({time.monotonic()-start:.0f}s); pid={self.process.pid}; last stage: {self.last_stage}', flush=True)
         if response == 'EOF':
             raise RuntimeError('worker exited; inspect worker.log')
         return response
@@ -70,6 +89,8 @@ class Worker:
         self.command(command, 'CLOSED')
         if self.process.wait(timeout=self.timeout):
             raise RuntimeError('worker cleanup failed')
+        self.process.stdin.close()
+        self.protocol_reader.join(timeout=1)
 
 
 def summary(a, b, seconds, ops):
@@ -217,6 +238,7 @@ def main():
             except (OSError, subprocess.TimeoutExpired):
                 worker.process.terminate(); report['worker_exit_unconfirmed']=True
             worker.reader.join(timeout=1)
+            worker.protocol_reader.join(timeout=1)
         for handle in (stream, connection, server):
             if handle: handle.close()
         if not worker or not worker.reader.is_alive(): log.close()

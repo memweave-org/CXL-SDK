@@ -1,8 +1,11 @@
 #pragma once
 #ifdef YCSB_UB_TWO_HOST
 #include <cstdint>
+#include <string>
 #include "core/properties.h"
 namespace ycsbc_ub {
+void stage(const std::string& message);
+void reply(const std::string& message);
 int threads(int machine); // B is native master 0, A is follower 1.
 int first_thread(int machine);
 int cpu_start();

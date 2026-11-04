@@ -73,3 +73,8 @@ python3 tests/YCSB-C/ub/test_framework.py --binary /absolute/path/ycsbc_nocc_no_
 
 上述二进制必须链接文件映射 SDK 替身；不要把这项本机检查指向真实 SDK 二进制。
 用于编译的替身头文件/实现见 `tests/ub-bwtree-ycsb/mock/`。
+
+本地 worker 的 READY、RESULT、CLOSED 通过专用继承 pipe
+（`YCSB_UB_CONTROL_FD`）传给控制器；stdin 只接收控制命令，stdout/stderr 只作日志。
+控制器不从日志解析协议，SDK 并发打印或不换行不会吞掉 READY。
+A/B 之间仍走独立 TCP 连接。worker 必须通过 run.sh/peer.py 启动。

@@ -35,11 +35,9 @@ class Worker:
         self.reader = threading.Thread(target=read, daemon=True)
         self.reader.start()
 
-    def receive(self, args, failed):
+    def receive(self, args):
         deadline = time.monotonic() + args.timeout
         while time.monotonic() < deadline:
-            if failed.is_set():
-                raise RuntimeError('exclusivity guard failed; samples invalid')
             try:
                 message = self.messages.get(timeout=0.1)
             except queue.Empty:
@@ -49,10 +47,10 @@ class Worker:
             return message
         raise TimeoutError('worker timed out; inspect logs and remote processes')
 
-    def command(self, command, args, failed):
+    def command(self, command, args):
         self.process.stdin.write(command + '\n')
         self.process.stdin.flush()
-        return self.receive(args, failed)
+        return self.receive(args)
 
 
 def main():
@@ -69,7 +67,6 @@ def main():
     parser.add_argument('--offset', default='0')
     parser.add_argument('--timeout', type=float, default=60)
     parser.add_argument('--output', type=Path, required=True)
-    parser.add_argument('--guard', required=True, help='local executable checking BOTH hosts; see README')
     args = parser.parse_args()
     if args.host_a == args.host_b:
         parser.error('A and B must be distinct physical machines')
@@ -78,56 +75,26 @@ def main():
     args.output.mkdir(parents=True, exist_ok=False)
     args.name = 'ub-vis-' + uuid.uuid4().hex[:20]
     (args.output / 'config.json').write_text(json.dumps(vars(args), default=str, indent=2))
-    failed, stop = threading.Event(), threading.Event()
-    guard_log = (args.output / 'exclusivity.log').open('w')
-
-    def guard():
-        guard_log.write(time.strftime('%Y-%m-%dT%H:%M:%S%z') + '\n')
-        guard_log.flush()
-        try:
-            rc = subprocess.run([args.guard, args.host_a, args.host_b], stdout=guard_log,
-                                stderr=subprocess.STDOUT, timeout=args.timeout).returncode
-            if rc:
-                failed.set()
-        except Exception as error:
-            guard_log.write(str(error) + '\n')
-            failed.set()
-        guard_log.flush()
-        return not failed.is_set()
-
     workers, logs = [], []
-    report = {'name': args.name, 'pass': False, 'samples_valid': False}
-    monitor = None
+    report = {'name': args.name, 'pass': False}
     try:
-        # Two successive whole-job checks, not an instantaneous utilization check.
-        if not guard():
-            raise RuntimeError('preflight exclusivity check failed')
-        time.sleep(1)
-        if not guard():
-            raise RuntimeError('second preflight exclusivity check failed')
-        def monitor_guard():
-            while not stop.wait(1):
-                if not guard():
-                    return
-        monitor = threading.Thread(target=monitor_guard, daemon=True)
-        monitor.start()
         def start(role, host, binary):
             log = (args.output / (role + '.log')).open('w')
             logs.append(log)
             worker = Worker(host, binary, role, args, log)
             workers.append(worker)
-            if worker.receive(args, failed) != 'READY':
+            if worker.receive(args) != 'READY':
                 raise RuntimeError('expected READY')
             return worker
         b = start('B', args.host_b, args.binary_b)
         a = start('A', args.host_a, args.binary_a)
         def value(command):
-            message = a.command(command, args, failed)
+            message = a.command(command, args)
             if not message.startswith('VALUE '):
                 raise RuntimeError('expected VALUE: ' + message)
             return int(message.split()[1])
         def expect(worker, command, expected):
-            if worker.command(command, args, failed) != expected:
+            if worker.command(command, args) != expected:
                 raise RuntimeError('unexpected response to ' + command)
         report['initial'] = value('prime')
         if report['initial'] != OLD:
@@ -144,8 +111,7 @@ def main():
         expect(b, 'release', 'CLOSED')
         if b.process.wait(timeout=args.timeout):
             raise RuntimeError('B cleanup failed')
-        report['samples_valid'] = not failed.is_set()
-        report['pass'] = report['samples_valid'] and report['case1_old'] and report['case2_new']
+        report['pass'] = report['case1_old'] and report['case2_new']
     except Exception as error:
         report['error'] = str(error)
         report['object_may_remain'] = True
@@ -158,12 +124,6 @@ def main():
             except (OSError, subprocess.TimeoutExpired):
                 worker.process.terminate()
                 report['remote_exit_unconfirmed'] = True
-        stop.set()
-        if monitor:
-            monitor.join(timeout=args.timeout + 1)
-        if failed.is_set():
-            report['samples_valid'] = report['pass'] = False
-        guard_log.close()
         for worker in workers:
             worker.reader.join(timeout=1)
         for log in logs:

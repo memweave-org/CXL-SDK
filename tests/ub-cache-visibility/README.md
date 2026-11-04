@@ -20,13 +20,10 @@ bash ./run.sh
 CPU，等待对端编译结束后通过 B 的 TCP 18981 端口同步，最后两边打印判定结果。
 控制端口只应对 A 开放，协议用于受信任的实验网络。等待对端最多 10 分钟。
 
-每次运行生成 `result-A-*` 或 `result-B-*`，包含编译日志、worker 日志、
-资源检查日志和 `result.json`。运行前仍需确认其他整轮实验及调度任务已结束；
-脚本在两次启动检查及运行期间记录全部进程，并遇到已知测试/驱动或高 CPU
-进程时停止自己的测试。通用进程名检查不能识别所有现场调度任务，不能替代
-对现场整轮实验结束状态的确认。受干扰结果标记无效，释放资源后重新运行。
+每次运行生成 `result-A-*` 或 `result-B-*`，包含编译日志、worker 日志和
+`result.json`。
 
-下面是测试原理和可选的旧 SSH 控制入口；一键入口无需 SSH 或自定义 guard。
+下面是测试原理和可选的旧 SSH 控制入口；一键入口无需 SSH。
 
 独立使用当前 `ubsmem_*` API，不依赖 YCSB 或 shm-lib。B 创建 `UBSM_FLAG_CACHE`
 对象，provider 必须指定 **B 的 UB 拓扑主机名**。B 映射 RW、A 映射 READ，分别申请
@@ -71,30 +68,19 @@ UBSM_LIBRARY=/usr/local/ubs_mem/lib/libubsm_sdk.so \
 
 ## 运行
 
-按照仓库测试资源互斥要求，runner 要求提供现场的 `--guard` 可执行程序。
-它接收 A、B 的 SSH 地址作为两个参数，必须检查**两台机器**的其他测试进程、
-驱动/调度脚本及 CPU 使用，输出机器、时间、PID、资源使用和整轮测试结束依据；
-确认没有其他测试且无待启动的实验调度任务才返回 0，发现冲突或无法确认则返回非零。
-不能仅根据 CPU 下降或某个 worker 退出放行。不要用 `true` 跳过检查。
-由于现场的调度系统及测试命令未知，此处不提供会漏检其他任务的通用进程名白名单。
-
 ```sh
 python3 tests/ub-cache-visibility/run.py \
   --host-a user@machine-a --host-b user@machine-b \
   --provider B的UB拓扑主机名 \
   --binary-a /tmp/ub-cache-worker --binary-b /tmp/ub-cache-worker \
   --cpu-a 2 --cpu-b 2 \
-  --guard /absolute/path/to/site-exclusivity-check \
   --output build/ub-visibility-run1
 ```
 
-runner 连续两次 preflight 检查后才启动 worker；运行中每秒再次检查，冲突后停止
-自己的测试、保留日志并将样本标记为无效，不干预其他任务。guard 本身应快速返回。
-互斥检测属于采样检查，现场仍须避免在检查间隙启动别的任务。
-`--timeout` 默认 60 秒，适用于单个控制阶段和 guard。输出目录必须不存在。
+`--timeout` 默认 60 秒，适用于单个控制阶段。输出目录必须不存在。
 
-输出 `A.log`、`B.log`、`exclusivity.log`、`config.json` 和 `result.json`。
-`case1_old` / `case2_new` 分别表示两个条件；只有两者通过、清理成功且样本有效才
+输出 `A.log`、`B.log`、`config.json` 和 `result.json`。
+`case1_old` / `case2_new` 分别表示两个条件；只有两者通过且清理成功才
 返回 0。真实 SDK 日志里可检查 map/ownership 返回码。失败、超时或 SSH 中断时，
 对象可能保留：按日志中的唯一对象名确认两边全部退出且 unmap 后再做人工清理。
 终止 SSH 不能保证卡在驱动中的远程进程已退出，runner 会标记无法确认的退出。

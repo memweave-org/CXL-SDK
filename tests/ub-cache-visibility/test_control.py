@@ -36,9 +36,9 @@ class ControlTest(unittest.TestCase):
                 self.process = Process(role)
                 self.reader = Reader()
                 events.append((role, 'start'))
-            def receive(self, args, failed):
+            def receive(self, args):
                 return 'READY'
-            def command(self, command, args, failed):
+            def command(self, command, args):
                 events.append((self.role, command))
                 if command == 'prime':
                     return f'VALUE {runner.OLD}'
@@ -51,11 +51,9 @@ class ControlTest(unittest.TestCase):
             out = Path(directory) / 'result'
             argv = ['run.py', '--host-a', 'a', '--host-b', 'b', '--provider', 'b',
                     '--binary-a', '/worker', '--binary-b', '/worker', '--cpu-a', '0',
-                    '--cpu-b', '0', '--guard', '/unused', '--output', str(out)]
+                    '--cpu-b', '0', '--output', str(out)]
             with patch('sys.argv', argv), patch.object(runner, 'Worker', Worker), \
-                 patch.object(runner.subprocess, 'run') as guard, \
-                 patch.object(runner.time, 'sleep'), contextlib.redirect_stdout(io.StringIO()):
-                guard.return_value.returncode = 0
+                 contextlib.redirect_stdout(io.StringIO()):
                 rc = runner.main()
             result = json.loads((out / 'result.json').read_text())
         return rc, result, events

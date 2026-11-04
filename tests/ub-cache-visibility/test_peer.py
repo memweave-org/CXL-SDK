@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""TCP control integration only: replace SDK workers and machine resource probes."""
+"""TCP control integration only: replace SDK workers."""
 import json
 import socket
 import subprocess
@@ -15,7 +15,6 @@ sys.dont_write_bytecode = True
 import peer
 role = sys.argv[sys.argv.index('--role') + 1]
 peer.socket.gethostname = lambda: 'fake-host-' + role
-peer.subprocess.check_output = lambda *a, **k: ''
 class Process:
     stdin = io.StringIO()
     pid = 99999999

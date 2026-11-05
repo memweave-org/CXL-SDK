@@ -23,7 +23,7 @@ for variant in "$@"; do
     [ -z "${UBSM_LIBRARY:-}" ] || set -- "$@" "-DUBSM_LIBRARY=$UBSM_LIBRARY"
     [ -z "${UB_MEMLINK_LIBRARY:-}" ] || set -- "$@" "-DUB_MEMLINK_LIBRARY=$UB_MEMLINK_LIBRARY"
     if [ "${YCSB_UB_TWO_HOST:-0}" = 1 ]; then
-        set -- "$@" -DYCSB_UB_TWO_HOST=ON -DYCSB_INDEXES=bwtree "-DBWTREE_MAPPING_TABLE_BITS=${MAPPING_BITS:-20}"
+        set -- "$@" -DYCSB_UB_TWO_HOST=ON "-DYCSB_INDEXES=${YCSB_INDEXES:-bwtree}" "-DBWTREE_MAPPING_TABLE_BITS=${MAPPING_BITS:-20}"
     fi
     cmake -B "$build_dir" "$@" -DVARIANT="$lower_variant" -DBUILD_EXTRA_INDEXES=OFF -DCMAKE_EXPORT_COMPILE_COMMANDS=ON || { echo "CMake configuration failed for $variant ($lower_variant)"; exit 1; }
     cmake --build "$build_dir" --parallel "${JOBS:-8}" || { echo "Make failed for $variant"; exit 1; }

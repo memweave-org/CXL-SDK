@@ -5,6 +5,9 @@
 // All entry points use the global, compile-time UB_API selection.
 const char* ub_api_name();
 enum class UbMappingMode { Legacy, Cacheable, Noncacheable };
+// UBSM Cacheable mappings invalidate this host's entire arena after ownership,
+// before application access. SHM_UB_STARTUP_INVALIDATE=0 disables this only for
+// controlled comparisons; invalidation does not clear memory contents.
 void* map_ub_memory(const char* name, void* base, size_t size, UbMappingMode mode = UbMappingMode::Legacy, bool read_only = false);
 void unmap_ub_memory(void* base, size_t size);
 // Create once; destroy only after both workers confirm unmap/finalize.

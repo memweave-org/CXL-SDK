@@ -10,6 +10,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 from types import SimpleNamespace
 sys.dont_write_bytecode=True
 from peer import summary, Worker
@@ -52,6 +53,19 @@ raise SystemExit(peer.main())
 '''
 
 class ControlTests(unittest.TestCase):
+    def test_fault_reports_address_and_region(self):
+        worker=Worker.__new__(Worker)
+        worker.role='A';worker.binary='unused'
+        worker.data_size=worker.nc_size=128<<20
+        with patch('peer.shutil.which',return_value=None):
+            for address,region in [('0x300000000040','CACHE data'),
+                                   ('0x400000000040','NC metadata'),('0x0','outside UB')]:
+                with self.subTest(address=address):
+                    with self.assertRaisesRegex(RuntimeError,region) as raised:
+                        worker.raise_fault(f'FAULT signal=0xb code=0x2 address={address} pc=0x401234')
+                    self.assertIn(address,str(raised.exception))
+                    self.assertIn('pc=0x401234',str(raised.exception))
+
     def test_running_worker_failure_stops_peer(self):
         for role, drop_report in (('A',False),('B',False),('A',True)):
             with self.subTest(role=role,drop_report=drop_report), tempfile.TemporaryDirectory() as directory:
@@ -165,6 +179,14 @@ os.write(fd,b'CLOSED\n')
         self.assertEqual(result['B_observed_read_fraction'],0.90)
         with self.assertRaises(RuntimeError): summary(a,{**b,'errors':1},2,100)
         with self.assertRaises(RuntimeError): summary({**a,'writes':1},b,2,100)
+
+    def test_suite_requires_both_workloads_and_correct_rpc_count(self):
+        a={'role':'A','reads':90,'writes':10,'errors':0,'bwtree_opt':False}
+        b={**a,'role':'B','framework_total_operations':200,'seconds':2,'rpc_completed':10}
+        self.assertEqual(summary(a,b,3,100,suite=True)['update_semantics'],'replace-existing-key')
+        with self.assertRaisesRegex(RuntimeError,'RPC completion'):
+            summary(a,b,3,100,suite=True,rpc=1)
+        self.assertTrue(summary(a,{**b,'rpc_completed':100},3,100,suite=True,rpc=1)['pass'])
 
     def test_two_peers(self):
         a,b=self.run_two_peers()

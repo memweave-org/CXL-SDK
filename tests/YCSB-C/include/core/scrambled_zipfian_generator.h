@@ -28,7 +28,11 @@ class ScrambledZipfianGenerator : public Generator<uint64_t> {
         num_items_(max - min + 1),
         generator_(min, max, zipfian_const) {
     std::random_device rd;
+#ifdef YCSB_UB_TWO_HOST
+    std::mt19937 gen(std::getenv("YCSB_UB_SEED") ? std::stoull(std::getenv("YCSB_UB_SEED")) : rd());
+#else
     std::mt19937 gen(rd());
+#endif
     std::uniform_int_distribution<uint32_t> dis;
     scramble_random_value = dis(gen);
   }

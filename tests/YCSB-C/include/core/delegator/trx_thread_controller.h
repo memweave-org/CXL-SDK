@@ -5,6 +5,7 @@
 #include <chrono>
 #include <iomanip>
 #include "core/ub_session.h"
+#include "db/ub_db.h"
 
 #include "connection/establish.h"
 #include "core/client.h"
@@ -153,9 +154,14 @@ public:
   }
   void ReportLocal(double seconds, uint64_t total=0) {
     auto mid=SimThreadInfo::worker_machine_id;
-    uint64_t reads=0,writes=0;
+    uint64_t reads=0,writes=0,trace_hash=14695981039346656037ULL;
     for(int t=ycsbc_ub::first_thread(mid);t<ycsbc_ub::first_thread(mid)+ycsbc_ub::threads(mid);++t)
-      for(const auto& op:op_groups[t]) { if(op.type==READ) ++reads; else ++writes; }
+      for(const auto& op:op_groups[t]) {
+        if(op.type==READ) ++reads; else ++writes;
+        trace_hash=(trace_hash^uint64_t(t))*1099511628211ULL;
+        trace_hash=(trace_hash^uint64_t(op.type))*1099511628211ULL;
+        trace_hash=(trace_hash^uint64_t(op.key))*1099511628211ULL;
+      }
     auto errors=reads+writes-local_success[mid].load();
     std::ostringstream response;
     response<<"RESULT {\"role\":\""<<(mid==0?"B":"A")
@@ -167,7 +173,8 @@ public:
 #else
       <<"false"
 #endif
-      <<"}";
+      <<",\"rpc_completed\":"<<UbRpcCompleted()
+      <<",\"trace_hash\":\""<<std::hex<<trace_hash<<"\"}";
     ycsbc_ub::reply(response.str());
   }
 #endif
@@ -208,7 +215,7 @@ private:
     SimThreadInfo::setup_worker_ids(arg->sim_machine_id, arg->sim_thread_id);
 #endif
 #ifdef YCSB_UB_TWO_HOST
-    ycsbc_ub::stage("thread " + std::to_string(arg->sim_thread_id) + " registering with BwTree");
+    ycsbc_ub::stage("thread " + std::to_string(arg->sim_thread_id) + " registering with index");
 #endif
     InitDelegateClient(thread_ids);
 #ifdef YCSB_UB_TWO_HOST

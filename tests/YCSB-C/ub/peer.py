@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import queue
+import shutil
 import socket
 import subprocess
 import threading
@@ -88,6 +89,10 @@ class Worker:
     def __init__(self, args, name, provider, log):
         self.queue = queue.Queue()
         self.role = args.role
+        self.binary = args.binary
+        self.data_size = args.size_mb << 20
+        self.nc_size = args.nc_size_mb << 20
+        self.a_writable = bool(getattr(args,'a_writable',0))
         self.last_stage = 'process launch'
         self.peer_check = lambda: None
         self.finished = False
@@ -96,10 +101,20 @@ class Worker:
                  YCSB_UB_THREADS_A=str(args.threads_a), YCSB_UB_THREADS_B=str(args.threads_b),
                  YCSB_UB_SIZE_MB=str(args.size_mb), YCSB_UB_NC_SIZE_MB=str(args.nc_size_mb),
                  YCSB_UB_RECORDS=str(args.records), YCSB_UB_OPS=str(args.ops), YCSB_UB_CPU=str(args.cpu))
-        command=[args.binary, '-db', 'bwtree', '-machinenum', '2',
+        for key in ('YCSB_UB_SUITE','YCSB_UB_RPC','YCSB_UB_A_WRITABLE','YCSB_UB_SEED'):
+            env.pop(key,None)
+        if getattr(args,'suite',False):
+            env.update(YCSB_UB_SUITE='1',YCSB_UB_RPC=str(args.rpc),
+                       YCSB_UB_A_WRITABLE=str(args.a_writable),YCSB_UB_SEED=str(args.seed))
+        command=[args.binary, '-db', getattr(args,'db','bwtree'), '-machinenum', '2',
                  '-machineno', '0' if args.role=='B' else '1',
                  '-server_threads', str(args.threads_a+args.threads_b),
-                 '-dbnum', '1', '-valuesize', '8', '-P', args.spec, '-C', args.ini]
+                 '-dbnum', '1', '-valuesize', str(getattr(args, 'value_size', 8)), '-P', args.spec, '-C', args.ini]
+        host_threads=args.threads_a if args.role=='A' else args.threads_b
+        cpus=set(range(args.cpu,args.cpu+host_threads))
+        if not cpus.issubset(os.sched_getaffinity(0)):
+            raise RuntimeError('Requested host CPU range is unavailable')
+        command=['taskset','-c',','.join(map(str,sorted(cpus)))]+command
         # SDK output can interleave at byte boundaries. Never parse stdout for control.
         read_fd, write_fd = os.pipe()
         env['YCSB_UB_CONTROL_FD'] = str(write_fd)
@@ -152,7 +167,28 @@ class Worker:
                     next_notice = time.monotonic()+10
         if response == 'EOF':
             self.raise_exit_error()
+        if response.startswith('FAULT '):
+            self.raise_fault(response)
         return response
+
+    def raise_fault(self, response):
+        fields=dict(part.split('=',1) for part in response.split()[1:])
+        address=int(fields['address'],0)
+        region='outside UB mappings'
+        if 0x300000000000 <= address < 0x300000000000+self.data_size:
+            region='CACHE data (A: '+('read-write' if getattr(self,'a_writable',False) else 'read-only')+'; B: read-write)'
+        elif 0x400000000000 <= address < 0x400000000000+self.nc_size:
+            region='NC metadata (both read-write)'
+        location=''
+        if shutil.which('addr2line'):
+            try:
+                symbol=subprocess.run(['addr2line','-C','-f','-i','-e',self.binary,fields['pc']],
+                    capture_output=True,text=True,timeout=3)
+                if symbol.returncode==0:
+                    location='; executable symbolization: '+symbol.stdout.strip()
+            except (OSError,subprocess.TimeoutExpired):
+                pass
+        raise RuntimeError(f'{self.role} worker {response}; region={region}{location}')
 
     def raise_exit_error(self):
         try:
@@ -193,22 +229,27 @@ class Worker:
         self.protocol_reader.join(timeout=1)
 
 
-def summary(a, b, seconds, ops):
+def summary(a, b, seconds, ops, suite=False, rpc=0, a_writable=0):
     for role, result in [('A', a), ('B', b)]:
         if result['role'] != role or result['reads'] + result['writes'] != ops or result['errors']:
             raise RuntimeError('incomplete/failed workload on ' + role)
-    if a['writes'] or seconds <= 0:
+    if (not suite and a['writes']) or seconds <= 0:
         raise RuntimeError('invalid read-only workload or duration')
     if b['framework_total_operations'] != 2*ops or a['bwtree_opt'] != b['bwtree_opt']:
         raise RuntimeError('framework result mismatch')
     control_seconds=seconds
     seconds=b['seconds']
     if seconds <= 0: raise RuntimeError('invalid framework duration')
+    if suite:
+        expected_rpc=ops if rpc else (0 if a_writable else a['writes'])
+        if b.get('rpc_completed')!=expected_rpc:
+            raise RuntimeError('RPC completion count mismatch')
     return {'framework': 'tests/YCSB-C/ycsbc', 'controller_seconds': control_seconds, 'pass': True, 'A': a, 'B': b, 'total_operations': 2*ops,
             'common_seconds': seconds, 'total_ops_per_second': 2*ops/seconds,
-            'total_mops': 2*ops/seconds/1e6, 'update_semantics': 'fresh-insert',
+            'total_mops': 2*ops/seconds/1e6, 'update_semantics': 'replace-existing-key' if suite else 'fresh-insert',
+            'A_observed_read_fraction': a['reads']/ops,
             'B_observed_read_fraction': b['reads']/ops,
-            'cache_policy': 'original-bwtree-split-ub',
+            'cache_policy': 'A-RW/B-RW' if a_writable else 'A-RO/B-RW',
             'reclamation': 'retain-until-both-processes-exit', 'bwtree_opt': b.get('bwtree_opt', False)}
 
 
@@ -229,7 +270,16 @@ def main():
     p.add_argument('--records', type=int, default=100000)
     p.add_argument('--ops', type=int, default=1000000)
     p.add_argument('--timeout', type=int, default=1200)
+    p.add_argument('--suite', action='store_true')
+    p.add_argument('--case', default='bwtree')
+    p.add_argument('--db', choices=['bwtree','clevelhash'], default='bwtree')
+    p.add_argument('--rpc', type=int, choices=[0,1], default=0)
+    p.add_argument('--a-writable', type=int, choices=[0,1], default=0)
+    p.add_argument('--seed', type=int, default=20261104)
+    p.add_argument('--fixture', action='store_true', help='Explicit local file-backed SDK correctness test only')
     args = p.parse_args()
+    if args.fixture and not os.environ.get('UBSM_TEST_DIRECTORY'):
+        p.error('--fixture requires UBSM_TEST_DIRECTORY')
     worker = channel = connection = server = None
     report = {'pass': False}
     log = (args.output/'worker.log').open('w')
@@ -274,12 +324,13 @@ def main():
         identity = {'host':socket.gethostname(), 'role':args.role, 'provider':args.provider,
                     'binary_sha256':hashlib.sha256(Path(args.binary).read_bytes()).hexdigest(),
                     'spec_sha256':hashlib.sha256(Path(args.spec).read_bytes()).hexdigest(),
-                    'threads':args.threads,'size_mb':args.size_mb,'nc_size_mb':args.nc_size_mb,'records':args.records,'ops':args.ops}
+                    'threads':args.threads,'size_mb':args.size_mb,'nc_size_mb':args.nc_size_mb,'records':args.records,'ops':args.ops,
+                    'case':args.case,'suite':args.suite,'db':args.db,'rpc':args.rpc,'a_writable':args.a_writable,'seed':args.seed,'fixture':args.fixture}
         status('TCP connected; exchanging configuration and binary hashes')
         send(identity); peer = receive()
-        if peer['role'] == args.role or peer['host'] == identity['host']:
+        if peer['role'] == args.role or (not args.fixture and peer['host'] == identity['host']):
             raise RuntimeError('expected two different physical hosts and roles')
-        for key in ('provider','binary_sha256','spec_sha256','size_mb','nc_size_mb','records','ops'):
+        for key in ('provider','binary_sha256','spec_sha256','size_mb','nc_size_mb','records','ops','case','suite','db','rpc','a_writable','seed','fixture'):
             if identity[key] != peer[key]:
                 raise RuntimeError('configuration mismatch: '+key)
         args.threads_a=args.threads if args.role=='A' else peer['threads']
@@ -290,7 +341,7 @@ def main():
             name='ycsb-ub-'+uuid.uuid4().hex[:18]; send(name)
         else:
             name=receive()
-            status(f'Waiting for B to initialize UB and load BwTree; object={name}')
+            status(f'Waiting for B to initialize UB and load {args.db}; object={name}')
             if receive()!='LOADED': raise RuntimeError('B did not load')
         (args.output/'config.json').write_text(json.dumps({**vars(args),'name':name,'provider':provider,
                                                         'identity':identity,'peer':peer,
@@ -322,7 +373,8 @@ def main():
             a=json.loads(result[7:]); b=receive()
             elapsed=time.monotonic()-start
             status('Original YCSB execution complete; collecting native throughput and cleaning up')
-            report=summary(a,b,elapsed,args.ops)
+            report=summary(a,b,elapsed,args.ops,args.suite,args.rpc,args.a_writable)
+            report.update(case=args.case,db=args.db,rpc=bool(args.rpc),seed=args.seed,fixture=args.fixture)
             worker.finish('close')
             send('RELEASE')
             if receive()!='CLOSED': raise RuntimeError('B cleanup failed')

@@ -66,7 +66,10 @@ public:
 private:
 // #ifdef NO_CC
 #ifdef LOCAL_NO_CC
-  using clevel_hash_64 = clevel_hash<uint64_t, uint64_t>;
+#ifndef YCSB_CLEVEL_HASH_POWER
+#define YCSB_CLEVEL_HASH_POWER 20
+#endif
+  using clevel_hash_64 = clevel_hash<uint64_t, uint64_t, std::hash<uint64_t>, std::equal_to<uint64_t>, YCSB_CLEVEL_HASH_POWER>;
   clevel_hash_64 *level;
 #else
   clevel_hash<uint64_t, uint64_t> *level;

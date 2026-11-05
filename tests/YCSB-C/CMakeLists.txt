@@ -11,6 +11,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED True)
 set(BWTREE_MAPPING_TABLE_BITS 24 CACHE STRING
     "BwTree mapping-table size as a power of two (24 for paper-scale runs)")
 add_compile_definitions(BWTREE_MAPPING_TABLE_BITS=${BWTREE_MAPPING_TABLE_BITS})
+set(YCSB_CLEVEL_HASH_POWER 20 CACHE STRING "Initial ClevelHash bucket exponent")
+add_compile_definitions(YCSB_CLEVEL_HASH_POWER=${YCSB_CLEVEL_HASH_POWER})
 
 option(YCSB_UB_TWO_HOST "Original YCSB framework over two UB hosts" OFF)
 if(YCSB_UB_TWO_HOST)

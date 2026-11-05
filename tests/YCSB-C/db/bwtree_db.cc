@@ -278,6 +278,17 @@ int BwTreeDB::UpdateInternal(uint64_t key, uintptr_t value) {
 #ifdef TRX_TYPE_STAT
   update_cnt.fetch_add(1);
 #endif
+#ifdef YCSB_UB_TWO_HOST
+  if (std::getenv("YCSB_UB_SUITE")) {
+    for (;;) {
+      std::vector<long> current;
+      tree->GetValue(key,current);
+      if(current.empty()) return DB::kErrorNoData;
+      long committed;
+      if(tree->CompareExchangeValue(key,current.front(),value,committed)) return DB::kOK;
+    }
+  }
+#endif
   // TODO: Update with the real key is extremely slow, checking the reason
   auto ret = tree->Insert(utils::Random64(), value) ? DB::kOK : DB::kErrorNoData;
   return ret;

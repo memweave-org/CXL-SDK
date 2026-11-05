@@ -174,7 +174,9 @@ template<class T, class D> static inline void WRITE_NT_32(T* p, D&& v) {
 #endif
 }
 template<class T, class D> static inline void WRITE_NT_64(T* p, D&& v) {
-  static_assert(sizeof(T)==8); __atomic_store_n(p, v, __ATOMIC_SEQ_CST);
+  // This register-sized helper also stores integer bits into pointer slots.
+  // Spell out the conversion (Clang rejects GCC's implicit integer-to-pointer conversion).
+  static_assert(sizeof(T)==8); __atomic_store_n(p, (T)v, __ATOMIC_SEQ_CST);
 #ifdef SHM_UB_SPLIT
   clwb((const void*)p,sizeof(T));
 #endif

@@ -4,6 +4,7 @@ cd -- "$(dirname -- "${BASH_SOURCE[0]}")"
 : "${BUILD_IMAGE:=shm-pcc-sdk:ub-glibc2.39-gcc12.3.1}"
 : "${SDK_ROOT:=/usr/local/ubs_mem}"
 : "${OPT:=1}"
+: "${YCSB_INDEXES:=bwtree}"
 ROOT=$(cd ../../.. && pwd)
 SDK_LIBRARY=${SDK_LIBRARY:-$SDK_ROOT/lib/libubsm_sdk.so}
 if [[ ! -f $SDK_LIBRARY && -f $SDK_ROOT/lib64/libubsm_sdk.so ]]; then SDK_LIBRARY=$SDK_ROOT/lib64/libubsm_sdk.so; fi
@@ -22,6 +23,9 @@ cp -r "$ROOT/ds/BwTree/src" "$ROOT/ds/BwTree/BTree" "$context/src/ds/BwTree/"
 mkdir -p "$context/src/ds/BwTree/benchmark"
 cp -r "$ROOT/ds/BwTree/benchmark/art" "$context/src/ds/BwTree/benchmark/"
 cp "$ROOT/ds/BwTree/CMakeLists.txt" "$context/src/ds/BwTree/"
+if [[ $YCSB_INDEXES != bwtree ]]; then
+  cp -r "$ROOT/ds/ClevelHash" "$context/src/ds/"
+fi
 for dir in include core db follower; do cp -r "../$dir" "$context/src/tests/YCSB-C/"; done
 cp ../CMakeLists.txt ../build.sh ../ycsbc.cc "$context/src/tests/YCSB-C/"
 cp "$ROOT/tests/two-process-ycsb/collect_ub_runtime.py" "$context/src/tests/two-process-ycsb/"
@@ -34,7 +38,7 @@ cleanup() {
   docker image rm "$image" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
-docker build --build-arg "BUILD_IMAGE=$BUILD_IMAGE" --build-arg "OPT=$OPT" --build-arg "JOBS=${JOBS:-2}" -t "$image" "$context" 2>&1 | tee "$out/build.log"
+docker build --build-arg "BUILD_IMAGE=$BUILD_IMAGE" --build-arg "OPT=$OPT" --build-arg "YCSB_INDEXES=$YCSB_INDEXES" --build-arg "JOBS=${JOBS:-2}" -t "$image" "$context" 2>&1 | tee "$out/build.log"
 container=$(docker create "$image" /bin/true)
 docker cp "$container:/out/." "$out/"
 chmod +x "$out/ycsbc"

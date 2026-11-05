@@ -38,7 +38,11 @@ inline uint64_t Hash(uint64_t val) { return FNVHash64(val); }
 
 inline double RandomDouble() {
   thread_local static std::random_device rd;
+#ifdef YCSB_UB_TWO_HOST
+  thread_local static std::default_random_engine generator(std::getenv("YCSB_UB_SEED") ? std::stoull(std::getenv("YCSB_UB_SEED")) : rd());
+#else
   thread_local static std::default_random_engine generator(rd());
+#endif
   thread_local static std::uniform_real_distribution<double> uniform(0, 1);
   return uniform(generator);
 }

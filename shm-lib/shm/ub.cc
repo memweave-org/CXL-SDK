@@ -2,6 +2,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <cstring>
+#include <cstdlib>
 #include <iostream>
 #include <map>
 #include <mutex>
@@ -120,6 +121,13 @@ void* map_ub_memory(const char* name, void* base, size_t size, UbMappingMode mod
       finalize(); checked(rc, "ubsmem_shmem_set_ownership(RW)");
     }
     cache_end.store(uintptr_t(p) + size); cache_begin.store(uintptr_t(p));
+    // Discard this host's residual CACHE lines before allocation or reads.
+    // This preserves memory contents and does not invalidate the other host.
+    const char* invalidate = std::getenv("SHM_UB_STARTUP_INVALIDATE");
+    if (!invalidate || std::strcmp(invalidate, "0") != 0) {
+      ub_cache_maintenance(p, size, false, true);
+      std::cerr << "UB_STARTUP_INVALIDATE read_only=" << read_only << " bytes=" << size << std::endl;
+    }
   }
 #endif
   mappings.emplace(p, size);

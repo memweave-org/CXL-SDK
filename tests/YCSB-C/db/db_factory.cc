@@ -9,6 +9,7 @@
 #include "db/db_factory.h"
 #include "utils/helper.h"
 #include "utils/sim_id.h"
+#include "db/ub_db.h"
 
 #include <string>
 
@@ -60,6 +61,9 @@ DB *DBFactory::CreateDB(utils::Properties &props) {
   int db_thread = SimThreadInfo::worker_thread_count / num_db + 1;
 #else
   int db_thread = SimThreadInfo::worker_thread_count + 1;
+#endif
+#ifdef YCSB_UB_TWO_HOST
+  if (std::getenv("YCSB_UB_SUITE")) return CreateUbDB(props["dbname"], db_thread);
 #endif
 #ifdef ENABLE_RADIX_ART_ROWEX_DB
   if (props["dbname"] == "radix_art_rowex") {

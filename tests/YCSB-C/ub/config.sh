@@ -1,16 +1,19 @@
-A_IP='76.53.137.81'
-B_IP='76.53.137.82'
-PROVIDER_B='' # 默认 B 的系统 hostname；可指定 UB 拓扑名
-BUILD_IMAGE='shm-pcc-sdk:ub-glibc2.39-gcc12.3.1'
-SDK_ROOT='/usr/local/ubs_mem'
-PORT=18982
-THREADS_A=1
-THREADS_B=1
-RECORDS=100000
-OPS=1000000 # 每台机器的操作数
-SIZE_MB=4096
-SPEC=workloadb_90read.spec
-# 可选 CPU_A=2 CPU_B=2；线程顺序绑定从该 CPU 开始的连续核心。
-
-OPT=${OPT:-1} # 1: 原 BwTree OPT；0: NOOPT
-NC_SIZE_MB=1024 # A/B 都可写；含映射表、控制元数据及原框架共享 trace 数组
+# Environment overrides work for both run.sh and run_all.sh.
+A_IP=${A_IP:-76.53.137.81}
+B_IP=${B_IP:-76.53.137.82}
+PROVIDER_B=${PROVIDER_B:-} # Empty: B system hostname / UB topology name
+BUILD_IMAGE=${BUILD_IMAGE:-shm-pcc-sdk:ub-glibc2.39-gcc12.3.1}
+SDK_ROOT=${SDK_ROOT:-/usr/local/ubs_mem}
+PORT=${PORT:-18982}
+THREADS_A=${THREADS_A:-1}
+THREADS_B=${THREADS_B:-1}
+RECORDS=${RECORDS:-100000}
+OPS=${OPS:-1000000} # Per host
+SIZE_MB=${SIZE_MB:-4096}
+NC_SIZE_MB=${NC_SIZE_MB:-1024}
+SPEC=${SPEC:-workloadb_90read.spec}
+OPT=${OPT:-1} # Legacy run.sh: 1 OPT, 0 NOOPT
+SEED=${SEED:-20261104}
+A_WRITABLE=${A_WRITABLE:-0} # 0: A CACHE read-only, forward its updates to B
+# CPU_A / CPU_B: first CPU of each host's consecutive client CPU range.
+# RPC service uses CPU_B as well; default is one CPU per host.

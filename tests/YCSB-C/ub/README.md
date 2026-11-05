@@ -103,3 +103,24 @@ A/B 之间仍走独立 TCP 连接。worker 必须通过 run.sh/peer.py 启动。
 控制器持续接收对端状态；等待本地 READY、RESULT 或 CLOSED 时也检查对端失败和断连。
 任一端失败，另一端中止本轮 worker；SIGTERM 后 2 秒仍未退出则发送 SIGKILL 并等待确认。
 仅操作控制器自己启动的子进程，失败结果标记 pass=false，UB 对象仍保留供诊断。
+
+
+## 正常 UB 运行的缓存修复
+
+重新编译后，`run.sh` 默认在两端 CACHE 映射取得 ownership 后、分配和读取之前，
+各自执行一次整区缓存失效。它不清零共享内存，也不依赖对端 cache coherence。
+日志中的 `UB_STARTUP_INVALIDATE` 可确认执行；仅显式设置
+`SHM_UB_STARTUP_INVALIDATE=0` 才关闭，供故障对照使用。
+
+`YCSB_UB_CASE=clevelhash bash ./run.sh` 选择 ClevelHash NOOPT，
+`YCSB_UB_CASE=clevelhash+opt bash ./run.sh` 选择 OPT；默认仍是 BwTree，
+由 `OPT=0/1` 选择变体。ClevelHash 的可变 bucket、metadata、root 和线程状态放在 NC，
+不可变 KV pair 放在 CACHE，并在发布指针前完整写回；读取 pair 时执行原有缓存失效。
+两端 ClevelHash 均执行 90% 读、10% 更新已有 key，A 直接读取、写请求转交 B，
+默认 A 的 CACHE 映射保持只读。`clevelhash+rpc` 和 `bwtree+rpc` 可将 A 的全部操作交给 B。
+
+默认 `run.sh` 每次从当前源码构建。若显式设置 `YCSB_UB_BUNDLE`，必须使用修复后
+重新构建的 bundle；旧二进制不会因为脚本更新自动获得修复。
+
+这些修复用于真实 SDK 构建，不启用独立内存副本模拟。启动失效不能阻止随后对未来
+地址的预取；CoW 地址不复用且未提前重新缓存，是仅靠启动失效读取新对象的前提。

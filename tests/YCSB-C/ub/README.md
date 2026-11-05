@@ -26,7 +26,8 @@ update 替换已有 key 的 value。两端均使用 Zipfian 分布，每项新�
 使用相同初始记录数、每端操作数、线程数和 `SEED`，并核对各端操作类型/key
 序列 hash 在相同 worker 数的八种模式间一致。B 的比例由随机抽样决定，小样本不保证恰好 90/10。
 每种模式依次测试每端 **32、64、128 个 worker**，共 24 轮，A/B 数量相同。
-默认初始 100,000 条，每端每轮共 1,000,000 次操作（两端合计 2,000,000），不是每个 worker 一百万次。
+默认初始插入 10,000,000 个 key，每端每轮共 10,000,000 次操作（两端合计 20,000,000），由该端全部 worker 分摊。
+A 执行 10,000,000 次查询；B 约 9,000,000 次查询、1,000,000 次更新，查询和更新均针对初始 key 集合。
 可用 `--thread-counts 32 64` 或 `THREAD_COUNTS="32 64"` 选择档位；启动时检查
 当前进程允许的 CPU 数，并按允许的编号绑定 worker，支持 CPU 编号不连续。
 首次可在两端用相同参数执行：
@@ -51,7 +52,7 @@ NC 映射仍需可写以支持控制信息及 epoch 等元数据；这不允许 
 `nc-memcpy` 将完整节点复制到本地查询，B 在本地修改后复制修改部分回 NC。
 value 也分别使用直接访问或本地复制。两项都关闭本地内部节点缓存，保持相同节点布局；
 每个 1024 字节节点占一个 4 KiB 分配槽并带独立 NC 版本头，避免修改/分裂时版本锁别名。
-`NC_SIZE_MB` 包含节点、value 和原框架的 trace/控制数据，默认 1024 MiB，耗尽即报错。
+`NC_SIZE_MB` 包含节点、value 和原框架的 trace/控制数据，默认 16384 MiB，耗尽即报错。
 这里的 NC 是 UB SDK 的 non-cacheable 映射，不是 cacheable 内存上的 streaming 指令。
 
 每端构建包含三种索引的 NOOPT/OPT 两份二进制，按 case 复用。镜像需包含 CityHash、
@@ -136,7 +137,7 @@ bash ./run.sh
 - 两边运行原 `TransactionThreadController → Client → BwTreeDB`。
 - 使用原 `CoreWorkload`、`OpGeneratorIntKeyAddr` 和 Zipfian 分布；只调整各主机的操作比例与分组。
 - 保留原 `UpdateInternal` 的随机新 key 插入语义，没有改成覆盖旧 key。
-- 每档各 1,000,000 次操作、100,000 条初始数据；操作数是每台总数，不是每线程总数。
+- 每档各 10,000,000 次操作、10,000,000 条初始数据；操作数是每台总数，不是每线程总数。
   单档模式仍支持 A/B 不同线程数，默认各 1 个 worker。
 
 ## 内存和编译
@@ -166,8 +167,10 @@ NC 的分配空间分成互不重叠的两半，分配偏移位于各进程本�
 B 的 SDK provider 默认使用 B 系统 hostname；可在配置中填写 `PROVIDER_B`。
 TCP 控制端口默认 18982。
 
-默认 CACHE 4096 MiB、NC 1024 MiB；NC 包含原框架的共享 trace 数组，
-调大操作数或线程数时可能需要增加 `NC_SIZE_MB`。耗尽即报错，不回退到私有堆。
+默认 CACHE 32768 MiB、NC 16384 MiB，为千万级初始数据及每端千万次操作预留空间。
+NC 分配区由 A/B 各占一半，B 预生成两端全部操作序列；仅 trace 数组就超过 1 GiB，
+还需容纳索引元数据，以及 Sherman 模式的节点和 value。
+可通过 `SIZE_MB` / `NC_SIZE_MB` 覆盖容量；更大负载可能仍需增加。耗尽即报错，不回退到私有堆。
 保留原 epoch/GC 逻辑及 B 的后台 collector；UB bump allocator 不复用已释放地址，
 整个对象在退出时释放。NodeID 的空闲栈没有入栈路径，UB 模式跳过其无用的 128-bit CAS。
 所有节点由 B 分配/回收，不启动不需要的跨机 GC 消息队列 dispatcher。

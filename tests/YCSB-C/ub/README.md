@@ -78,7 +78,7 @@ YCSB_UB_SUITE=1 YCSB_UB_CASE=bwtree bash run.sh
 可选 CMake 参数 `YCSB_BUILD_SHERMAN_CONTRACT=ON` 构建 `sherman_nc_contract`，
 仅供 fixture SDK 下验证双进程对称插入、分裂、更新和读取，不输出吞吐或耗时。
 
-## 旧单项 BwTree 入口
+## BwTree 线程数扫描与单项入口
 
 两机同步完整源码，在各自物理机执行一次：
 
@@ -87,7 +87,19 @@ cd /mnt/disk1/wfn/CXL-SDK/tests/YCSB-C
 bash ./run.sh
 ```
 
-默认 OPT；测试 NOOPT 时，两边都用 `OPT=0 bash ./run.sh`。
+默认 OPT，`run.sh` 顺序运行每端 **32、64、128、192 个事务 worker**。
+每档 A/B 的 worker 数相同，A 100% read，B 90% read / 10% update，不使用 RPC。
+每端只编译一次；每档使用新共享对象，等两端完成清理后才进入下一档。
+`bash run.sh --dry-run` 可查看计划；`THREAD_COUNTS="32 64" bash run.sh` 可选择部分档位。
+启动前检查最大档位的连续可用 CPU 范围，可用 `CPU_A`、`CPU_B` 指定各端起始 CPU。
+启动及运行期间沿用 `run_all` 的测试互斥检查，两端握手额外核对扫描列表和当前档位；
+失败或受干扰即停止，当前档保留 `invalid.json`，不进入下一档。
+结果位于 `ub/result-threads-A-*` / `ub/result-threads-B-*` 的 `threads-32` 等子目录，
+`summary.json` / `summary.csv` 汇总各档结果；每档的 `launcher.log` 包含完整控制与 worker 输出。
+事务 worker 数不包括主线程、B 的 GC 线程、Python 控制器或 SDK 自建线程。
+
+保留单档入口：`YCSB_UB_SINGLE=1 THREADS_A=32 THREADS_B=32 bash run.sh`。
+测试 NOOPT 时，两边都用 `OPT=0 bash ./run.sh`。
 也可使用原入口 `bash ./run_shm_ds.sh -mode=ub_two_host`。
 旧目录 `tests/ub-bwtree-ycsb/run.sh` 现在也转到此入口。
 配置统一在 **`tests/YCSB-C/ub/config.sh`**，旧目录的 config.sh 不再生效。
@@ -98,7 +110,8 @@ bash ./run.sh
 - 两边运行原 `TransactionThreadController → Client → BwTreeDB`。
 - 使用原 `CoreWorkload`、`OpGeneratorIntKeyAddr` 和 Zipfian 分布；只调整各主机的操作比例与分组。
 - 保留原 `UpdateInternal` 的随机新 key 插入语义，没有改成覆盖旧 key。
-- 默认各 1 线程、各 1,000,000 次操作、100,000 条初始数据；支持 A/B 不同线程数。
+- 每档各 1,000,000 次操作、100,000 条初始数据；操作数是每台总数，不是每线程总数。
+  单档模式仍支持 A/B 不同线程数，默认各 1 个 worker。
 
 ## 内存和编译
 

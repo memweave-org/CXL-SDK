@@ -254,6 +254,16 @@ def summary(a, b, seconds, ops, suite=False, rpc=0, a_writable=0):
             'reclamation': 'retain-until-both-processes-exit', 'bwtree_opt': b.get('bwtree_opt', False)}
 
 
+def check_thread_sweep(identity, peer):
+    sweep = identity.get('thread_sweep')
+    if sweep != peer.get('thread_sweep'):
+        raise RuntimeError('configuration mismatch: thread sweep schedule/round')
+    if sweep is not None:
+        expected = json.loads(sweep)['threads']
+        if identity['threads'] != expected or peer['threads'] != expected:
+            raise RuntimeError('thread sweep requires both worker counts to match the requested round')
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--role', choices=['A', 'B'], required=True)
@@ -329,11 +339,13 @@ def main():
                     'spec_sha256':hashlib.sha256(Path(args.spec).read_bytes()).hexdigest(),
                     'threads':args.threads,'size_mb':args.size_mb,'nc_size_mb':args.nc_size_mb,'records':args.records,'ops':args.ops,
                     'case':args.case,'suite':args.suite,'db':args.db,'rpc':args.rpc,'expected_opt':args.expected_opt,
-                    'sherman_access':args.sherman_access,'a_writable':args.a_writable,'seed':args.seed,'fixture':args.fixture}
+                    'sherman_access':args.sherman_access,'a_writable':args.a_writable,'seed':args.seed,'fixture':args.fixture,
+                    'thread_sweep':os.environ.get('YCSB_UB_THREAD_SWEEP')}
         status('TCP connected; exchanging configuration and binary hashes')
         send(identity); peer = receive()
         if peer['role'] == args.role or (not args.fixture and peer['host'] == identity['host']):
             raise RuntimeError('expected two different physical hosts and roles')
+        check_thread_sweep(identity, peer)
         for key in ('provider','binary_sha256','spec_sha256','size_mb','nc_size_mb','records','ops','case','suite','db','rpc','expected_opt','sherman_access','a_writable','seed','fixture'):
             if identity[key] != peer[key]:
                 raise RuntimeError('configuration mismatch: '+key)

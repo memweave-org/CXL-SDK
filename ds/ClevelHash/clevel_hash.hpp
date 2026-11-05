@@ -466,8 +466,22 @@ public:
   static void destroy_shared_value(value_type *value) {
     if (value) {
       value->~value_type();
+#ifdef SHM_UB_SPLIT
+      cacheable.free(value);
+#else
       shared_atomic_memory(clevel_memory()).free(value);
+#endif
     }
+  }
+
+  static void retire_shared_value(value_type *value) {
+#ifdef SHM_UB_SPLIT
+    // Direct A readers can still hold this published KV. The UB path has no
+    // cross-host KV grace period yet; only unpublished candidates are reusable.
+    (void)value;
+#else
+    destroy_shared_value(value);
+#endif
   }
 
   static void allocate_KV_copy_construct(value_type *&KV_ptr,
@@ -635,7 +649,7 @@ public:
   level_meta_ptr_t meta;
 #ifdef OPT_CLEVEL_ROOT_READ
   clevel_vector<level_meta_ptr_t> meta_replicas;
-  HelpUpdate<level_meta> *help_update;
+  HelpUpdate<level_meta> *help_update = nullptr;
 #endif
 
   struct alignas(CACHE_LINE_SIZE) aligned_level_meta_ptr_t {
@@ -658,6 +672,11 @@ public:
   size_type hashpower;
   atomic_type<size_type> thread_num;
   atomic_type<char> run_expand_thread;
+#ifdef SHM_UB_SPLIT
+  // Only the allocating part of expansion is serialized. Without this gate,
+  // every losing writer can allocate a full new bucket array simultaneously.
+  atomic_type<bool> expansion_allocating{false};
+#endif
   // Array for each thread
   clevel_vector<level_meta *> tmp_meta;
   clevel_vector<level_bucket *> tmp_level;
@@ -789,7 +808,7 @@ void clevel_hash<Key, T, Hash, KeyEqual, HashPower>::del_dup(
       uint64_t expected = e2.p;
       bool ret = p2->p.compare_exchange_strong(expected, 0);
       if (ret) {
-        destroy_shared_value(e2.addr());
+        retire_shared_value(e2.addr());
       }
     }
   }
@@ -1257,7 +1276,7 @@ clevel_hash<Key, T, Hash, KeyEqual, HashPower>::erase(const key_type &key,
             if (f_b.slots[j].p.compare_exchange_strong(expected, 0)) {
               succ_deletion = true;
 
-              destroy_shared_value(tmp.addr(true));
+              retire_shared_value(tmp.addr(true));
 
               // Instead of redoing the delete to
               // guarantee the deletion is successful,
@@ -1300,7 +1319,7 @@ clevel_hash<Key, T, Hash, KeyEqual, HashPower>::erase(const key_type &key,
             bool ret = s_b.slots[j].p.compare_exchange_strong(expected, 0);
             if (ret) {
               succ_deletion = true;
-              destroy_shared_value(tmp.addr(true));
+              retire_shared_value(tmp.addr(true));
               // Instead of redoing the delete to
               // guarantee the deletion is
               // successful, we apply context checking
@@ -1437,6 +1456,25 @@ template <typename Key, typename T, typename Hash, typename KeyEqual,
           size_t HashPower>
 void clevel_hash<Key, T, Hash, KeyEqual, HashPower>::expand(
     size_type thread_id, level_meta *m_copy) {
+#ifdef SHM_UB_SPLIT
+  struct AllocationGuard {
+    atomic_type<bool>& flag;
+    explicit AllocationGuard(atomic_type<bool>& flag) : flag(flag) {
+      bool expected = false;
+      while (!flag.compare_exchange_strong(expected, true)) {
+        expected = false;
+        std::this_thread::yield();
+      }
+    }
+    ~AllocationGuard() { flag.store(false); }
+  } allocation_guard(expansion_allocating);
+  // The request may have become obsolete while another writer expanded.
+#ifdef OPT_CLEVEL_ROOT_READ
+  if (help_update->load_ptr(thread_id) != m_copy) return;
+#else
+  if (meta.load() != m_copy) return;
+#endif
+#endif
   difference_type t_id = static_cast<difference_type>(thread_id);
   level_bucket *cl = m_copy->first_level;
 
@@ -1514,6 +1552,11 @@ void clevel_hash<Key, T, Hash, KeyEqual, HashPower>::expand(
 // #endif
         break;
       } else {
+#ifdef USE_CXL
+        shared_atomic_memory(clevel_memory()).free(tmp_meta[t_id]);
+#else
+        delete tmp_meta[t_id];
+#endif
 #ifdef OPT_CLEVEL_ROOT_READ
         m_copy = help_update->load_ptr(t_id);
 #else
@@ -1524,11 +1567,6 @@ void clevel_hash<Key, T, Hash, KeyEqual, HashPower>::expand(
         if (cl->capacity >= new_capacity && m_copy->is_resizing) {
           // CAS fails because other threads help updating
           // meta
-#ifdef USE_CXL
-          shared_atomic_memory(clevel_memory()).free(tmp_meta[t_id]);
-#else
-          delete tmp_meta[t_id];
-#endif
           break;
         }
         // CAS fails because other threads complete rehashing.
@@ -1576,6 +1614,11 @@ void clevel_hash<Key, T, Hash, KeyEqual, HashPower>::expand(
 #endif
           break;
         } else {
+#ifdef USE_CXL
+          shared_atomic_memory(clevel_memory()).free(tmp_meta[t_id]);
+#else
+          delete tmp_meta[t_id];
+#endif
 #ifdef OPT_CLEVEL_ROOT_READ
           m_copy = help_update->load_ptr(thread_id);
 #else
@@ -1586,11 +1629,6 @@ void clevel_hash<Key, T, Hash, KeyEqual, HashPower>::expand(
           if (cl->capacity >= new_capacity && m_copy->is_resizing) {
             // CAS fails because other threads help
             // updating meta
-#ifdef USE_CXL
-            shared_atomic_memory(clevel_memory()).free(tmp_meta[t_id]);
-#else
-            delete tmp_meta[t_id];
-#endif
             break;
           }
           // CAS fails because other threads complete

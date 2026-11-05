@@ -16,8 +16,14 @@ void create_ub_memory(const char* name, size_t size, const char* provider_host,
 void destroy_ub_memory(const char* name);
 
 // Mixed-layout arenas are partitioned by process; allocations never cross slices.
-void ub_configure_arena(bool atomic, void* base, size_t size);
+// recycle=false is reserved for readers relying on immutable addresses for the
+// whole mapping lifetime. Otherwise free coalesces/reuses blocks in this slice.
+void ub_configure_arena(bool atomic, void* base, size_t size, bool recycle = true);
 void* ub_arena_allocate(bool atomic, size_t size, size_t alignment = 64);
+// Caller must first finish the object's reader/epoch lifetime. Never free a
+// published object merely because a pointer to its replacement was installed.
+void ub_arena_deallocate(bool atomic, void* pointer);
 size_t ub_arena_used(bool atomic);
+size_t ub_arena_live(bool atomic);
 void ub_cache_maintenance(const void*, size_t, bool writeback, bool fence);
 void ub_assert_atomic_target(const void*);

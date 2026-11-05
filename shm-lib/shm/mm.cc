@@ -406,9 +406,12 @@ int MemoryManager::clalign(void **memptr, size_t size) {
 }
 
 void MemoryManager::free(void *ptr) {
-  if (backend_ == CacheableAllocatorBackend::UbCache || backend_ == CacheableAllocatorBackend::UbAtomic) return;
   // Explicit benchmark lifetime policy: no cross-process allocator frees.
   if (retain_shared_) return;
+  if (backend_ == CacheableAllocatorBackend::UbCache || backend_ == CacheableAllocatorBackend::UbAtomic) {
+    ub_arena_deallocate(backend_ == CacheableAllocatorBackend::UbAtomic, ptr);
+    return;
+  }
   if (ptr == nullptr) {
     return;
   }

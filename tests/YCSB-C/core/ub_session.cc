@@ -158,7 +158,10 @@ void prepare(utils::Properties& props) {
   size_t half=((nc_size-4096)/2)&~size_t(all_nc ? 4095 : 63);
   ub_configure_arena(true,static_cast<char*>(nc)+4096+(owner?0:half),half);
   // A never allocates data. Leaving its CACHE allocator unconfigured catches violations.
-  if(!all_nc && owner) ub_configure_arena(false,data,data_size);
+  // BwTree's cached immutable nodes still require unique addresses for the
+  // mapping lifetime. ClevelHash invalidates KV reads and recycles unpublished
+  // candidates; its published entries retain their existing reader lifetime.
+  if(!all_nc && owner) ub_configure_arena(false,data,data_size,props["dbname"]!="bwtree");
   cacheable=MemoryManager(all_nc);
   stage("UB mappings ready; allocators configured");
   std::cerr<<"YCSB framework UB role="<<(owner?"B":"A")<<" CACHE="<<(all_nc?"NONE":owner?"RW":"READ")<<" NC=RW"<<std::endl;

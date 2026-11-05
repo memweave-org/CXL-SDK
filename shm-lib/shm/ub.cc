@@ -1,4 +1,5 @@
 #include "shm/ub.h"
+#include "shm/ub_arena.h"
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <cstring>
@@ -29,8 +30,7 @@ std::mutex api_mutex;
 std::map<void*, size_t> mappings;
 std::map<void*, UbMappingMode> mapping_modes;
 std::map<void*, std::string> mapping_names;
-struct Arena { char* base{}; size_t size{}; std::atomic<size_t> used{0}; };
-Arena arenas[2];
+UbArena arenas[2];
 // Published once before starting worker threads, unchanged until they join.
 std::atomic<uintptr_t> cache_begin{0}, cache_end{0};
 #ifdef SHM_LIB_WITH_UBSM
@@ -158,7 +158,7 @@ void unmap_ub_memory(void* base, size_t size) {
   }
   for (auto& arena : arenas) {
     const auto a = uintptr_t(arena.base), b = uintptr_t(base);
-    if (arena.base && a >= b && a-b < size) { arena.base=nullptr; arena.size=0; arena.used.store(0); }
+    if (arena.base && a >= b && a-b < size) arena.configure(nullptr, 0);
   }
   mapping_modes.erase(base);
   mapping_names.erase(base);
@@ -212,7 +212,7 @@ void destroy_ub_memory(const char* name) {
 #endif
 }
 
-void ub_configure_arena(bool atomic, void* base, size_t size) {
+void ub_configure_arena(bool atomic, void* base, size_t size, bool recycle) {
   std::lock_guard<std::mutex> guard(api_mutex);
   const auto address = uintptr_t(base);
   const auto expected = atomic ? UbMappingMode::Noncacheable : UbMappingMode::Cacheable;
@@ -223,33 +223,27 @@ void ub_configure_arena(bool atomic, void* base, size_t size) {
         && mapping_modes.at(item.first) == expected) valid = true;
   }
   if (!valid || !size || address % 64) throw std::runtime_error("UB arena does not match mapping mode/range");
-  auto& a = arenas[atomic]; a.base = static_cast<char*>(base); a.size = size; a.used.store(0);
+  arenas[atomic].configure(base, size, recycle);
 }
 void* ub_arena_allocate(bool atomic, size_t size, size_t alignment) {
   auto& a = arenas[atomic];
-  auto fail = [&](const char* reason) -> void {
+  try {
+    return a.allocate(size, alignment);
+  } catch (const std::bad_alloc&) {
     const auto used = a.used.load(std::memory_order_relaxed);
+    const auto live = a.live_bytes();
     std::cerr << "UB_ALLOC_FAILED arena=" << (atomic ? "NC" : "CACHE")
               << " requested_bytes=" << size << " alignment=" << alignment
               << " process_capacity_bytes=" << a.size << " used_bytes=" << used
-              << " remaining_bytes=" << (used <= a.size ? a.size-used : 0)
-              << " reason=" << reason << std::endl;
-    throw std::bad_alloc();
-  };
-  if (!a.base || !alignment || (alignment & (alignment-1))) fail("unconfigured arena or invalid alignment");
-  alignment = std::max(alignment, size_t(64));
-  auto old = a.used.load(std::memory_order_relaxed);
-  for (;;) {
-    if (old > a.size || alignment-1 > a.size-old) fail("arena exhausted or allocation exceeds bounds");
-    const size_t start = (old + alignment-1) & ~(alignment-1);
-    if (start > a.size || size > a.size-start || size > SIZE_MAX-63) fail("arena exhausted or allocation exceeds bounds");
-    const size_t padded = (size + 63) & ~size_t(63);
-    if (padded > a.size-start) fail("arena exhausted or allocation exceeds bounds");
-    const size_t next = start + padded;
-    if (a.used.compare_exchange_weak(old,next,std::memory_order_relaxed)) return a.base + start;
+              << " live_bytes=" << live
+              << " remaining_bytes=" << (live <= a.size ? a.size-live : 0)
+              << " reason=arena exhausted or invalid size/alignment" << std::endl;
+    throw;
   }
 }
+void ub_arena_deallocate(bool atomic, void* pointer) { arenas[atomic].deallocate(pointer); }
 size_t ub_arena_used(bool atomic) { return arenas[atomic].used.load(); }
+size_t ub_arena_live(bool atomic) { return arenas[atomic].live_bytes(); }
 void ub_assert_atomic_target(const void* p) {
   const auto v = uintptr_t(p), b = cache_begin.load(std::memory_order_relaxed);
   if (b && v >= b && v < cache_end.load(std::memory_order_relaxed))

@@ -3052,7 +3052,7 @@ class BwTree : public BwTreeBase {
 #ifdef OPT_ROOT_READ
     // FreeNodeByNodeID() resolves the root through GetRootPtr(), so the
     // replicated-pointer helper must outlive the node teardown.
-    if (root_help_update) { root_help_update->~HelpUpdate<BaseNode>(); bwtree_memory().free(root_help_update); }
+    if (root_help_update) { root_help_update->~HelpUpdate<BaseNode>(); shared_atomic_memory(bwtree_memory()).free(root_help_update); }
     root_help_update = nullptr;
 #endif
 
@@ -3495,7 +3495,7 @@ class BwTree : public BwTreeBase {
   }
 
   void ConfigureRootPointerReplicas() {
-    if (root_help_update) { root_help_update->~HelpUpdate<BaseNode>(); bwtree_memory().free(root_help_update); }
+    if (root_help_update) { root_help_update->~HelpUpdate<BaseNode>(); shared_atomic_memory(bwtree_memory()).free(root_help_update); }
     root_help_update = nullptr;
     root_node_replicas.clear();
     root_node_replicas.resize(thread_num);
@@ -9945,7 +9945,7 @@ class BwTree : public BwTreeBase {
           // This invalidates any further reference to its
           // members (so we saved next pointer above)
           // Use bwtree_memory().free for shared memory support
-          bwtree_memory().free(const_cast<void*>(static_cast<const void*>(garbage_node_p)));
+          shared_atomic_memory(bwtree_memory()).free(const_cast<void*>(static_cast<const void*>(garbage_node_p)));
         }  // for
 
         // First need to save this in order to delete current node
@@ -9953,7 +9953,7 @@ class BwTree : public BwTreeBase {
         EpochNode *next_epoch_node_p = head_epoch_p->next_p;
 
         // Use bwtree_memory().free for shared memory support
-        bwtree_memory().free(static_cast<void*>(head_epoch_p));
+        shared_atomic_memory(bwtree_memory()).free(static_cast<void*>(head_epoch_p));
 
 #ifdef BWTREE_DEBUG
         epoch_freed++;
@@ -10971,7 +10971,7 @@ class BwTree : public BwTreeBase {
 
 #ifdef USE_CXL
       garbage_p->~GarbageNode();
-      bwtree_memory().free(garbage_p);
+      shared_atomic_memory(bwtree_memory()).free(garbage_p);
 #else
       delete garbage_p;
 #endif

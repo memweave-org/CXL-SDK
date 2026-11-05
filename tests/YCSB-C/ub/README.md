@@ -101,6 +101,11 @@ NOOPT/OPT 各构建一次，全部轮次复用；每轮新建共享对象，清�
 `bwtree+legacy` 覆盖未设置 suite 的默认入口。
 这不是无 CC 硬件模拟，也不输出吞吐或延迟；正式性能测试仍须等待独占资源。
 
+同一 `YCSB_BUILD_READONLY_RPC_CONTRACT=ON` 构建在启用 ClevelHash 时提供
+`ub_reuse_contract`。用 fixture SDK、独立 `UBSM_TEST_DIRECTORY` 运行 OPT/NOOPT
+两份产物，断言小 arena 下反复释放复用、合并、对齐、并发、无效释放，以及
+ClevelHash 重复插入、失败更新和扩容临时对象的内存有界性。此项也不计时。
+
 ## BwTree 线程数扫描与单项入口
 
 两机同步完整源码，在各自物理机执行一次：
@@ -171,8 +176,13 @@ TCP 控制端口默认 18982。
 NC 分配区由 A/B 各占一半，B 预生成两端全部操作序列；仅 trace 数组就超过 1 GiB，
 还需容纳索引元数据，以及 Sherman 模式的节点和 value。
 可通过 `SIZE_MB` / `NC_SIZE_MB` 覆盖容量；更大负载可能仍需增加。耗尽即报错，不回退到私有堆。
-保留原 epoch/GC 逻辑及 B 的后台 collector；UB bump allocator 不复用已释放地址，
-整个对象在退出时释放。NodeID 的空闲栈没有入栈路径，UB 模式跳过其无用的 128-bit CAS。
+UB arena 按进程分区，`MemoryManager::free()` 将安全释放的块合并并供后续分配复用，
+分配器账本留在进程本地；支持 CACHE/NC、64 字节隔离及绝对地址对齐，拒绝跨分区、
+跨分配器、内部指针和重复释放。`ub_arena_used()` 为地址高水位，`ub_arena_live()` 为未释放字节数。
+ClevelHash 的未发布 KV、失败的扩容数组和元数据会回收；扩容分配串行化以限制临时数组峰值，
+普通查询和更新不经过此扩容锁。已发布 KV 尚无跨机回收宽限期，继续保留到对象退出，
+不能在替换指针后立即复用。BwTree CACHE 节点仍采用地址不复用策略，NC 回收走原 epoch/GC。
+整个 UB 对象在退出时释放。NodeID 的空闲栈没有入栈路径，UB 模式跳过其无用的 128-bit CAS。
 所有节点由 B 分配/回收，不启动不需要的跨机 GC 消息队列 dispatcher。
 
 ## 启停与统计

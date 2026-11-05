@@ -159,10 +159,17 @@ CPU cacheline invalidate，也没有改变 UB 原生 NC 原子的后端。
 
 两进程框架中的 BwTree、ClevelHash（包括 OPT/NOOPT/RPC）在计时前，
 由每个 worker 将自己的 workload 操作描述符复制到进程私有 DRAM。
-分配绑定到该 worker CPU 所在 NUMA 节点，核对页面位置后才发布 READY；
+分配优先绑定到该 worker CPU 所在 NUMA 节点；若该节点没有内存或不在当前
+cpuset 允许的内存节点中，则选择允许范围内距离最近的有内存节点（也可为无 CPU 的
+内存节点）。核对页面位于选定节点后才发布 READY；
 计时循环读取本地数组，结果标记 `operation_storage=local-dram`。
 原共享数组仅供准备阶段分发同一条 trace，仍保留到回收阶段；key、顺序和 value 指针不变，
-索引 value 本身继续位于共享数据区。日志 `WORKLOAD_STORAGE` 记录各线程的位置和操作数。
+索引 value 本身继续位于共享数据区。日志 `WORKLOAD_STORAGE` 记录各线程的位置和操作数，
+其中 `node` 为选定的内存节点，`cpu_node` 为 CPU 所在节点。RPC 本地索引也采用此回退策略。
+
+无内存 NUMA 节点的轻量回归可通过 `-DYCSB_BUILD_NUMA_CONTRACT=ON` 构建并运行
+`numa_contract`。它模拟节点拓扑和 cpuset，覆盖无内存 CPU 节点、受限节点、
+节点编号大于 63、距离信息缺失及无可用内存节点，不进行性能测量。
 
 同一个 `run.sh` 用 `--backend ub|cxl` 选择运行后端（默认 `ub`）：
 

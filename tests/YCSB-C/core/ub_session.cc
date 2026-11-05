@@ -1,6 +1,7 @@
 #include "core/ub_session.h"
 #ifdef YCSB_UB_TWO_HOST
 #include "core/ub_cpu.h"
+#include "core/ub_numa.h"
 #include "db/ub_db.h"
 #include "shm/mm.h"
 #include "shm/ub.h"
@@ -185,14 +186,13 @@ size_t megabytes(const char* key) {
 }
 void* allocate_local_dram(size_t bytes) {
   if (!bytes) return nullptr;
-  const int node = numa_node_of_cpu(sched_getcpu());
-  if (node < 0) throw std::runtime_error("Cannot identify worker's DRAM NUMA node");
+  const int node = local_memory_node();
   void* p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   if (p == MAP_FAILED) throw std::bad_alloc();
   auto* mask = numa_allocate_nodemask();
   if (!mask) { munmap(p, bytes); throw std::bad_alloc(); }
   numa_bitmask_setbit(mask, node);
-  const int rc = mbind(p, bytes, MPOL_BIND, mask->maskp, mask->size + 1, MPOL_MF_STRICT);
+  const int rc = mbind(p, bytes, MPOL_BIND, mask->maskp, mask->size, MPOL_MF_STRICT);
   const int saved_errno = errno;
   numa_free_nodemask(mask);
   if (rc) {
@@ -205,7 +205,8 @@ void free_local_dram(void* address, size_t bytes) noexcept {
   if (address && bytes) munmap(address, bytes);
 }
 void check_local_workload(const void* address, size_t bytes, unsigned thread, size_t operations) {
-  const int node = numa_node_of_cpu(sched_getcpu());
+  const int cpu_node = numa_node_of_cpu(sched_getcpu());
+  const int node = local_memory_node(cpu_node);
   if (bytes) {
     const auto first = reinterpret_cast<uintptr_t>(address);
     if ((first >= data_base && first - data_base < data_size) ||
@@ -214,12 +215,13 @@ void check_local_workload(const void* address, size_t bytes, unsigned thread, si
     for (const void* page : {address, static_cast<const void*>(static_cast<const char*>(address) + bytes - 1)}) {
       int actual = -1;
       if (get_mempolicy(&actual, nullptr, 0, const_cast<void*>(page), MPOL_F_ADDR | MPOL_F_NODE) || actual != node)
-        throw std::runtime_error("Workload descriptors are not on the worker's DRAM node");
+        throw std::runtime_error("Workload descriptors are not on the selected local memory node");
     }
   }
   std::ostringstream message;
   message << "WORKLOAD_STORAGE thread=" << thread << " operations=" << operations
-          << " storage=local-dram node=" << node << " address=" << address << " bytes=" << bytes;
+          << " storage=local-dram node=" << node << " cpu_node=" << cpu_node
+          << " address=" << address << " bytes=" << bytes;
   stage(message.str());
 }
 void stage(const std::string& message) {
@@ -319,7 +321,8 @@ void prepare(utils::Properties& props) {
     cacheable=MemoryManager(new LocalIndexMapper,nullptr,data_size);
     cacheable.require_shared_allocations(props["dbname"]=="bwtree");
     std::cerr<<"RPC_INDEX_STORAGE role="<<(owner?"B":"A")<<" storage=local-dram base="<<local_index_base
-             <<" bytes="<<data_size<<" node="<<numa_node_of_cpu(sched_getcpu())<<std::endl;
+             <<" bytes="<<data_size<<" node="<<local_memory_node()
+             <<" cpu_node="<<numa_node_of_cpu(sched_getcpu())<<std::endl;
   } else {
     if(!all_nc && owner) ub_configure_arena(false,data,data_size);
     cacheable=MemoryManager(all_nc);

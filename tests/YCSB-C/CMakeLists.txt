@@ -84,6 +84,12 @@ include_directories(include)
 # Specify the source files
 file(GLOB SUBSRCS "core/*.cc" "ycsbc.cc" "db/db_factory.cc" "db/thread_pool.cc" "follower/*.cc")
 
+option(YCSB_BUILD_NUMA_CONTRACT "Build untimed memoryless NUMA fallback assertions" OFF)
+if(YCSB_BUILD_NUMA_CONTRACT)
+    add_executable(numa_contract ub/numa_contract.cc)
+    target_link_libraries(numa_contract PRIVATE numa)
+endif()
+
 option(YCSB_BUILD_MAPPING_CACHE_CONTRACT "Build untimed process-local cache/message assertions" OFF)
 if(YCSB_BUILD_MAPPING_CACHE_CONTRACT)
     add_executable(mapping_cache_contract ub/mapping_cache_contract.cc)

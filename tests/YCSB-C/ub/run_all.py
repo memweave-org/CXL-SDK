@@ -122,13 +122,14 @@ def main():
     p.add_argument('--build-only',action='store_true')
     p.add_argument('--fixture',action='store_true',help='Explicit local SDK fixture, never a hardware/performance result')
     args=p.parse_args()
+    if os.environ.get('A_WRITABLE','0')!='0': p.error('A is always read-only; A_WRITABLE must be 0')
     spec=Path(os.environ['SPEC'])
     if not spec.is_absolute(): spec=HERE/spec
     common={key:os.environ[key] for key in ('A_IP','B_IP','THREADS_A','THREADS_B','RECORDS','OPS','SIZE_MB','NC_SIZE_MB','SEED','A_WRITABLE')}
     plan={'cases':list(CASES),'common':common,'spec':str(spec),'workload':spec.read_text(),
-          'A_workload':'90% read / 10% update','B_workload':'90% read / 10% update',
+          'A_workload':'100% read','B_workload':'90% read / 10% update',
           'update_semantics':'replace-existing-key','fixture':args.fixture}
-    plan['sherman']={'mapping':'NC only','writers':'A and B, no RPC',
+    plan['sherman']={'mapping':'NC only','writers':'B only, no RPC',
                      'modes':['in-place loads/stores','local memcpy and copy-back']}
     if args.dry_run:
         print(json.dumps(plan,indent=2)); return 0

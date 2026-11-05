@@ -14,6 +14,6 @@ NC_SIZE_MB=${NC_SIZE_MB:-1024}
 SPEC=${SPEC:-workloadb_90read.spec}
 OPT=${OPT:-1} # Legacy run.sh: 1 OPT, 0 NOOPT
 SEED=${SEED:-20261104}
-A_WRITABLE=${A_WRITABLE:-0} # 0: A CACHE read-only, forward its updates to B
+A_WRITABLE=${A_WRITABLE:-0} # Compatibility only: A is always read-only; 1 is rejected.
 # CPU_A / CPU_B: first CPU of each host's consecutive client CPU range.
 # RPC service uses CPU_B as well; default is one CPU per host.

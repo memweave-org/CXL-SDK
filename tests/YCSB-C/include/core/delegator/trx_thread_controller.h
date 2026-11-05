@@ -174,6 +174,7 @@ public:
       <<"false"
 #endif
       <<",\"rpc_completed\":"<<UbRpcCompleted()
+      <<",\"rpc_transport\":\""<<UbRpcTransport()<<"\""
       <<",\"nc_data\":"<<(ycsbc_ub::nc_data()?"true":"false")
       <<",\"nc_direct\":"<<(ycsbc_ub::nc_direct_data()?"true":"false")
       <<",\"trace_hash\":\""<<std::hex<<trace_hash<<"\"}";

@@ -17,8 +17,8 @@ EXPECTED={
     'clevelhash': ('clevelhash',0,0,'cache',0),
     'clevelhash+opt': ('clevelhash',1,0,'cache',0),
     'clevelhash+rpc': ('clevelhash',0,1,'cache',0),
-    'sherman+nc-direct': ('sherman',0,0,'nc-direct',1),
-    'sherman+nc-memcpy': ('sherman',0,0,'nc-memcpy',1),
+    'sherman+nc-direct': ('sherman',0,0,'nc-direct',0),
+    'sherman+nc-memcpy': ('sherman',0,0,'nc-memcpy',0),
 }
 
 
@@ -26,7 +26,18 @@ class RoutingTests(unittest.TestCase):
     def test_batch_plan(self):
         result=subprocess.run(['bash',str(HERE/'run_all.sh'),'--dry-run'],
                               capture_output=True,text=True,check=True)
-        self.assertEqual(json.loads(result.stdout)['cases'],list(EXPECTED))
+        plan=json.loads(result.stdout)
+        self.assertEqual(plan['cases'],list(EXPECTED))
+        self.assertEqual(plan['A_workload'],'100% read')
+        self.assertEqual(plan['B_workload'],'90% read / 10% update')
+        self.assertEqual(plan['sherman']['writers'],'B only, no RPC')
+
+    def test_a_writable_is_rejected_before_build_or_run(self):
+        for script,arguments in [('run.sh',[]),('run_all.sh',['--dry-run'])]:
+            result=subprocess.run(['bash',str(HERE/script),*arguments],
+                env=dict(os.environ,A_WRITABLE='1'),capture_output=True,text=True)
+            self.assertNotEqual(result.returncode,0)
+            self.assertIn('A is always read-only',result.stderr)
 
     def test_cases_and_legacy_entry(self):
         with tempfile.TemporaryDirectory() as directory:

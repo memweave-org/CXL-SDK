@@ -45,15 +45,16 @@ def main():
                 assert case['update_semantics']=='replace-existing-key',case
                 for host in ('A','B'):
                     assert case[host]['errors']==0 and case[host]['reads']+case[host]['writes']==128
-                    assert case[host]['writes']>0,case
+                assert case['A']['reads']==128 and case['A']['writes']==0,case
+                assert case['B']['writes']>0,case
                 text=(root/role/case['case']/'worker.log').read_text()
                 nc=case['case'].startswith('sherman+nc-')
                 assert f'CACHE={"NONE" if nc else "READ" if role=="A" else "RW"} NC=RW' in text
                 if nc:
                     assert case['B']['rpc_completed']==0,case
-                    assert case['cache_policy']=='NC-only A-RW/B-RW',case
+                    assert case['cache_policy']=='NC-only; A reads, B reads/updates',case
                 if case['rpc']: assert case['B']['rpc_completed']==128
-                elif not nc: assert case['B']['rpc_completed']==case['A']['writes']
+                else: assert case['B']['rpc_completed']==0
         assert not list((root/'objects').iterdir()),'UB fixture objects leaked'
         print('PASS: all eight cases, native two-process shell flow, one CPU; logs:',root)
     finally:

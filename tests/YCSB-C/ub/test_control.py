@@ -180,13 +180,24 @@ os.write(fd,b'CLOSED\n')
         with self.assertRaises(RuntimeError): summary(a,{**b,'errors':1},2,100)
         with self.assertRaises(RuntimeError): summary({**a,'writes':1},b,2,100)
 
-    def test_suite_requires_both_workloads_and_correct_rpc_count(self):
-        a={'role':'A','reads':90,'writes':10,'errors':0,'bwtree_opt':False}
-        b={**a,'role':'B','framework_total_operations':200,'seconds':2,'rpc_completed':10}
+    def test_suite_requires_read_only_a_and_correct_rpc_transport(self):
+        a={'role':'A','reads':100,'writes':0,'errors':0,'bwtree_opt':False,'rpc_transport':'none'}
+        b={**a,'role':'B','reads':90,'writes':10,'framework_total_operations':200,'seconds':2,'rpc_completed':0}
         self.assertEqual(summary(a,b,3,100,suite=True)['update_semantics'],'replace-existing-key')
+        for rpc in (0,1):
+            with self.assertRaisesRegex(RuntimeError,'read-only'):
+                summary({**a,'reads':90,'writes':10},b,3,100,suite=True,rpc=rpc)
+        with self.assertRaisesRegex(RuntimeError,'read-only'):
+            summary(a,b,3,100,suite=True,a_writable=1)
+        with self.assertRaisesRegex(RuntimeError,'RPC completion'):
+            summary(a,{**b,'rpc_completed':10},3,100,suite=True)
         with self.assertRaisesRegex(RuntimeError,'RPC completion'):
             summary(a,b,3,100,suite=True,rpc=1)
-        self.assertTrue(summary(a,{**b,'rpc_completed':100},3,100,suite=True,rpc=1)['pass'])
+        rpc_a={**a,'rpc_transport':'mpmc-shared-queue'}
+        rpc_b={**b,'rpc_completed':100,'rpc_transport':'mpmc-shared-queue'}
+        self.assertTrue(summary(rpc_a,rpc_b,3,100,suite=True,rpc=1)['pass'])
+        with self.assertRaisesRegex(RuntimeError,'RPC transport'):
+            summary(a,rpc_b,3,100,suite=True,rpc=1)
 
     def test_two_peers(self):
         a,b=self.run_two_peers()

@@ -30,7 +30,7 @@ class OpGenerator {
       // Keep the framework generator; only select the host and its read/write mix.
       const int machine=i<num_ops/2?0:1;
       int group=ycsbc_ub::first_thread(machine)+workload_->NextGroup(ycsbc_ub::threads(machine));
-      auto operation=machine==1 && !std::getenv("YCSB_UB_SUITE")?READ:workload_->NextOperation();
+      auto operation=machine==1?READ:workload_->NextOperation();
 #else
       int group = workload_->NextGroup(group_size);
       auto operation=workload_->NextOperation();

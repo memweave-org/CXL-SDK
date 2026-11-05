@@ -6,7 +6,9 @@ The YCSB adapter supports two symmetric NC modes on both hosts:
 `YCSB_UB_CASE=sherman+nc-direct` uses in-place node and value loads/stores;
 `YCSB_UB_CASE=sherman+nc-memcpy` copies nodes and values to private buffers,
 modifies there and copies updates back. Both use NC roots, locks and per-node
-snapshot versions, with no RPC forwarding or RDMA. The eight-case comparison is
+snapshot versions, with no RPC forwarding or RDMA. A only reads the index; B
+runs 90% reads / 10% updates. Both hosts use the selected access mechanism.
+The eight-case comparison is
 `bash run_all.sh` from `tests/YCSB-C` on both hosts (B first, then A); see
 [`tests/YCSB-C/ub/README.md`](../../tests/YCSB-C/ub/README.md).
 The upstream description below documents the original RDMA implementation.

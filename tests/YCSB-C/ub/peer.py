@@ -234,7 +234,7 @@ def summary(a, b, seconds, ops, suite=False, rpc=0, a_writable=0):
     for role, result in [('A', a), ('B', b)]:
         if result['role'] != role or result['reads'] + result['writes'] != ops or result['errors']:
             raise RuntimeError('incomplete/failed workload on ' + role)
-    if (not suite and a['writes']) or seconds <= 0:
+    if (a_writable or a['writes']) or seconds <= 0:
         raise RuntimeError('invalid read-only workload or duration')
     if b['framework_total_operations'] != 2*ops or a['bwtree_opt'] != b['bwtree_opt']:
         raise RuntimeError('framework result mismatch')
@@ -242,15 +242,18 @@ def summary(a, b, seconds, ops, suite=False, rpc=0, a_writable=0):
     seconds=b['seconds']
     if seconds <= 0: raise RuntimeError('invalid framework duration')
     if suite:
-        expected_rpc=ops if rpc else (0 if a_writable else a['writes'])
+        expected_rpc=ops if rpc else 0
         if b.get('rpc_completed')!=expected_rpc:
             raise RuntimeError('RPC completion count mismatch')
+        transport='mpmc-shared-queue' if rpc else 'none'
+        if any(r.get('rpc_transport')!=transport for r in (a,b)):
+            raise RuntimeError('RPC transport mismatch; rebuild bundles')
     return {'framework': 'tests/YCSB-C/ycsbc', 'controller_seconds': control_seconds, 'pass': True, 'A': a, 'B': b, 'total_operations': 2*ops,
             'common_seconds': seconds, 'total_ops_per_second': 2*ops/seconds,
             'total_mops': 2*ops/seconds/1e6, 'update_semantics': 'replace-existing-key' if suite else 'fresh-insert',
             'A_observed_read_fraction': a['reads']/ops,
             'B_observed_read_fraction': b['reads']/ops,
-            'cache_policy': 'A-RW/B-RW' if a_writable else 'A-RO/B-RW',
+            'cache_policy': 'A-RO/B-RW',
             'reclamation': 'retain-until-both-processes-exit', 'bwtree_opt': b.get('bwtree_opt', False)}
 
 
@@ -287,7 +290,7 @@ def main():
     p.add_argument('--rpc', type=int, choices=[0,1], default=0)
     p.add_argument('--expected-opt', type=int, choices=[0,1], help='Reject a reused binary with the wrong OPT mode')
     p.add_argument('--sherman-access', choices=['cache','nc-direct','nc-memcpy'], default='cache')
-    p.add_argument('--a-writable', type=int, choices=[0,1], default=0)
+    p.add_argument('--a-writable', type=int, choices=[0], default=0, help='A is always read-only')
     p.add_argument('--seed', type=int, default=20261104)
     p.add_argument('--fixture', action='store_true', help='Explicit local file-backed SDK correctness test only')
     args = p.parse_args()
@@ -398,7 +401,7 @@ def main():
             report.update(case=args.case,db=args.db,rpc=bool(args.rpc),seed=args.seed,fixture=args.fixture,
                           sherman_access=args.sherman_access if args.db=='sherman' else None)
             if args.db=='sherman' and args.sherman_access!='cache':
-                report['cache_policy']='NC-only A-RW/B-RW'
+                report['cache_policy']='NC-only; A reads, B reads/updates'
             worker.finish('close')
             send('RELEASE')
             if receive()!='CLOSED': raise RuntimeError('B cleanup failed')

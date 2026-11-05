@@ -63,7 +63,7 @@ DB *DBFactory::CreateDB(utils::Properties &props) {
   int db_thread = SimThreadInfo::worker_thread_count + 1;
 #endif
 #ifdef YCSB_UB_TWO_HOST
-  if (std::getenv("YCSB_UB_SUITE")) return CreateUbDB(props["dbname"], db_thread);
+  return CreateUbDB(props["dbname"], db_thread);
 #endif
 #ifdef ENABLE_RADIX_ART_ROWEX_DB
   if (props["dbname"] == "radix_art_rowex") {

@@ -3,6 +3,7 @@
 set -euo pipefail
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")"
 source "${YCSB_UB_CONFIG:-./config.sh}"
+[[ $A_WRITABLE == 0 ]] || { echo "A is always read-only; A_WRITABLE must be 0" >&2; exit 2; }
 case_name=${YCSB_UB_CASE:-bwtree}
 suite=${YCSB_UB_SUITE:-0}
 db=bwtree; rpc=0; sherman_access=cache
@@ -14,8 +15,8 @@ case "$case_name" in
   clevelhash+rpc) db=clevelhash; OPT=0; rpc=1;;
   bwtree+rpc) OPT=0; rpc=1;;
   sherman) db=sherman; OPT=0;;
-  sherman+nc-direct) db=sherman; OPT=0; sherman_access=nc-direct; A_WRITABLE=1;;
-  sherman+nc-memcpy) db=sherman; OPT=0; sherman_access=nc-memcpy; A_WRITABLE=1;;
+  sherman+nc-direct) db=sherman; OPT=0; sherman_access=nc-direct;;
+  sherman+nc-memcpy) db=sherman; OPT=0; sherman_access=nc-memcpy;;
   *) echo "Unknown UB case: $case_name" >&2; exit 2;;
 esac
 case $OPT in 0|1) ;; *) echo 'OPT must be 0 or 1' >&2; exit 2;; esac

@@ -10,20 +10,21 @@ bash run_all.sh --dry-run
 bash run_all.sh
 ```
 
-| case | 编译模式 | A 的读 / 更新 | B 的读 / 更新 | 节点内存 |
+| case | 编译模式 | A（100% read） | B（90% read / 10% update） | 节点内存 |
 | --- | --- | --- | --- | --- |
-| bwtree | NOOPT | 直接读 / NC RPC | 本地索引 | CACHE |
-| bwtree+opt | OPT | 直接读 / NC RPC | 本地索引 | CACHE |
-| bwtree+rpc | NOOPT | 全部 NC RPC | 本地索引 | CACHE |
-| clevelhash | NOOPT | 直接读 / NC RPC | 本地索引 | CACHE |
-| clevelhash+opt | OPT | 直接读 / NC RPC | 本地索引 | CACHE |
-| clevelhash+rpc | NOOPT | 全部 NC RPC | 本地索引 | CACHE |
-| sherman+nc-direct | NOOPT | 原地 load/store | 原地 load/store | NC |
-| sherman+nc-memcpy | NOOPT | memcpy 到本地，修改后 memcpy 回去 | 同左 | NC |
+| bwtree | NOOPT | 直接读 | 本地索引 | CACHE |
+| bwtree+opt | OPT | 直接读 | 本地索引 | CACHE |
+| bwtree+rpc | NOOPT | 共享内存队列 RPC 读 | 本地索引 | CACHE |
+| clevelhash | NOOPT | 直接读 | 本地索引 | CACHE |
+| clevelhash+opt | OPT | 直接读 | 本地索引 | CACHE |
+| clevelhash+rpc | NOOPT | 共享内存队列 RPC 读 | 本地索引 | CACHE |
+| sherman+nc-direct | NOOPT | NC 字段直接 load | NC 字段直接 load/store | NC |
+| sherman+nc-memcpy | NOOPT | memcpy 到本地读取 | memcpy 到本地，修改后复制回 NC | NC |
 
-两端均为 90% read / 10% update、Zipfian；update 替换已有 key 的 value。
-每项新建共享对象，使用相同初始记录数、每端操作数、线程数和 `SEED`，并核对
-各端操作类型/key 序列 hash 在八项间一致。比例由随机抽样决定，小样本不保证恰好 90/10。
+所有 case 的 A 都只读，禁止 UPDATE/INSERT；B 使用 90% read / 10% update，
+update 替换已有 key 的 value。两端均使用 Zipfian 分布，每项新建共享对象，
+使用相同初始记录数、每端操作数、线程数和 `SEED`，并核对各端操作类型/key
+序列 hash 在八项间一致。B 的比例由随机抽样决定，小样本不保证恰好 90/10。
 默认初始 100,000 条，每端 1 线程、1,000,000 次操作（合计 2,000,000）。
 首次可在两端用相同参数执行：
 
@@ -31,15 +32,20 @@ bash run_all.sh
 RECORDS=1000 OPS=1000 bash run_all.sh
 ```
 
-BwTree/ClevelHash 继续使用已有启动 CACHE 失效及发布修复，默认 A CACHE 只读、B 可写。
-普通模式仅 A 的更新交给 B；RPC 模式 A 的全部操作交给 B。RPC 使用 NC mailbox，
-每个 client 一个同步请求，B 一个服务线程；默认服务线程和 B client 共用 `CPU_B`。
-`A_WRITABLE=1` 可显式允许普通 BwTree/ClevelHash 的 A 直接更新 CACHE。
+BwTree/ClevelHash 继续使用已有启动 CACHE 失效及发布修复，A CACHE 只读、B 可写。
+普通模式不分配 RPC 队列、不启动服务线程。`+rpc` 仅把 A 的读请求发给 B：
+复用 `shm-lib/include/msg/mpmc_queue.h` 的 `MPMCQueue<uint32_t>`（`USE_NO_CC_QUEUE`），
+队列、请求和回复都位于共享 NC。队列传递 client 编号，每个 client 只保留一个
+在途读请求，B 出队执行读取后通过 `response_sequence` 发布结果。
+B 的自身 workload 直接访问索引；B 有一个额外的 RPC 服务线程，默认与 B client
+共用 `CPU_B`。普通模式 RPC 完成数必须为 0，`+rpc` 必须等于 A 的全部读次数。
+`A_WRITABLE=1` 会在启动前报错，不能开启 A 更新。
 
 Sherman 两项都只 mmap 一块 NC 对象，节点、value、根、锁和控制信息全部在 NC，
-不创建 CACHE 映射。A/B 分配区互不重叠，双方对称执行读写，RPC 完成数必须为 0。
-`nc-direct` 直接遍历 NC 节点字段，在锁和版本保护下原地修改、分裂节点；
-`nc-memcpy` 将完整节点复制到本地做查询或修改，然后复制修改部分回 NC。
+不创建 CACHE 映射。A/B 使用相同访问机制，A 只读索引，只有 B 更新，RPC 完成数为 0。
+NC 映射仍需可写以支持控制信息及 epoch 等元数据；这不允许 A 执行索引更新。
+`nc-direct` 直接遍历 NC 节点字段，B 在锁和版本保护下原地修改、分裂节点；
+`nc-memcpy` 将完整节点复制到本地查询，B 在本地修改后复制修改部分回 NC。
 value 也分别使用直接访问或本地复制。两项都关闭本地内部节点缓存，保持相同节点布局；
 每个 1024 字节节点占一个 4 KiB 分配槽并带独立 NC 版本头，避免修改/分裂时版本锁别名。
 `NC_SIZE_MB` 包含节点、value 和原框架的 trace/控制数据，默认 1024 MiB，耗尽即报错。
@@ -77,6 +83,17 @@ YCSB_UB_SUITE=1 YCSB_UB_CASE=bwtree bash run.sh
 真实双进程接线检查（35 条记录、每端 128 次操作），结果不能用于 UB 性能或缓存一致性结论。
 可选 CMake 参数 `YCSB_BUILD_SHERMAN_CONTRACT=ON` 构建 `sherman_nc_contract`，
 仅供 fixture SDK 下验证双进程对称插入、分裂、更新和读取，不输出吞吐或耗时。
+
+### 不计时的本地功能断言
+
+使用 file-backed SDK fixture 构建时，可增加 `-DYCSB_BUILD_READONLY_RPC_CONTRACT=ON`，
+同时设 `-DBWTREE_MAPPING_TABLE_BITS=10 -DYCSB_CLEVEL_HASH_POWER=10`，构建
+`readonly_rpc_contract`。设置独立的 `UBSM_TEST_DIRECTORY` 后，分别传入 `queue` 或
+上表中的 case；OPT 两项必须运行 OPT 构建。该测试使用两个进程、四个 A client，
+验证实际操作生成器、A 更新/插入拒绝、B 更新可见性及 RPC 完成计数。
+`queue` 额外用容量为 2 的原有 MPMC 队列核对重复复用和各 client 的回复。
+`bwtree+legacy` 覆盖未设置 suite 的默认入口。
+这不是无 CC 硬件模拟，也不输出吞吐或延迟；正式性能测试仍须等待独占资源。
 
 ## BwTree 线程数扫描与单项入口
 

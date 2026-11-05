@@ -116,6 +116,9 @@ void prepare(utils::Properties& props) {
   (void)control_fd(); // Fail before allocating UB objects if launched without a controller.
   install_fault_reporter();
   stage("prepare UB session");
+  const char* writable=std::getenv("YCSB_UB_A_WRITABLE");
+  if(writable && std::string(writable)!="0")
+    throw std::runtime_error("A is always read-only; YCSB_UB_A_WRITABLE must be 0");
   owner=SimThreadInfo::is_master();
   const char* access=std::getenv("YCSB_UB_SHERMAN_ACCESS");
   all_nc=props["dbname"]=="sherman" && access && std::string(access)!="cache";
@@ -141,18 +144,14 @@ void prepare(utils::Properties& props) {
     create_ub_memory((name+"-nc").c_str(),nc_size,env("YCSB_UB_PROVIDER"),UINT32_MAX,UbMappingMode::Noncacheable);
   }
   nc=map_ub_memory((name+"-nc").c_str(),reinterpret_cast<void*>(nc_base),nc_size,UbMappingMode::Noncacheable);
-  const bool a_writable=std::getenv("YCSB_UB_A_WRITABLE") && std::string(std::getenv("YCSB_UB_A_WRITABLE"))=="1";
-  if(!all_nc) data=map_ub_memory(name.c_str(),reinterpret_cast<void*>(data_base),data_size,UbMappingMode::Cacheable,!owner && !a_writable);
+  if(!all_nc) data=map_ub_memory(name.c_str(),reinterpret_cast<void*>(data_base),data_size,UbMappingMode::Cacheable,!owner);
   size_t half=((nc_size-4096)/2)&~size_t(all_nc ? 4095 : 63);
   ub_configure_arena(true,static_cast<char*>(nc)+4096+(owner?0:half),half);
   // A never allocates data. Leaving its CACHE allocator unconfigured catches violations.
-  if(!all_nc) {
-    if(a_writable) ub_configure_arena(false,static_cast<char*>(data)+(owner?0:data_size/2),data_size/2);
-    else if(owner) ub_configure_arena(false,data,data_size);
-  }
+  if(!all_nc && owner) ub_configure_arena(false,data,data_size);
   cacheable=MemoryManager(all_nc);
   stage("UB mappings ready; allocators configured");
-  std::cerr<<"YCSB framework UB role="<<(owner?"B":"A")<<" CACHE="<<(all_nc?"NONE":owner||a_writable?"RW":"READ")<<" NC=RW"<<std::endl;
+  std::cerr<<"YCSB framework UB role="<<(owner?"B":"A")<<" CACHE="<<(all_nc?"NONE":owner?"RW":"READ")<<" NC=RW"<<std::endl;
 }
 void* control_header() { return nc; }
 void ready() {

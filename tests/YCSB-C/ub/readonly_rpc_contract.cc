@@ -100,7 +100,11 @@ void queue_contract(bool owner,int in,int out) {
 void mapping_gc_contract(bool owner,int in,int out) {
   using Tree=wangziqi2013::bwtree::BwTree<long,long>;
   constexpr NodeID id=MAPPING_TABLE_SIZE-1;
-  struct State { Tree* tree; const Tree::BaseNode* old; const Tree::BaseNode* replacement; } state{};
+  constexpr size_t retired_count=70; // Cross the production 64-node batch boundary.
+  struct State {
+    Tree* tree; const Tree::BaseNode* old; const Tree::BaseNode* replacement;
+    std::array<const Tree::BaseNode*,retired_count-1> more_old{},more_new{};
+  } state{};
   if(owner) {
     state.tree=new(shared_atomic_memory().malloc(sizeof(Tree))) Tree(false,false);
     state.tree->UpdateThreadLocal(2);
@@ -110,12 +114,18 @@ void mapping_gc_contract(bool owner,int in,int out) {
     };
     state.old=node(); state.replacement=node();
     state.tree->mapping_table[id].store(state.old);
+    for(size_t i=1;i<retired_count;++i) {
+      state.more_old[i-1]=node(); state.more_new[i-1]=node();
+      state.tree->mapping_table[id-i].store(state.more_old[i-1]);
+    }
   }
   transfer(owner?out:in,&state,sizeof(state),owner);
   auto* tree=state.tree;
   tree->AssignGCID(owner?0:1);
   tree->PrepareLocalMappingCache();
   require(tree->GetNode(id,false)==state.old,"initial inner cache fill");
+  for(size_t i=1;i<retired_count;++i)
+    require(tree->GetNode(id-i,false)==state.more_old[i-1],"initial batch cache fill");
   if(!owner) {
     // Hold a real tree slot busy while both GetNode entry points run on A.
     // Neither may expose the marker or wait for this gated filling thread.
@@ -138,6 +148,10 @@ void mapping_gc_contract(bool owner,int in,int out) {
   if(owner) {
     tree->mapping_table[id].store(state.replacement);
     tree->AddGarbageNode(state.old,id);
+    for(size_t i=1;i<retired_count;++i) {
+      tree->mapping_table[id-i].store(state.more_new[i-1]);
+      tree->AddGarbageNode(state.more_old[i-1],id-i);
+    }
     tree->IncreaseEpoch(); // epoch 1
     tree->UpdateLastActiveEpoch();
   }
@@ -151,25 +165,34 @@ void mapping_gc_contract(bool owner,int in,int out) {
     tree->IncreaseEpoch(); // epoch 2, min 1: the original grace period ended.
     tree->PerformGC(0);
     auto* meta=tree->GetGCMetaData(0);
-    require(meta->node_count==1,"reclaimed before invalidation ACK");
+    require(meta->node_count==retired_count,"reclaimed before invalidation ACK");
     auto* garbage=meta->header.next_p;
     require(garbage && garbage->cache_invalidation.sequence,"GC did not send a message");
+    auto* last=meta->last_p;
+    require(last->cache_invalidation.sequence>garbage->cache_invalidation.sequence,
+            "GC did not split retirement into multiple batches");
+    auto* cursor=garbage;
+    for(size_t i=0;i<64;++i,cursor=cursor->next_p)
+      require(cursor->cache_invalidation.sequence==garbage->cache_invalidation.sequence,
+              "GC sent per-node messages instead of one batch");
     const auto limit=std::chrono::steady_clock::now()+std::chrono::seconds(5);
-    while(!tree->mapping_cache_invalidations.acknowledged(garbage->cache_invalidation)) {
+    while(!tree->mapping_cache_invalidations.acknowledged(last->cache_invalidation)) {
       require(std::chrono::steady_clock::now()<limit,"GC message ACK timeout");
       std::this_thread::sleep_for(std::chrono::microseconds(100));
     }
     tree->PerformGC(0); // Record an epoch after all ACKs, even if already ACKed above.
-    require(meta->node_count==1 && garbage->cache_clear_epoch==2,"missing post-ACK grace period");
+    require(meta->node_count==retired_count && garbage->cache_clear_epoch==2,"missing post-ACK grace period");
     tree->UpdateLastActiveEpoch();
     tree->IncreaseEpoch(); // epoch 3, min 1: A still holds the cached old node.
     tree->PerformGC(0);
-    require(meta->node_count==1,"freed while A still holds an old cached pointer");
+    require(meta->node_count==retired_count,"freed while A still holds an old cached pointer");
   }
   barrier(in,out);
   if(!owner) {
     require(state.old->GetType()==Tree::NodeType::InnerType,"old node died inside read operation");
     require(tree->GetNode(id,false)==state.replacement,"message failed to refresh A's cache");
+    for(size_t i=1;i<retired_count;++i)
+      require(tree->GetNode(id-i,false)==state.more_new[i-1],"batch failed to clear A's cache");
     tree->UpdateLastActiveEpoch();
     tree->UnregisterThread(1);
     bwtree_process_cache::shutdown();
@@ -192,6 +215,10 @@ void mapping_gc_contract(bool owner,int in,int out) {
     tree->epoch_manager.FreeEpochDeltaChain(reused);
     tree->mapping_table[id].store(nullptr);
     tree->epoch_manager.FreeEpochDeltaChain(state.replacement);
+    for(size_t i=1;i<retired_count;++i) {
+      tree->mapping_table[id-i].store(nullptr);
+      tree->epoch_manager.FreeEpochDeltaChain(state.more_new[i-1]);
+    }
     tree->UnregisterThread(0);
     tree->~Tree();
     shared_atomic_memory().free(tree);

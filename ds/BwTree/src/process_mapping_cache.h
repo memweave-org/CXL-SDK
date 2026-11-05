@@ -64,89 +64,129 @@ static_assert(std::atomic<uintptr_t>::is_always_lock_free,
 struct MappingInvalidationTicket {
   uint64_t sequence = 0;
   uint64_t recipients = 0;
+  size_t producer = 0;
 };
 
-// Inline in the shared NC tree; contains no process-private addresses. The
-// production instantiation uses nt<uint64_t> (native mapped NC atomics on UB).
-// Each process consumes its own stream and publishes ACK only after clearing.
-template <template<class> class Atomic, size_t Capacity = 1024, size_t Processes = 16>
+// One single-writer broadcast ring per GC worker. Producers do not share a
+// tail, reservation CAS or lock, and there is no ordering between their rings.
+// Capacity counts batches; payload lives in NC, ordered by published/ACK.
+// Producer IDs are the stable GC thread IDs, never shared concurrently.
+// 512 covers the coordinated runner's maximum of 192 workers on each host.
+template <template<class> class Atomic, size_t Capacity = 16, size_t Processes = 16,
+          size_t Producers = 512, size_t BatchSize = 64>
 class MappingInvalidationChannel {
-  static_assert(Capacity > 0 && Processes > 0 && Processes <= 64, "channel bounds");
-  // Space ACK writers apart without imposing a stronger alignment requirement
-  // on the containing tree's existing shared allocator.
-  struct Consumer {
-    Atomic<uint64_t> ack{0};
+  static_assert(Capacity > 0 && Processes > 0 && Processes <= 64 &&
+                Producers > 0 && BatchSize > 0, "channel bounds");
+  struct Counter {
+    Atomic<uint64_t> value{0};
     char padding[64 - sizeof(Atomic<uint64_t>)]{};
   };
-  Atomic<uint64_t> locked_{0};
-  Atomic<uint64_t> published_{0};
-  uint64_t active_ = 0; // Accessed only with locked_ held.
-  std::array<Atomic<uint64_t>, Capacity> messages_{};
-  std::array<Consumer, Processes> consumers_{};
+  struct Batch {
+    size_t count = 0;
+    std::array<uint64_t, BatchSize> nodes{};
+  };
+  struct Lane {
+    Counter published;
+    std::array<Counter, Processes> consumers;
+    std::array<Batch, Capacity> batches;
+  };
+  Atomic<uint64_t> active_{0};
+  Atomic<uint64_t> producer_count_{1};
+  std::array<Atomic<uint64_t>, Processes> registered_{};
+  std::array<Lane, Producers> lanes_{};
 
-  bool try_lock() {
-    uint64_t expected = 0;
-    return locked_.compare_exchange_strong(expected, 1);
+  // Registration only; never called on the publish/consume data path.
+  void membership(size_t process, bool joining) {
+    const auto bit = uint64_t{1} << process;
+    auto old = active_.load();
+    while (!active_.compare_exchange_strong(old, joining ? old | bit : old & ~bit)) {}
   }
-  void lock() { while (!try_lock()) std::this_thread::yield(); }
-  void unlock() { locked_.store(0); }
 public:
-  // The caller's cache must be empty, and no readers may use it before attach.
+  static constexpr size_t batch_size = BatchSize;
+  static constexpr size_t producer_limit = Producers;
+
+  // The cache is empty, and local readers start only after attach returns.
+  // New readers cannot hold nodes retired before their registration. Start
+  // by joining the recipient set BEFORE snapshotting the published heads.
+  // Readers still cannot start, so all batches skipped by those snapshots
+  // predate this empty cache. Joining first prevents unbounded ring reuse
+  // while the snapshots are taken; at most one pre-join batch per lane is
+  // still in flight, and its release publication orders the payload.
   void attach(size_t process) {
     if (process >= Processes) throw std::out_of_range("BwTree cache process ID");
-    lock();
-    const uint64_t bit = uint64_t{1} << process;
-    if (active_ & bit) {
-      unlock();
+    uint64_t expected = 0;
+    if (!registered_[process].compare_exchange_strong(expected, 1))
       throw std::logic_error("Duplicate BwTree cache consumer");
-    }
-    consumers_[process].ack.store(published_.load());
-    active_ |= bit;
-    unlock();
+    membership(process, true);
+    for (auto& lane : lanes_)
+      lane.consumers[process].value.store(lane.published.value.load());
   }
-  // Called after local readers and the receiver have stopped. The retired
-  // table can never be reused, so it is safe to acknowledge its entire stream.
+  // Local readers and the receiver have stopped. Removing membership also
+  // retires ACK obligations of publications racing with this departure.
   void detach(size_t process) {
-    lock();
-    consumers_[process].ack.store(published_.load());
-    active_ &= ~(uint64_t{1} << process);
-    unlock();
+    if (process >= Processes) throw std::out_of_range("BwTree cache process ID");
+    membership(process, false);
+    registered_[process].store(0);
   }
-  MappingInvalidationTicket try_publish(uint64_t node_id) {
-    if (!try_lock()) return {};
-    const auto head = published_.load();
-    if (head == std::numeric_limits<uint64_t>::max()) {
-      unlock();
+  MappingInvalidationTicket try_publish_batch(size_t producer, const uint64_t* ids,
+                                              size_t count) {
+    if (producer >= Producers || !count || count > BatchSize || !ids)
+      throw std::out_of_range("BwTree invalidation batch/producer bounds");
+    // This CAS is a one-time announcement when a new highest producer ID
+    // first publishes. Existing lanes use only loads/stores for every batch.
+    auto known = producer_count_.load(std::memory_order_acquire);
+    while (known <= producer && !producer_count_.compare_exchange_strong(known, producer + 1)) {}
+    auto& lane = lanes_[producer];
+    const auto head = lane.published.value.load(std::memory_order_relaxed);
+    if (head == std::numeric_limits<uint64_t>::max())
       throw std::overflow_error("BwTree invalidation sequence exhausted");
-    }
-    for (size_t i = 0; i < Processes; ++i) {
-      if ((active_ & (uint64_t{1} << i)) &&
-          head - consumers_[i].ack.load() >= Capacity) {
-        unlock();
-        return {}; // Backpressure delays GC; it never drops an invalidation.
-      }
-    }
-    messages_[head % Capacity].store(node_id);
-    const MappingInvalidationTicket ticket{head + 1, active_};
-    published_.store(ticket.sequence);
-    unlock();
-    return ticket;
+    const auto recipients = active_.load(std::memory_order_acquire);
+    for (size_t i = 0; i < Processes; ++i)
+      if ((recipients & (uint64_t{1} << i)) &&
+          head - lane.consumers[i].value.load(std::memory_order_acquire) >= Capacity)
+        return {}; // This lane is full; independent producers can still publish.
+    auto& batch = lane.batches[head % Capacity];
+    batch.count = count;
+    for (size_t i = 0; i < count; ++i) batch.nodes[i] = ids[i];
+    lane.published.value.store(head + 1, std::memory_order_release);
+    return {head + 1, recipients, producer};
   }
-  template<class Clear> bool consume(size_t process, Clear clear) {
-    auto ack = consumers_[process].ack.load();
-    const auto end = published_.load();
+  // Compatibility for single-node callers; only one caller may own lane 0.
+  MappingInvalidationTicket try_publish(uint64_t node_id) {
+    return try_publish_batch(0, &node_id, 1);
+  }
+  template<class Clear> bool consume_lane(size_t process, size_t producer, Clear clear) {
+    if (process >= Processes || producer >= Producers)
+      throw std::out_of_range("BwTree cache consumer/producer ID");
+    auto& lane = lanes_[producer];
+    auto ack = lane.consumers[process].value.load(std::memory_order_relaxed);
+    const auto end = lane.published.value.load(std::memory_order_acquire);
     if (ack == end) return false;
     while (ack < end) {
-      clear(messages_[ack % Capacity].load());
-      consumers_[process].ack.store(++ack);
+      const auto& batch = lane.batches[ack % Capacity];
+      for (size_t i = 0; i < batch.count; ++i) clear(batch.nodes[i]);
+      ++ack;
     }
+    // One release ACK for this entire drain, after every cache clear. A
+    // producer cannot overwrite any of its payload while we are using it.
+    lane.consumers[process].value.store(end, std::memory_order_release);
     return true;
+  }
+  template<class Clear> bool consume(size_t process, Clear clear) {
+    bool progress = false;
+    const auto count = producer_count_.load(std::memory_order_acquire);
+    for (size_t producer = 0; producer < count; ++producer)
+      progress = consume_lane(process, producer, clear) || progress;
+    return progress;
   }
   bool acknowledged(MappingInvalidationTicket ticket) const {
     if (!ticket.sequence) return false;
+    if (ticket.producer >= Producers) throw std::out_of_range("BwTree ticket producer ID");
+    const auto recipients = ticket.recipients & active_.load(std::memory_order_acquire);
     for (size_t i = 0; i < Processes; ++i)
-      if ((ticket.recipients & (uint64_t{1} << i)) &&
-          consumers_[i].ack.load() < ticket.sequence) return false;
+      if ((recipients & (uint64_t{1} << i)) &&
+          lanes_[ticket.producer].consumers[i].value.load(std::memory_order_acquire) < ticket.sequence)
+        return false;
     return true;
   }
 };
@@ -205,7 +245,7 @@ private:
       }
       live.store(true);
       std::fprintf(stderr,
-          "BWTREE_MAPPING_CACHE pid=%ld tree=%p address=%p bytes=%zu tables=1 placement=process-private-dram invalidation=message-ack fill=busy-slot\n",
+          "BWTREE_MAPPING_CACHE pid=%ld tree=%p address=%p bytes=%zu tables=1 placement=process-private-dram invalidation=per-worker-batch-ack batch_nodes=64 publish=single-writer fill=busy-slot\n",
           long(getpid()), key, static_cast<void*>(&table[0]), sizeof(Table));
     }
     void stop() override {

@@ -75,6 +75,85 @@ void channel_contract() {
   channel.detach(1);
 }
 
+void batch_contract() {
+  using Channel = MappingInvalidationChannel<std::atomic, 2, 2, 4, 4>;
+  Channel channel;
+  channel.attach(0); channel.attach(1);
+  const uint64_t a[]{10,11,12,13}, b[]{20,21,22};
+  const auto first=channel.try_publish_batch(0,a,4);
+  const auto second=channel.try_publish_batch(0,a,4);
+  require(first.sequence && second.sequence,"batch reservation failed");
+  require(!channel.try_publish_batch(0,a,1).sequence,"full producer ring overwritten");
+  const auto independent=channel.try_publish_batch(1,b,3);
+  require(independent.sequence,"one full producer blocked another producer");
+  for(size_t process=0;process<2;++process) {
+    size_t n=0;
+    channel.consume_lane(process,1,[&](uint64_t id) { require(id==b[n++],"batch payload corruption"); });
+    require(n==3,"batch payload truncated");
+  }
+  require(channel.acknowledged(independent) && !channel.acknowledged(first),
+          "independent producer ACKs were conflated");
+  std::promise<void> entered,resume;
+  auto blocked=entered.get_future(),go=resume.get_future();
+  std::thread receiver([&] {
+    size_t n=0;
+    channel.consume_lane(0,0,[&](uint64_t id) {
+      require(id==a[n%4],"batch order/data corrupted");
+      if(++n==1) { entered.set_value();go.wait(); }
+      require(!channel.acknowledged(first),"ACK published before drain completed");
+    });
+    require(n==8,"multiple batches not drained");
+  });
+  blocked.wait();
+  size_t n=0;
+  channel.consume_lane(1,0,[&](uint64_t id) { require(id==a[n++%4],"second receiver data"); });
+  require(n==8 && !channel.acknowledged(first),"partial batch ACK accepted");
+  resume.set_value();receiver.join();
+  require(channel.acknowledged(first) && channel.acknowledged(second),"batch ACK missing");
+  // Wrap the ring, detach with outstanding work, and reattach with an empty
+  // cache. Tickets always identify their producer, even at equal sequences.
+  const auto wrapped=channel.try_publish_batch(0,b,3);
+  channel.detach(1);
+  channel.consume_lane(0,0,[](uint64_t) {});
+  require(channel.acknowledged(wrapped),"detach left a batch waiting forever");
+  channel.attach(1);
+  require(!channel.consume(1,[](uint64_t) {}),"reattach consumed retired batches");
+  channel.detach(0);channel.detach(1);
+}
+
+void concurrent_producers_contract() {
+  using Channel=MappingInvalidationChannel<std::atomic, 2, 2, 4, 8>;
+  Channel channel;
+  channel.attach(0);channel.attach(1);
+  constexpr size_t rounds=128;
+  std::array<MappingInvalidationTicket,4> last{};
+  std::array<std::thread,4> writers;
+  for(size_t p=0;p<4;++p) writers[p]=std::thread([&,p] {
+    for(size_t r=0;r<rounds;++r) {
+      uint64_t ids[8];
+      for(size_t i=0;i<8;++i) ids[i]=p*100000+r*8+i;
+      MappingInvalidationTicket ticket;
+      eventually([&] { ticket=channel.try_publish_batch(p,ids,8);return ticket.sequence!=0; });
+      last[p]=ticket;
+    }
+  });
+  std::array<std::thread,2> readers;
+  for(size_t process=0;process<2;++process) readers[process]=std::thread([&,process] {
+    std::array<size_t,4> seen{};
+    eventually([&] {
+      channel.consume(process,[&](uint64_t id) {
+        const auto p=id/100000,offset=id%100000;
+        require(p<4 && offset==seen[p]++,"concurrent batches lost, duplicated or reordered within producer");
+      });
+      return seen[0]+seen[1]+seen[2]+seen[3]==4*rounds*8;
+    });
+  });
+  for(auto& writer:writers) writer.join();
+  for(auto& reader:readers) reader.join();
+  for(const auto ticket:last) require(channel.acknowledged(ticket),"concurrent final ACK missing");
+  channel.detach(0);channel.detach(1);
+}
+
 void refill_contract() {
   MappingInvalidationChannel<std::atomic, 2, 1> channel;
   channel.attach(0);
@@ -263,9 +342,11 @@ int main() {
   signal(SIGPIPE, SIG_IGN);
   try {
     channel_contract();
+    batch_contract();
+    concurrent_producers_contract();
     refill_contract();
     process_contract();
-    std::cout << "PASS: private tables, fill/clear exclusion, busy-reader bypass, ACK, backpressure, detach/reuse\n";
+    std::cout << "PASS: private tables, fill/clear exclusion, busy-reader bypass, batch ACK, independent concurrent producers, backpressure, detach/reuse\n";
   } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';
     return 1;

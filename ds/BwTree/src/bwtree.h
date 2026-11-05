@@ -11035,18 +11035,39 @@ class BwTree : public BwTreeBase {
     GarbageNode *first_p = header_p->next_p;
 
 #if defined(OPT_IN_USE_FLAG) && BWTREE_PROCESS_MAPPING_CACHE
-    // Clearing at reclamation time alone is insufficient: a newer reader may
-    // already hold a cached pointer. After every recipient ACKs, take a fresh
-    // epoch and wait another grace period. Never block a worker on remote ACKs.
-    for (auto *node = first_p; node != nullptr && node->delete_epoch < min_epoch;
-         node = node->next_p) {
-      if (!node->cache_invalidation.sequence) {
-        node->cache_invalidation = mapping_cache_invalidations.try_publish(node->node_id);
-        if (!node->cache_invalidation.sequence) break;
+    // Each GC worker publishes to its own ring: no global lock or ordering
+    // between workers. Contiguous retired nodes share one batch ticket, one
+    // ACK check and one post-ACK epoch. Reader lifetime rules are unchanged.
+    constexpr size_t batch_size = LocalMappingCache::Channel::batch_size;
+    auto* node = first_p;
+    while (node != nullptr && node->delete_epoch < min_epoch) {
+      if (node->cache_clear_epoch != std::numeric_limits<uint64_t>::max()) {
+        node = node->next_p;
+        continue;
       }
-      if (node->cache_clear_epoch == std::numeric_limits<uint64_t>::max() &&
-          mapping_cache_invalidations.acknowledged(node->cache_invalidation))
-        node->cache_clear_epoch = GetGlobalEpoch();
+      std::array<GarbageNode*, batch_size> batch;
+      std::array<uint64_t, batch_size> ids;
+      size_t count = 0;
+      auto ticket = node->cache_invalidation;
+      auto* next = node;
+      while (next != nullptr && next->delete_epoch < min_epoch && count < batch_size &&
+             next->cache_clear_epoch == std::numeric_limits<uint64_t>::max() &&
+             next->cache_invalidation.sequence == ticket.sequence &&
+             next->cache_invalidation.producer == ticket.producer) {
+        batch[count] = next;
+        ids[count++] = next->node_id;
+        next = next->next_p;
+      }
+      if (!ticket.sequence) {
+        ticket = mapping_cache_invalidations.try_publish_batch(thread_id, ids.data(), count);
+        if (!ticket.sequence) break;
+        for (size_t i = 0; i < count; ++i) batch[i]->cache_invalidation = ticket;
+      }
+      if (mapping_cache_invalidations.acknowledged(ticket)) {
+        const auto cleared_epoch = GetGlobalEpoch();
+        for (size_t i = 0; i < count; ++i) batch[i]->cache_clear_epoch = cleared_epoch;
+      }
+      node = next;
     }
 #endif
     const auto reclaimable = [min_epoch](const GarbageNode *node) {

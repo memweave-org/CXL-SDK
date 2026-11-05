@@ -129,13 +129,22 @@ ClevelHash 重复插入、失败更新和扩容临时对象的内存有界性。
 其中一个节点。共享树内只保留权威 mapping table 和清理消息通道，不存私有表地址。
 默认 24-bit 表每项只有一个 64-bit 原子值，共 128 MiB/进程；NOOPT 不创建该表。
 B 在构造树时分配，A 在 worker 注册时分配，两者都在 READY 和吞吐计时之前完成。
-启动日志 `BWTREE_MAPPING_CACHE` 包含 pid、表地址、大小、`invalidation=message-ack`
+启动日志 `BWTREE_MAPPING_CACHE` 包含 pid、表地址、大小、`invalidation=per-worker-batch-ack`
 和 `fill=busy-slot`。
 
-GC 通过共享 NC 环形消息通道发送 node ID，各进程的接收线程只清自己的对应表项，
-清完后返回 ACK。GC 收齐消息发送时已注册进程的 ACK，再记录新的 epoch；只有这个
-epoch 的读操作也已退出，才释放旧节点。队列满或 ACK 未到只延后回收，普通读操作
-不等待消息。接收线程空闲时休眠 50 微秒；缓存不会因 epoch 改变而整体失效。
+GC 为每个 worker 使用独立的共享 NC 单写者环形队列，每批最多 64 个 node ID，
+每条队列最多保留 16 批。常规发送仅用 load/store 发布，不争用全局 tail、CAS 或锁；
+不同 worker 的批次没有全局顺序。首次出现更大的 worker ID 时用一次 CAS 公布队列范围，
+进程注册/退出用 CAS 更新成员位图，这些均不在每批发送的竞争路径上。最多支持 512 个
+GC worker ID，覆盖当前每端最多 192 worker 的双端脚本。
+
+后台接收线程分别读取各 worker 队列，清完一次 drain 内的所有批次后，仅写一次 ACK。
+一条队列满只延后该 worker 的回收，不阻塞其他 worker 发布。GC 对同批节点只检查一次
+两端 ACK，再共享一个新 epoch；只有这个 epoch 的读操作也退出，才允许复用旧节点。
+普通读不等待消息。接收线程空闲时休眠 50 微秒；缓存不会因 epoch 改变而整体失效。
+队列 payload 是 NC 普通读写，使用发布与 ACK 的 acquire/release（UB 的全系统屏障）
+保证写完整批后才能消费、清完整批后才能复用槽位。注册先加入接收者集合，再快照各
+队列头；私有空缓存只在注册结束后开放给读线程，避免注册期间队列绕回覆盖未处理数据。
 本地命中只对表项做一次 acquire load。回填先用 CAS 取得表项的忙标记，再读取权威
 mapping table 并发布指针；接收线程与回填互斥，等已有回填结束后才清空并 ACK。
 读线程遇到忙标记或竞争失败时直接读 NC，不等待、不回填。这样旧操作不会在清理
@@ -148,10 +157,11 @@ CPU cacheline invalidate，也没有改变 UB 原生 NC 原子的后端。
 这会改变共享树布局，A/B 必须同步源码并重新构建 OPT bundle，不能混用旧二进制。
 本地构建可增加 `-DYCSB_BUILD_MAPPING_CACHE_CONTRACT=ON`，生成不计时的
 `mapping_cache_contract`，覆盖两个进程的私有表、同进程线程复用、清理等待已有回填、
-忙表项读绕过、ACK 时序、异常释放忙标记、队列满、定向清理及退出/重建。用显式屏障
+忙表项读绕过、批量 ACK 时序、四发送者独立队列、队列满不互相阻塞、异常释放忙标记、
+定向清理及退出/重建。用显式屏障
 固定回填与清理的交错顺序，不依赖线程速度；普通共享 mmap 不代表 NC 硬件验证。
 前述 SDK fixture 的 `readonly_rpc_contract bwtree+cache-gc` 另覆盖真实 BwTree 的
-回收路径：A 在新的 epoch 继续持有旧缓存指针时，即使清理已 ACK，B 也必须延后释放；
+回收路径（70 个退休节点，跨越两个批次）：A 在新的 epoch 继续持有旧缓存指针时，即使清理已 ACK，B 也必须延后释放；
 读端退出宽限期后，验证 CACHE 存活字节下降、旧地址复用且分配高水位不增长。
 运行这些用例前仍须完成测试资源互斥检查；性能结论还需独占环境下的 OPT/NOOPT 对比。
 

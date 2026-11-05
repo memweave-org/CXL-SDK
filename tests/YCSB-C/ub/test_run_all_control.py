@@ -32,10 +32,10 @@ class RoutingTests(unittest.TestCase):
         base={k:v for k,v in os.environ.items() if k not in
               ('SIZE_MB','NC_SIZE_MB','SHERMAN_NC_SIZE_MB','YCSB_UB_CONFIG','A_WRITABLE')}
         for override,cache,nc,sherman_nc in (
-            ({},65536,16384,65536),
-            ({'NC_SIZE_MB':'128'},65536,128,128),
+            ({},49152,16384,16384),
+            ({'NC_SIZE_MB':'128'},49152,128,128),
             ({'SIZE_MB':'256','SHERMAN_NC_SIZE_MB':'512'},256,16384,512),
-            ({'NC_SIZE_MB':'128','SHERMAN_NC_SIZE_MB':'512'},65536,128,512),
+            ({'NC_SIZE_MB':'128','SHERMAN_NC_SIZE_MB':'512'},49152,128,512),
         ):
             with self.subTest(override=override):
                 result=subprocess.run(['bash',str(HERE/'run_all.sh'),'--dry-run'],
@@ -54,10 +54,11 @@ class RoutingTests(unittest.TestCase):
 
     def test_batch_plan(self):
         result=subprocess.run(['bash',str(HERE/'run_all.sh'),'--dry-run'],
-                              env={k:v for k,v in os.environ.items() if k not in ('THREAD_COUNTS','YCSB_UB_CONFIG','A_WRITABLE')},
+                              env={k:v for k,v in os.environ.items() if k not in ('THREAD_COUNTS','YCSB_UB_CONFIG','A_WRITABLE','PROVIDER_B','PROVIDER_CACHE','PROVIDER_NC')},
                               capture_output=True,text=True,check=True)
         plan=json.loads(result.stdout)
         self.assertEqual(plan['cases'],list(EXPECTED))
+        self.assertEqual(plan['providers'],{'cache':'B hostname','nc':'B hostname'})
         self.assertEqual(plan['thread_counts'],[32,64,128])
         self.assertEqual(plan['rounds'],[{'case':c,'threads_A':n,'threads_B':n} for c in EXPECTED for n in (32,64,128)])
         self.assertEqual(plan['A_workload'],'100% read')
@@ -190,7 +191,8 @@ printf '%s %s' "$OPT" "$YCSB_INDEXES" > "$1/build-routing"
                     env=dict(os.environ,PATH=str(tools)+':'+os.environ['PATH'],
                         YCSB_UB_ROLE='A',YCSB_UB_CASE='bwtree' if case=='legacy' else case,
                         YCSB_UB_SUITE='0' if case=='legacy' else '1',
-                        YCSB_UB_OUTPUT=str(out),OPT='1',A_WRITABLE='0')
+                        YCSB_UB_OUTPUT=str(out),OPT='1',A_WRITABLE='0',
+                        PROVIDER_CACHE='provider-82',PROVIDER_NC='provider-81')
                     for key in ('YCSB_UB_BUNDLE','YCSB_UB_FIXTURE','YCSB_UB_CONFIG',
                                 'SIZE_MB','NC_SIZE_MB','SHERMAN_NC_SIZE_MB'):
                         env.pop(key,None)
@@ -201,8 +203,10 @@ printf '%s %s' "$OPT" "$YCSB_INDEXES" > "$1/build-routing"
                     args=json.loads((out/'peer-args.json').read_text())
                     def value(flag): return args[args.index(flag)+1]
                     self.assertEqual(value('--expected-opt'),str(opt))
-                    self.assertEqual(value('--size-mb'),'65536')
-                    self.assertEqual(value('--nc-size-mb'),'65536' if case.startswith('sherman+') else '16384')
+                    self.assertEqual(value('--size-mb'),'49152')
+                    self.assertEqual(value('--nc-size-mb'),'16384')
+                    self.assertEqual(value('--cache-provider'),'provider-82')
+                    self.assertEqual(value('--nc-provider'),'provider-81')
                     self.assertEqual('--suite' in args,case!='legacy')
                     if case!='legacy':
                         self.assertEqual(value('--db'),db)

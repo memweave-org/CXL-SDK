@@ -44,8 +44,9 @@ public:
   }
 };
 std::vector<int> worker_cpus;
-const char* env(const char* key) {
+const char* env(const char* key,const char* fallback=nullptr) {
   const char* value=std::getenv(key);
+  if((!value || !*value) && fallback) value=std::getenv(fallback);
   if(!value || !*value) throw std::runtime_error(std::string("Missing ")+key);
   return value;
 }
@@ -303,8 +304,8 @@ void prepare(utils::Properties& props) {
   prepare_cxl();
 #else
   if(owner) {
-    if(!all_nc && !rpc) create_ub_memory(name.c_str(),data_size,env("YCSB_UB_PROVIDER"),UINT32_MAX,UbMappingMode::Cacheable);
-    create_ub_memory((name+"-nc").c_str(),nc_size,env("YCSB_UB_PROVIDER"),UINT32_MAX,UbMappingMode::Noncacheable);
+    if(!all_nc && !rpc) create_ub_memory(name.c_str(),data_size,env("YCSB_UB_CACHE_PROVIDER","YCSB_UB_PROVIDER"),UINT32_MAX,UbMappingMode::Cacheable);
+    create_ub_memory((name+"-nc").c_str(),nc_size,env("YCSB_UB_NC_PROVIDER","YCSB_UB_PROVIDER"),UINT32_MAX,UbMappingMode::Noncacheable);
   }
   nc=map_ub_memory((name+"-nc").c_str(),reinterpret_cast<void*>(nc_base),nc_size,UbMappingMode::Noncacheable);
   if(!all_nc && !rpc) data=map_ub_memory(name.c_str(),reinterpret_cast<void*>(data_base),data_size,UbMappingMode::Cacheable,!owner);

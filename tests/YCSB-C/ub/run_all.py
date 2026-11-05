@@ -84,6 +84,8 @@ def main(argv=None):
         for case in CASES}
     plan={'cases':list(CASES),'thread_counts':counts,'rounds':rounds,'common':common,'spec':str(spec),'workload':spec.read_text(),
           'memory_by_case':memory_by_case,
+          'providers':{'cache':os.environ.get('PROVIDER_CACHE') or os.environ.get('PROVIDER_B') or 'B hostname',
+                       'nc':os.environ.get('PROVIDER_NC') or os.environ.get('PROVIDER_B') or 'B hostname'},
           'A_workload':'100% read','B_workload':'90% read / 10% update',
           'update_semantics':'replace-existing-key','fixture':args.fixture}
     plan['sherman']={'mapping':'NC only','writers':'B only, no RPC',

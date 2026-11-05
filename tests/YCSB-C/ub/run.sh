@@ -67,5 +67,6 @@ if [[ $case_name != bwtree || $suite == 1 ]]; then
 fi
 if [[ ${YCSB_UB_FIXTURE:-0} == 1 ]]; then suite_args+=(--fixture); fi
 python3 ./peer.py --role "$role" --peer "$B_IP" --port "$PORT" --provider "$PROVIDER_B" \
+  --cache-provider "${PROVIDER_CACHE:-}" --nc-provider "${PROVIDER_NC:-}" \
   --binary "$out/ycsbc" --output "$out" --threads "$threads" --records "$RECORDS" --ops "$OPS" \
   --size-mb "$SIZE_MB" --nc-size-mb "$NC_SIZE_MB" --spec "$spec" --ini "$PWD/config.ini" --expected-opt "$OPT" "${cpu_args[@]}" "${suite_args[@]}" "${backend_args[@]}"

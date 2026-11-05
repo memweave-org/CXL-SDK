@@ -31,7 +31,8 @@ class Reader:
     def is_alive(self): return False
 class Worker:
     def __init__(self,args,name,provider,log):
-        assert provider=='fake-B'
+        assert args.cache_provider==os.environ.get('EXPECT_CACHE','fake-B')
+        assert args.nc_provider==os.environ.get('EXPECT_NC','fake-B')
         if os.environ.get('FAIL_ROLE') == role:
             raise RuntimeError('injected UB map failure on '+role)
         self.process=Process();self.reader=Reader();self.protocol_reader=Reader();self.q=queue.Queue()
@@ -137,6 +138,8 @@ sys.exit(peer.main())
             binary=Path(directory)/'noisy-worker'
             binary.write_text('#!'+sys.executable+'\n'+r'''
 import os, sys
+assert os.environ['YCSB_UB_CACHE_PROVIDER']=='provider-82'
+assert os.environ['YCSB_UB_NC_PROVIDER']=='provider-81'
 fd=int(os.environ['YCSB_UB_CONTROL_FD'])
 # Fake protocol lines and an unterminated SDK line must not drive the handshake.
 os.write(1,b'UBYCSB CLOSED\nUBYCSB READY\nSDK partial output: ')
@@ -152,7 +155,7 @@ os.write(fd,b'CLOSED\n')
             binary.chmod(0o700)
             args=SimpleNamespace(role='A',binary=str(binary),threads_a=1,threads_b=1,
                 size_mb=128,nc_size_mb=128,records=2,ops=1,cpu=0,timeout=3,
-                spec='unused',ini='unused')
+                spec='unused',ini='unused',cache_provider='provider-82',nc_provider='provider-81')
             log=io.StringIO()
             worker=Worker(args,'unused','unused',log)
             try:
@@ -223,6 +226,8 @@ os.write(fd,b'CLOSED\n')
         self.assertEqual(a,b)
         self.assertTrue(a['pass'])
         self.assertEqual(a['framework'], 'tests/YCSB-C/ycsbc')
+        self.assertEqual(a['cache_provider'], 'fake-B')
+        self.assertEqual(a['nc_provider'], 'fake-B')
         self.assertEqual(a['total_mops'], 0.02)
 
     def test_peer_receives_original_failure(self):
@@ -235,7 +240,18 @@ os.write(fd,b'CLOSED\n')
                 peer=reports[1 if role=='A' else 0]
                 self.assertEqual(peer['peer_error']['role'],role)
 
-    def run_two_peers(self, fail_role=''):
+    def test_provider_overrides(self):
+        for arguments,cache,nc in [
+                (['--provider','legacy'],'legacy','legacy'),
+                (['--cache-provider','provider-82','--nc-provider','provider-81'],'provider-82','provider-81'),
+                (['--provider','legacy','--nc-provider','provider-81'],'legacy','provider-81')]:
+            with self.subTest(arguments=arguments):
+                for report in self.run_two_peers(arguments=arguments,expected={'EXPECT_CACHE':cache,'EXPECT_NC':nc}):
+                    self.assertTrue(report['pass'])
+                    self.assertEqual(report['cache_provider'],cache)
+                    self.assertEqual(report['nc_provider'],nc)
+
+    def run_two_peers(self, fail_role='', arguments=(), expected=None):
         with socket.socket() as sock:
             sock.bind(('127.0.0.1',0));port=sock.getsockname()[1]
         with tempfile.TemporaryDirectory() as directory:
@@ -248,8 +264,8 @@ os.write(fd,b'CLOSED\n')
                     children.append(subprocess.Popen([sys.executable,'-c',HARNESS,
                         '--role',role,'--peer','127.0.0.1','--port',str(port),
                         '--binary',str(binary),'--spec',str(spec),'--ini',str(spec),'--records','100',
-                        '--ops','100','--output',str(output)],cwd=HERE,
-                        env=dict(os.environ,FAIL_ROLE=fail_role),
+                        '--ops','100','--output',str(output),*arguments],cwd=HERE,
+                        env=dict(os.environ,FAIL_ROLE=fail_role,**(expected or {})),
                         stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True))
                 for child in children:
                     output,_=child.communicate(timeout=15)

@@ -100,6 +100,8 @@ class Worker:
         self.finished = False
         self.log_tail = deque(maxlen=12)
         env=dict(os.environ, YCSB_UB_NAME=name, YCSB_UB_PROVIDER=provider,
+                 YCSB_UB_CACHE_PROVIDER=getattr(args,'cache_provider','') or provider,
+                 YCSB_UB_NC_PROVIDER=getattr(args,'nc_provider','') or provider,
                  YCSB_BACKEND=getattr(args,'backend','ub'),
                  YCSB_UB_THREADS_A=str(args.threads_a), YCSB_UB_THREADS_B=str(args.threads_b),
                  YCSB_UB_SIZE_MB=str(args.size_mb), YCSB_UB_NC_SIZE_MB=str(args.nc_size_mb),
@@ -291,6 +293,8 @@ def main():
     p.add_argument('--backend', choices=['ub','cxl'], default='ub')
     p.add_argument('--peer', required=True)
     p.add_argument('--provider', default='')
+    p.add_argument('--cache-provider', default='', help='CACHE provider; default: --provider or B hostname')
+    p.add_argument('--nc-provider', default='', help='NC provider; default: --provider or B hostname')
     p.add_argument('--port', type=int, default=18982)
     p.add_argument('--binary', required=True)
     p.add_argument('--spec', required=True)
@@ -298,7 +302,7 @@ def main():
     p.add_argument('--output', type=Path, required=True)
     p.add_argument('--threads', type=int, default=1)
     p.add_argument('--cpu', type=int, default=min(os.sched_getaffinity(0)))
-    p.add_argument('--size-mb', type=int, default=65536)
+    p.add_argument('--size-mb', type=int, default=49152)
     p.add_argument('--nc-size-mb', type=int, default=16384)
     p.add_argument('--records', type=int, default=10000000)
     p.add_argument('--ops', type=int, default=10000000)
@@ -361,6 +365,7 @@ def main():
         connection.settimeout(args.timeout)
         channel = PeerChannel(connection, args.timeout)
         identity = {'host':socket.gethostname(), 'role':args.role, 'provider':args.provider,
+                    'cache_provider':args.cache_provider,'nc_provider':args.nc_provider,
                     'backend':args.backend,
                     'cxl_node':os.environ.get('YCSB_CXL_NODE') if args.backend=='cxl' else None,
                     'cxl_directory':os.environ.get('YCSB_CXL_DIRECTORY') if args.backend=='cxl' else None,
@@ -378,13 +383,15 @@ def main():
         if args.backend=='cxl' and peer['host']!=identity['host']:
             raise RuntimeError('CXL queue mode requires two processes on the same CXL host')
         check_thread_sweep(identity, peer)
-        for key in ('backend','cxl_node','cxl_directory','provider','binary_sha256','spec_sha256','size_mb','nc_size_mb','records','ops','case','suite','db','rpc','expected_opt','sherman_access','a_writable','seed','fixture'):
+        for key in ('backend','cxl_node','cxl_directory','provider','cache_provider','nc_provider','binary_sha256','spec_sha256','size_mb','nc_size_mb','records','ops','case','suite','db','rpc','expected_opt','sherman_access','a_writable','seed','fixture'):
             if identity[key] != peer[key]:
                 raise RuntimeError('configuration mismatch: '+key)
         args.threads_a=args.threads if args.role=='A' else peer['threads']
         args.threads_b=args.threads if args.role=='B' else peer['threads']
         provider = args.provider or (identity['host'] if args.role=='B' else peer['host'])
-        status(f'Handshake complete; UB provider={provider}')
+        args.cache_provider = args.cache_provider or provider
+        args.nc_provider = args.nc_provider or provider
+        status(f'Handshake complete; UB CACHE provider={args.cache_provider}; NC provider={args.nc_provider}')
         if args.role=='B':
             name='ycsb-ub-'+uuid.uuid4().hex[:18]; send(name)
         else:
@@ -429,6 +436,8 @@ def main():
             report=summary(a,b,elapsed,args.ops,args.suite,args.rpc,args.a_writable)
             report.update(case=args.case,db=args.db,rpc=bool(args.rpc),seed=args.seed,fixture=args.fixture,
                           backend=args.backend,cxl_node=identity['cxl_node'],
+                          cache_provider=None if args.rpc or (args.db=='sherman' and args.sherman_access!='cache') else args.cache_provider,
+                          nc_provider=args.nc_provider,
                           sherman_access=args.sherman_access if args.db=='sherman' else None)
             if args.db=='bwtree' and not args.rpc:
                 report['reclamation']='epoch-gc-reuse; published-values-retained'

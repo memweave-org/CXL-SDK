@@ -64,7 +64,7 @@ value 也分别使用直接访问或本地复制。两项都关闭本地内部�
 每个 1024 字节节点占一个 4 KiB 分配槽并带独立 NC 版本头，避免修改/分裂时版本锁别名。
 NC 模式不再分配旧的 4 MiB 哈希版本表；CACHE 模式仍使用它。独立版本头和哈希版本表
 都是适配层机制，与上游节点/叶子记录内嵌的 front/rear 版本字段不同。
-Sherman 的 NC 包含节点、value 和原框架的 trace/控制数据，默认 65536 MiB，
+Sherman 的 NC 包含节点、value 和原框架的 trace/控制数据，默认 16384 MiB，
 由 `SHERMAN_NC_SIZE_MB` 单独配置；耗尽即报错。
 这里的 NC 是 UB SDK 的 non-cacheable 映射，不是 cacheable 内存上的 streaming 指令。
 
@@ -259,17 +259,20 @@ NC 的分配空间分成互不重叠的两半，分配偏移位于各进程本�
 容器只编译；Python 控制器与 `ycsbc` 都在物理机运行。
 默认镜像 `shm-pcc-sdk:ub-glibc2.39-gcc12.3.1`、SDK `/usr/local/ubs_mem`。
 编译为非 PIE，两端校验二进制及 workload SHA256。
-B 的 SDK provider 默认使用 B 系统 hostname；可在配置中填写 `PROVIDER_B`。
+CACHE 和 NC 的 SDK provider 默认都使用 B（82）的系统 hostname。
+`PROVIDER_CACHE` / `PROVIDER_NC` 可分别指定 SDK 拓扑主机名；不是 TCP 连接 IP。
+兼容原 `PROVIDER_B`：显式设置时作为两块内存的共同默认 provider，分项配置优先。
+仍由 B 创建两个对象并在双方解除映射后释放，内存所在机器不改变 A/B 分配区的划分。
 TCP 控制端口默认 18982。
 
-默认 CACHE 65536 MiB（64 GiB）、NC 16384 MiB（16 GiB）。
-Sherman 两项不创建 CACHE 对象，默认 NC 65536 MiB（64 GiB）；
+默认 CACHE 49152 MiB（48 GiB）、NC 16384 MiB（16 GiB），均由 B（82）提供。
+Sherman 两项不创建 CACHE 对象，默认 NC 16384 MiB（16 GiB）；
 其节点和 value 均在 NC，不能沿用其他索引的元数据预算。
-NC 分配区由 A/B 各占一半，B 预生成两端全部操作序列；仅 trace 数组就超过 1 GiB，
+NC 分配区由 A/B 各占一半，B 预生成两端全部操作序列；默认每端 1000 万次操作的 trace 数组约 1.8 GiB，
 还需容纳索引元数据，以及 Sherman 模式的节点和 value。
 `SIZE_MB` 覆盖 CACHE 容量（RPC 中为每端本地索引的 DRAM 容量）；
 显式设置 `NC_SIZE_MB` 会覆盖所有 case，`SHERMAN_NC_SIZE_MB` 可进一步单独覆盖 Sherman。
-例如 `SIZE_MB=65536 NC_SIZE_MB=16384 SHERMAN_NC_SIZE_MB=65536 bash run_all.sh`。
+例如 `SIZE_MB=49152 NC_SIZE_MB=16384 SHERMAN_NC_SIZE_MB=16384 bash run_all.sh`。
 `--dry-run` 的 `memory_by_case` 和每轮结果记录实际共享容量；RPC 的 CACHE 为 0。
 更大负载可能仍需增加容量。耗尽即报错，不回退到私有堆。
 UB arena 按进程分区，`MemoryManager::free()` 将安全释放的块合并并供后续分配复用，

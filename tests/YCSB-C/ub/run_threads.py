@@ -11,15 +11,11 @@ import subprocess
 import tempfile
 
 from run_all import ResourceGuard
+from cpu_affinity import select_cpus
 
 HERE = Path(__file__).resolve().parent
 def check_cpus(counts, first, allowed):
-    required = set(range(first, first + max(counts)))
-    missing = sorted(required - set(allowed))
-    if first < 0 or missing:
-        raise ValueError(f'The {max(counts)}-worker round needs available CPUs '
-                         f'{first}..{first + max(counts) - 1}; missing={missing}. '
-                         'Set CPU_A/CPU_B to an available consecutive CPU range.')
+    return select_cpus(max(counts), first, allowed)
 
 
 def identify_role():
@@ -43,7 +39,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--dry-run', action='store_true')
     parser.add_argument('--thread-counts', nargs='+', type=int,
-                        default=os.environ.get('THREAD_COUNTS', '32 64 128 192').split())
+                        default=os.environ.get('THREAD_COUNTS', '32 64 128').split())
     parser.add_argument('--output', type=Path)
     parser.add_argument('--bundle', type=Path, help='Reuse an already built BwTree bundle')
     args = parser.parse_args(argv)
@@ -73,7 +69,7 @@ def main(argv=None):
         role = identify_role()
         allowed = os.sched_getaffinity(0)
         cpu = int(os.environ.get('CPU_' + role) or min(allowed))
-        check_cpus(counts, cpu, allowed)
+        cpus = check_cpus(counts, cpu, allowed)
     except (ValueError, KeyError, OSError) as error:
         parser.error(str(error))
 
@@ -82,8 +78,10 @@ def main(argv=None):
     out.mkdir(parents=True, exist_ok=True)
     if any(out.iterdir()):
         parser.error('Output directory must be empty; previous samples must not be overwritten')
-    (out / 'manifest.json').write_text(json.dumps({**plan, 'role': role, 'cpu_start': cpu}, indent=2))
+    (out / 'manifest.json').write_text(json.dumps({**plan, 'role': role, 'cpu_start': cpu,
+                                                 'worker_cpus': cpus}, indent=2))
     print(f'[{role}] BwTree OPT={opt}, A reads only, no RPC; per-host workers={counts}; output={out}', flush=True)
+    print(f'[{role}] Allowed logical CPUs={len(allowed)}; selected CPU IDs={cpus}', flush=True)
     lock_path = Path(tempfile.gettempdir()) / 'cxl-sdk-ub-benchmark.lock'
     lock = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o666)
     if os.fstat(lock).st_uid == os.getuid():

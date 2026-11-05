@@ -9,6 +9,7 @@ void reply(const std::string& message);
 int threads(int machine); // B is native master 0, A is follower 1.
 int first_thread(int machine);
 int cpu_start();
+int worker_cpu(unsigned local_index);
 bool nc_data();
 bool nc_direct_data();
 void prepare(utils::Properties& props);

@@ -77,7 +77,7 @@ public:
       cpu_id = cpu_allocator.allocate_cpu(1);
 #endif
 #ifdef YCSB_UB_TWO_HOST
-      cpu_id=ycsbc_ub::cpu_start()+i-first;
+      cpu_id=ycsbc_ub::worker_cpu(i-first);
       cpu_set_t allowed, selected; CPU_ZERO(&selected);
       if(cpu_id<0 || cpu_id>=CPU_SETSIZE || sched_getaffinity(0,sizeof(allowed),&allowed) || !CPU_ISSET(cpu_id,&allowed))
         throw std::runtime_error("Requested UB worker CPU is unavailable");

@@ -13,6 +13,7 @@ import subprocess
 import threading
 import time
 import uuid
+from cpu_affinity import select_cpus
 
 
 class PeerFailure(RuntimeError):
@@ -112,10 +113,10 @@ class Worker:
                  '-server_threads', str(args.threads_a+args.threads_b),
                  '-dbnum', '1', '-valuesize', str(getattr(args, 'value_size', 8)), '-P', args.spec, '-C', args.ini]
         host_threads=args.threads_a if args.role=='A' else args.threads_b
-        cpus=set(range(args.cpu,args.cpu+host_threads))
-        if not cpus.issubset(os.sched_getaffinity(0)):
-            raise RuntimeError('Requested host CPU range is unavailable')
-        command=['taskset','-c',','.join(map(str,sorted(cpus)))]+command
+        cpus=select_cpus(host_threads,args.cpu,os.sched_getaffinity(0))
+        env['YCSB_UB_CPUS']=','.join(map(str,cpus))
+        command=['taskset','-c',env['YCSB_UB_CPUS']]+command
+        print(f'[{args.role}] Worker threads={host_threads}; CPU IDs={cpus}',flush=True)
         # SDK output can interleave at byte boundaries. Never parse stdout for control.
         read_fd, write_fd = os.pipe()
         env['YCSB_UB_CONTROL_FD'] = str(write_fd)
@@ -294,6 +295,10 @@ def main():
     p.add_argument('--seed', type=int, default=20261104)
     p.add_argument('--fixture', action='store_true', help='Explicit local file-backed SDK correctness test only')
     args = p.parse_args()
+    try:
+        args.worker_cpus=select_cpus(args.threads,args.cpu,os.sched_getaffinity(0))
+    except ValueError as error:
+        p.error(str(error))
     if args.fixture and not os.environ.get('UBSM_TEST_DIRECTORY'):
         p.error('--fixture requires UBSM_TEST_DIRECTORY')
     worker = channel = connection = server = None
@@ -343,7 +348,8 @@ def main():
                     'threads':args.threads,'size_mb':args.size_mb,'nc_size_mb':args.nc_size_mb,'records':args.records,'ops':args.ops,
                     'case':args.case,'suite':args.suite,'db':args.db,'rpc':args.rpc,'expected_opt':args.expected_opt,
                     'sherman_access':args.sherman_access,'a_writable':args.a_writable,'seed':args.seed,'fixture':args.fixture,
-                    'thread_sweep':os.environ.get('YCSB_UB_THREAD_SWEEP')}
+                    'thread_sweep':os.environ.get('YCSB_UB_THREAD_SWEEP'),
+                    'worker_cpus':args.worker_cpus}
         status('TCP connected; exchanging configuration and binary hashes')
         send(identity); peer = receive()
         if peer['role'] == args.role or (not args.fixture and peer['host'] == identity['host']):

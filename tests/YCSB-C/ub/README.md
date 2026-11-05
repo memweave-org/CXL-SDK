@@ -104,11 +104,15 @@ cd /mnt/disk1/wfn/CXL-SDK/tests/YCSB-C
 bash ./run.sh
 ```
 
-默认 OPT，`run.sh` 顺序运行每端 **32、64、128、192 个事务 worker**。
+默认 OPT，`run.sh` 顺序运行每端 **32、64、128 个事务 worker**。
 每档 A/B 的 worker 数相同，A 100% read，B 90% read / 10% update，不使用 RPC。
 每端只编译一次；每档使用新共享对象，等两端完成清理后才进入下一档。
 `bash run.sh --dry-run` 可查看计划；`THREAD_COUNTS="32 64" bash run.sh` 可选择部分档位。
-启动前检查最大档位的连续可用 CPU 范围，可用 `CPU_A`、`CPU_B` 指定各端起始 CPU。
+启动前检查最大档位需要的可用逻辑 CPU 数，可用 `CPU_A`、`CPU_B` 指定各端起始 CPU。
+从进程允许的 CPU 列表中按编号选择，跳过编号空洞；每个 worker 绑定一个不同的 CPU。
+例如允许 `0-49,96-239` 时，128 档使用 `0-49,96-173`，不会因缺少编号 50 而失败。
+日志、`manifest.json` 和每档 `config.json` 记录实际 CPU 列表；总数不足时明确报出
+可用数量，不自动把多个 worker 挤到同一个 CPU。更新后需要重新编译，旧 bundle 不支持此绑定方式。
 启动及运行期间沿用 `run_all` 的测试互斥检查，两端握手额外核对扫描列表和当前档位；
 失败或受干扰即停止，当前档保留 `invalid.json`，不进入下一档。
 结果位于 `ub/result-threads-A-*` / `ub/result-threads-B-*` 的 `threads-32` 等子目录，

@@ -1,5 +1,6 @@
 #include "core/ub_session.h"
 #ifdef YCSB_UB_TWO_HOST
+#include "core/ub_cpu.h"
 #include "shm/mm.h"
 #include "shm/ub.h"
 #include "utils/bypass_cache.h"
@@ -23,6 +24,7 @@ size_t data_size=0,nc_size=0;
 std::string name;
 bool owner=false;
 bool all_nc=false, direct_nc=false;
+std::vector<int> worker_cpus;
 const char* env(const char* key) {
   const char* value=std::getenv(key);
   if(!value || !*value) throw std::runtime_error(std::string("Missing ")+key);
@@ -109,7 +111,8 @@ int threads(int machine) {
   return n;
 }
 int first_thread(int machine) { return machine==0?0:threads(0); }
-int cpu_start() { return std::stoi(env("YCSB_UB_CPU")); }
+int worker_cpu(unsigned local_index) { return worker_cpus.at(local_index); }
+int cpu_start() { return worker_cpu(0); }
 bool nc_data() { return all_nc; }
 bool nc_direct_data() { return direct_nc; }
 void prepare(utils::Properties& props) {
@@ -120,6 +123,13 @@ void prepare(utils::Properties& props) {
   if(writable && std::string(writable)!="0")
     throw std::runtime_error("A is always read-only; YCSB_UB_A_WRITABLE must be 0");
   owner=SimThreadInfo::is_master();
+  worker_cpus=parse_worker_cpus(std::getenv("YCSB_UB_CPUS"),threads(owner?0:1),
+                                std::stoi(env("YCSB_UB_CPU")));
+  cpu_set_t allowed;
+  if(sched_getaffinity(0,sizeof(allowed),&allowed))
+    throw std::runtime_error("Cannot read UB worker CPU affinity");
+  for(int cpu:worker_cpus)
+    if(!CPU_ISSET(cpu,&allowed)) throw std::runtime_error("Requested UB worker CPU is unavailable");
   const char* access=std::getenv("YCSB_UB_SHERMAN_ACCESS");
   all_nc=props["dbname"]=="sherman" && access && std::string(access)!="cache";
   direct_nc=all_nc && std::string(access)=="nc-direct";

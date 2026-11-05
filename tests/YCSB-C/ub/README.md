@@ -1,6 +1,6 @@
 # 原 YCSB-C 框架的双机 UB 模式
 
-## 八项顺序对比：run_all
+## 八种模式 × 三档 worker：run_all
 
 两机拉取同一版本并配置 `ub/config.sh`，在 B 先执行、A 随后执行：
 
@@ -24,12 +24,15 @@ bash run_all.sh
 所有 case 的 A 都只读，禁止 UPDATE/INSERT；B 使用 90% read / 10% update，
 update 替换已有 key 的 value。两端均使用 Zipfian 分布，每项新建共享对象，
 使用相同初始记录数、每端操作数、线程数和 `SEED`，并核对各端操作类型/key
-序列 hash 在八项间一致。B 的比例由随机抽样决定，小样本不保证恰好 90/10。
-默认初始 100,000 条，每端 1 线程、1,000,000 次操作（合计 2,000,000）。
+序列 hash 在相同 worker 数的八种模式间一致。B 的比例由随机抽样决定，小样本不保证恰好 90/10。
+每种模式依次测试每端 **32、64、128 个 worker**，共 24 轮，A/B 数量相同。
+默认初始 100,000 条，每端每轮共 1,000,000 次操作（两端合计 2,000,000），不是每个 worker 一百万次。
+可用 `--thread-counts 32 64` 或 `THREAD_COUNTS="32 64"` 选择档位；启动时检查
+当前进程允许的 CPU 数，并按允许的编号绑定 worker，支持 CPU 编号不连续。
 首次可在两端用相同参数执行：
 
 ```sh
-RECORDS=1000 OPS=1000 bash run_all.sh
+RECORDS=1000 OPS=1000 bash run_all.sh --thread-counts 32
 ```
 
 BwTree/ClevelHash 继续使用已有启动 CACHE 失效及发布修复，A CACHE 只读、B 可写。
@@ -71,13 +74,18 @@ YCSB_UB_SUITE=1 YCSB_UB_CASE=bwtree bash run.sh
 以上命令逐轮运行，等 A/B 均退出后再切换。未指定 case 的旧 `run.sh` 仍保留下面的默认行为。
 按配置中的 IP 自动识别角色，也可设置 `YCSB_UB_ROLE=A` / `B`。不设置 `YCSB_UB_FIXTURE`。
 
-结果位于 `ub/result-all-A-*` / `ub/result-all-B-*`：每项一个子目录，包含 worker/control 日志、
-配置和 `result.json`；`summary.json` / `summary.csv` 汇总八项。失败立即停止后续项，
-失败目录写入 `invalid.json`，失败样本不计入成功汇总。
+结果位于 `ub/result-all-A-*` / `ub/result-all-B-*`，每轮使用
+`<case>/threads-32`、`threads-64` 或 `threads-128` 子目录，包含 worker/control 日志、
+配置和 `result.json`；`summary.json` / `summary.csv` 汇总 24 轮并记录两端 worker 数。
+NOOPT/OPT 各构建一次，全部轮次复用；每轮新建共享对象，清理完成后再进入下一轮。
+两端握手核对完整模式列表、线程数列表和当前轮次。失败立即停止，失败目录写入
+`invalid.json`，失败样本不计入成功汇总。
+`run_all.sh` 和 `run.sh` 的线程扫描都不检测其他进程、CPU 负载或其他测试，不等待
+机器空闲，也不因外部负载中止。自身命令失败仍会停止后续轮次。
 
-`test_run_all_control.py` 只检查脚本选项和计划，不运行索引或计时。
+`test_run_all_control.py` 检查 24 轮调度、参数传递、构建复用、失败停止和汇总，不运行索引或计时。
 `test_run_all.py --bundles /absolute/path/fixture-bundles` 用文件映射 SDK 替身执行八项
-真实双进程接线检查（35 条记录、每端 128 次操作），结果不能用于 UB 性能或缓存一致性结论。
+真实双进程接线检查（固定每端 1 worker、35 条记录、每端 128 次操作），结果不能用于 UB 性能或缓存一致性结论。
 可选 CMake 参数 `YCSB_BUILD_SHERMAN_CONTRACT=ON` 构建 `sherman_nc_contract`，
 仅供 fixture SDK 下验证双进程对称插入、分裂、更新和读取，不输出吞吐或耗时。
 

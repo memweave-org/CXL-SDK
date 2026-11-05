@@ -25,7 +25,7 @@ def main():
         sock.bind(('127.0.0.1',0)); port=sock.getsockname()[1]
     env=dict(os.environ,UBSM_TEST_DIRECTORY=str(root/'objects'),B_IP='127.0.0.1',
              PORT=str(port),CPU_A=str(min(os.sched_getaffinity(0))),CPU_B=str(min(os.sched_getaffinity(0))),
-             THREADS_A='1',THREADS_B='1',RECORDS='35',OPS='128',SIZE_MB='128',NC_SIZE_MB='128',A_WRITABLE='0')
+             THREAD_COUNTS='1',THREADS_A='1',THREADS_B='1',RECORDS='35',OPS='128',SIZE_MB='128',NC_SIZE_MB='128',A_WRITABLE='0')
     children=[]; logs=[]
     try:
         for role in ('B','A'):
@@ -47,7 +47,8 @@ def main():
                     assert case[host]['errors']==0 and case[host]['reads']+case[host]['writes']==128
                 assert case['A']['reads']==128 and case['A']['writes']==0,case
                 assert case['B']['writes']>0,case
-                text=(root/role/case['case']/'worker.log').read_text()
+                assert case['threads_A']==case['threads_B']==1
+                text=(root/role/case['case']/'threads-1'/'worker.log').read_text()
                 nc=case['case'].startswith('sherman+nc-')
                 assert f'CACHE={"NONE" if nc else "READ" if role=="A" else "RW"} NC=RW' in text
                 if nc:

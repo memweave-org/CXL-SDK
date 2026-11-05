@@ -22,6 +22,7 @@ void *data=nullptr,*nc=nullptr;
 size_t data_size=0,nc_size=0;
 std::string name;
 bool owner=false;
+bool all_nc=false, direct_nc=false;
 const char* env(const char* key) {
   const char* value=std::getenv(key);
   if(!value || !*value) throw std::runtime_error(std::string("Missing ")+key);
@@ -109,11 +110,16 @@ int threads(int machine) {
 }
 int first_thread(int machine) { return machine==0?0:threads(0); }
 int cpu_start() { return std::stoi(env("YCSB_UB_CPU")); }
+bool nc_data() { return all_nc; }
+bool nc_direct_data() { return direct_nc; }
 void prepare(utils::Properties& props) {
   (void)control_fd(); // Fail before allocating UB objects if launched without a controller.
   install_fault_reporter();
   stage("prepare UB session");
   owner=SimThreadInfo::is_master();
+  const char* access=std::getenv("YCSB_UB_SHERMAN_ACCESS");
+  all_nc=props["dbname"]=="sherman" && access && std::string(access)!="cache";
+  direct_nc=all_nc && std::string(access)=="nc-direct";
   name=env("YCSB_UB_NAME");
   data_size=megabytes("YCSB_UB_SIZE_MB"); nc_size=megabytes("YCSB_UB_NC_SIZE_MB");
   if(SimThreadInfo::worker_machine_count!=2 ||
@@ -131,20 +137,22 @@ void prepare(utils::Properties& props) {
   for(const char* key:{"insertproportion","scanproportion","readmodifywriteproportion"})
     if(std::stod(props.GetProperty(key,"0"))!=0) throw std::runtime_error("Only read/update are supported");
   if(owner) {
-    create_ub_memory(name.c_str(),data_size,env("YCSB_UB_PROVIDER"),UINT32_MAX,UbMappingMode::Cacheable);
+    if(!all_nc) create_ub_memory(name.c_str(),data_size,env("YCSB_UB_PROVIDER"),UINT32_MAX,UbMappingMode::Cacheable);
     create_ub_memory((name+"-nc").c_str(),nc_size,env("YCSB_UB_PROVIDER"),UINT32_MAX,UbMappingMode::Noncacheable);
   }
   nc=map_ub_memory((name+"-nc").c_str(),reinterpret_cast<void*>(nc_base),nc_size,UbMappingMode::Noncacheable);
   const bool a_writable=std::getenv("YCSB_UB_A_WRITABLE") && std::string(std::getenv("YCSB_UB_A_WRITABLE"))=="1";
-  data=map_ub_memory(name.c_str(),reinterpret_cast<void*>(data_base),data_size,UbMappingMode::Cacheable,!owner && !a_writable);
-  size_t half=((nc_size-4096)/2)&~size_t(63);
+  if(!all_nc) data=map_ub_memory(name.c_str(),reinterpret_cast<void*>(data_base),data_size,UbMappingMode::Cacheable,!owner && !a_writable);
+  size_t half=((nc_size-4096)/2)&~size_t(all_nc ? 4095 : 63);
   ub_configure_arena(true,static_cast<char*>(nc)+4096+(owner?0:half),half);
   // A never allocates data. Leaving its CACHE allocator unconfigured catches violations.
-  if(a_writable) ub_configure_arena(false,static_cast<char*>(data)+(owner?0:data_size/2),data_size/2);
-  else if(owner) ub_configure_arena(false,data,data_size);
-  cacheable=MemoryManager(false);
-  stage("both UB mappings ready; allocators configured");
-  std::cerr<<"YCSB framework UB role="<<(owner?"B":"A")<<" CACHE="<<(owner||a_writable?"RW":"READ")<<" NC=RW"<<std::endl;
+  if(!all_nc) {
+    if(a_writable) ub_configure_arena(false,static_cast<char*>(data)+(owner?0:data_size/2),data_size/2);
+    else if(owner) ub_configure_arena(false,data,data_size);
+  }
+  cacheable=MemoryManager(all_nc);
+  stage("UB mappings ready; allocators configured");
+  std::cerr<<"YCSB framework UB role="<<(owner?"B":"A")<<" CACHE="<<(all_nc?"NONE":owner||a_writable?"RW":"READ")<<" NC=RW"<<std::endl;
 }
 void* control_header() { return nc; }
 void ready() {
@@ -154,9 +162,12 @@ void ready() {
 }
 void await_cleanup() { command(owner?"release":"close"); }
 void finish() {
-  unmap_ub_memory(data,data_size); data=nullptr;
+  if(data) { unmap_ub_memory(data,data_size); data=nullptr; }
   unmap_ub_memory(nc,nc_size); nc=nullptr;
-  if(owner) { destroy_ub_memory(name.c_str());destroy_ub_memory((name+"-nc").c_str()); }
+  if(owner) {
+    if(!all_nc) destroy_ub_memory(name.c_str());
+    destroy_ub_memory((name+"-nc").c_str());
+  }
   reply("CLOSED");
 }
 }

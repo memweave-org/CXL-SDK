@@ -23,8 +23,13 @@ cp -r "$ROOT/ds/BwTree/src" "$ROOT/ds/BwTree/BTree" "$context/src/ds/BwTree/"
 mkdir -p "$context/src/ds/BwTree/benchmark"
 cp -r "$ROOT/ds/BwTree/benchmark/art" "$context/src/ds/BwTree/benchmark/"
 cp "$ROOT/ds/BwTree/CMakeLists.txt" "$context/src/ds/BwTree/"
-if [[ $YCSB_INDEXES != bwtree ]]; then
+if [[ ";$YCSB_INDEXES;" == *';clevel-hash;'* ]]; then
   cp -r "$ROOT/ds/ClevelHash" "$context/src/ds/"
+fi
+if [[ ";$YCSB_INDEXES;" == *';sherman;'* ]]; then
+  cp -r "$ROOT/ds/Sherman" "$ROOT/ds/cxl_transport" "$context/src/ds/"
+  mkdir -p "$context/src/drivers/uncached_ram"
+  cp "$ROOT/drivers/uncached_ram/uncached_ram_uapi.h" "$context/src/drivers/uncached_ram/"
 fi
 for dir in include core db follower; do cp -r "../$dir" "$context/src/tests/YCSB-C/"; done
 cp ../CMakeLists.txt ../build.sh ../ycsbc.cc "$context/src/tests/YCSB-C/"

@@ -1,5 +1,85 @@
 # 原 YCSB-C 框架的双机 UB 模式
 
+## 八项顺序对比：run_all
+
+两机拉取同一版本并配置 `ub/config.sh`，在 B 先执行、A 随后执行：
+
+```sh
+cd /mnt/disk1/wfn/CXL-SDK/tests/YCSB-C
+bash run_all.sh --dry-run
+bash run_all.sh
+```
+
+| case | 编译模式 | A 的读 / 更新 | B 的读 / 更新 | 节点内存 |
+| --- | --- | --- | --- | --- |
+| bwtree | NOOPT | 直接读 / NC RPC | 本地索引 | CACHE |
+| bwtree+opt | OPT | 直接读 / NC RPC | 本地索引 | CACHE |
+| bwtree+rpc | NOOPT | 全部 NC RPC | 本地索引 | CACHE |
+| clevelhash | NOOPT | 直接读 / NC RPC | 本地索引 | CACHE |
+| clevelhash+opt | OPT | 直接读 / NC RPC | 本地索引 | CACHE |
+| clevelhash+rpc | NOOPT | 全部 NC RPC | 本地索引 | CACHE |
+| sherman+nc-direct | NOOPT | 原地 load/store | 原地 load/store | NC |
+| sherman+nc-memcpy | NOOPT | memcpy 到本地，修改后 memcpy 回去 | 同左 | NC |
+
+两端均为 90% read / 10% update、Zipfian；update 替换已有 key 的 value。
+每项新建共享对象，使用相同初始记录数、每端操作数、线程数和 `SEED`，并核对
+各端操作类型/key 序列 hash 在八项间一致。比例由随机抽样决定，小样本不保证恰好 90/10。
+默认初始 100,000 条，每端 1 线程、1,000,000 次操作（合计 2,000,000）。
+首次可在两端用相同参数执行：
+
+```sh
+RECORDS=1000 OPS=1000 bash run_all.sh
+```
+
+BwTree/ClevelHash 继续使用已有启动 CACHE 失效及发布修复，默认 A CACHE 只读、B 可写。
+普通模式仅 A 的更新交给 B；RPC 模式 A 的全部操作交给 B。RPC 使用 NC mailbox，
+每个 client 一个同步请求，B 一个服务线程；默认服务线程和 B client 共用 `CPU_B`。
+`A_WRITABLE=1` 可显式允许普通 BwTree/ClevelHash 的 A 直接更新 CACHE。
+
+Sherman 两项都只 mmap 一块 NC 对象，节点、value、根、锁和控制信息全部在 NC，
+不创建 CACHE 映射。A/B 分配区互不重叠，双方对称执行读写，RPC 完成数必须为 0。
+`nc-direct` 直接遍历 NC 节点字段，在锁和版本保护下原地修改、分裂节点；
+`nc-memcpy` 将完整节点复制到本地做查询或修改，然后复制修改部分回 NC。
+value 也分别使用直接访问或本地复制。两项都关闭本地内部节点缓存，保持相同节点布局；
+每个 1024 字节节点占一个 4 KiB 分配槽并带独立 NC 版本头，避免修改/分裂时版本锁别名。
+`NC_SIZE_MB` 包含节点、value 和原框架的 trace/控制数据，默认 1024 MiB，耗尽即报错。
+这里的 NC 是 UB SDK 的 non-cacheable 映射，不是 cacheable 内存上的 streaming 指令。
+
+每端构建包含三种索引的 NOOPT/OPT 两份二进制，按 case 复用。镜像需包含 CityHash、
+Boost coroutine/context 开发库；`Dockerfile.openEuler` 已配置这些依赖。
+构建仍在 Docker 内，worker 在物理机运行；Sherman 不需要 RDMA 或 memcached。
+`--build-only --output /absolute/path/build-result` 只构建，后续用
+`--bundles /absolute/path/build-result/bundles` 复用。两端握手核对 case、访问模式、
+参数、workload 和二进制 SHA256，结果还检查实际 OPT 和 NC 模式，旧 bundle 不能冒充新模式。
+
+单项也可通过同一入口选择，例如两端各执行：
+
+```sh
+YCSB_UB_CASE=bwtree+rpc bash run.sh
+YCSB_UB_CASE=sherman+nc-direct bash run.sh
+YCSB_UB_CASE=sherman+nc-memcpy bash run.sh
+# 使用批量 workload 语义的 BwTree 非 OPT：
+YCSB_UB_SUITE=1 YCSB_UB_CASE=bwtree bash run.sh
+```
+
+以上命令逐轮运行，等 A/B 均退出后再切换。未指定 case 的旧 `run.sh` 仍保留下面的默认行为。
+按配置中的 IP 自动识别角色，也可设置 `YCSB_UB_ROLE=A` / `B`。不设置 `YCSB_UB_FIXTURE`。
+
+结果位于 `ub/result-all-A-*` / `ub/result-all-B-*`：每项一个子目录，包含 worker/control 日志、
+配置和 `result.json`；`summary.json` / `summary.csv` 汇总八项。失败立即停止后续项，
+失败目录写入 `invalid.json`，失败样本不计入成功汇总。
+`exclusivity.jsonl` 记录驱动 PID、CPU、时间、退出情况；启动前连续确认空闲，运行中
+发现其他测试则只停止自身进程组并标记样本无效。识别器无法覆盖任意命名的调度程序，
+运行者仍须确认两台机器的其他整轮测试已经结束；受干扰项须待资源释放后重跑。
+
+`test_run_all_control.py` 只检查脚本选项和计划，不运行索引或计时。
+`test_run_all.py --bundles /absolute/path/fixture-bundles` 用文件映射 SDK 替身执行八项
+真实双进程接线检查（35 条记录、每端 128 次操作），结果不能用于 UB 性能或缓存一致性结论。
+可选 CMake 参数 `YCSB_BUILD_SHERMAN_CONTRACT=ON` 构建 `sherman_nc_contract`，
+仅供 fixture SDK 下验证双进程对称插入、分裂、更新和读取，不输出吞吐或耗时。
+
+## 旧单项 BwTree 入口
+
 两机同步完整源码，在各自物理机执行一次：
 
 ```sh

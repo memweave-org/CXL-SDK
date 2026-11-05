@@ -101,11 +101,12 @@ class Worker:
                  YCSB_UB_THREADS_A=str(args.threads_a), YCSB_UB_THREADS_B=str(args.threads_b),
                  YCSB_UB_SIZE_MB=str(args.size_mb), YCSB_UB_NC_SIZE_MB=str(args.nc_size_mb),
                  YCSB_UB_RECORDS=str(args.records), YCSB_UB_OPS=str(args.ops), YCSB_UB_CPU=str(args.cpu))
-        for key in ('YCSB_UB_SUITE','YCSB_UB_RPC','YCSB_UB_A_WRITABLE','YCSB_UB_SEED'):
+        for key in ('YCSB_UB_SUITE','YCSB_UB_RPC','YCSB_UB_A_WRITABLE','YCSB_UB_SEED','YCSB_UB_SHERMAN_ACCESS'):
             env.pop(key,None)
         if getattr(args,'suite',False):
             env.update(YCSB_UB_SUITE='1',YCSB_UB_RPC=str(args.rpc),
-                       YCSB_UB_A_WRITABLE=str(args.a_writable),YCSB_UB_SEED=str(args.seed))
+                       YCSB_UB_A_WRITABLE=str(args.a_writable),YCSB_UB_SEED=str(args.seed),
+                       YCSB_UB_SHERMAN_ACCESS=args.sherman_access)
         command=[args.binary, '-db', getattr(args,'db','bwtree'), '-machinenum', '2',
                  '-machineno', '0' if args.role=='B' else '1',
                  '-server_threads', str(args.threads_a+args.threads_b),
@@ -272,8 +273,10 @@ def main():
     p.add_argument('--timeout', type=int, default=1200)
     p.add_argument('--suite', action='store_true')
     p.add_argument('--case', default='bwtree')
-    p.add_argument('--db', choices=['bwtree','clevelhash'], default='bwtree')
+    p.add_argument('--db', choices=['bwtree','clevelhash','sherman'], default='bwtree')
     p.add_argument('--rpc', type=int, choices=[0,1], default=0)
+    p.add_argument('--expected-opt', type=int, choices=[0,1], help='Reject a reused binary with the wrong OPT mode')
+    p.add_argument('--sherman-access', choices=['cache','nc-direct','nc-memcpy'], default='cache')
     p.add_argument('--a-writable', type=int, choices=[0,1], default=0)
     p.add_argument('--seed', type=int, default=20261104)
     p.add_argument('--fixture', action='store_true', help='Explicit local file-backed SDK correctness test only')
@@ -325,12 +328,13 @@ def main():
                     'binary_sha256':hashlib.sha256(Path(args.binary).read_bytes()).hexdigest(),
                     'spec_sha256':hashlib.sha256(Path(args.spec).read_bytes()).hexdigest(),
                     'threads':args.threads,'size_mb':args.size_mb,'nc_size_mb':args.nc_size_mb,'records':args.records,'ops':args.ops,
-                    'case':args.case,'suite':args.suite,'db':args.db,'rpc':args.rpc,'a_writable':args.a_writable,'seed':args.seed,'fixture':args.fixture}
+                    'case':args.case,'suite':args.suite,'db':args.db,'rpc':args.rpc,'expected_opt':args.expected_opt,
+                    'sherman_access':args.sherman_access,'a_writable':args.a_writable,'seed':args.seed,'fixture':args.fixture}
         status('TCP connected; exchanging configuration and binary hashes')
         send(identity); peer = receive()
         if peer['role'] == args.role or (not args.fixture and peer['host'] == identity['host']):
             raise RuntimeError('expected two different physical hosts and roles')
-        for key in ('provider','binary_sha256','spec_sha256','size_mb','nc_size_mb','records','ops','case','suite','db','rpc','a_writable','seed','fixture'):
+        for key in ('provider','binary_sha256','spec_sha256','size_mb','nc_size_mb','records','ops','case','suite','db','rpc','expected_opt','sherman_access','a_writable','seed','fixture'):
             if identity[key] != peer[key]:
                 raise RuntimeError('configuration mismatch: '+key)
         args.threads_a=args.threads if args.role=='A' else peer['threads']
@@ -372,9 +376,17 @@ def main():
             if not result.startswith('RESULT '): raise RuntimeError(result)
             a=json.loads(result[7:]); b=receive()
             elapsed=time.monotonic()-start
+            if args.expected_opt is not None and any(r['bwtree_opt'] != bool(args.expected_opt) for r in (a,b)):
+                raise RuntimeError('Binary OPT mode does not match requested case; rebuild bundles')
+            if args.db=='sherman' and args.sherman_access!='cache':
+                if any(r.get('nc_data') is not True or r.get('nc_direct') != (args.sherman_access=='nc-direct') for r in (a,b)):
+                    raise RuntimeError('Worker does not implement the requested NC access mode; rebuild bundles')
             status('Original YCSB execution complete; collecting native throughput and cleaning up')
             report=summary(a,b,elapsed,args.ops,args.suite,args.rpc,args.a_writable)
-            report.update(case=args.case,db=args.db,rpc=bool(args.rpc),seed=args.seed,fixture=args.fixture)
+            report.update(case=args.case,db=args.db,rpc=bool(args.rpc),seed=args.seed,fixture=args.fixture,
+                          sherman_access=args.sherman_access if args.db=='sherman' else None)
+            if args.db=='sherman' and args.sherman_access!='cache':
+                report['cache_policy']='NC-only A-RW/B-RW'
             worker.finish('close')
             send('RELEASE')
             if receive()!='CLOSED': raise RuntimeError('B cleanup failed')

@@ -13,6 +13,10 @@
 #ifdef ENABLE_CLEVEL_HASH_DB
 #include "db/clevel_hash_db.h"
 #endif
+#ifdef ENABLE_SHERMAN_DB
+#include "Tree.h"
+#include <mutex>
+#endif
 
 namespace ycsbc {
 namespace {
@@ -23,6 +27,65 @@ bool enabled(const char* key) {
 template<class T, class... Args> T* shared_new(Args&&... args) {
   return new (shared_atomic_memory().malloc(sizeof(T))) T(std::forward<Args>(args)...);
 }
+#ifdef ENABLE_SHERMAN_DB
+DSM* local_dsm=nullptr;
+Tree* local_tree=nullptr;
+std::once_flag sherman_attach;
+class ShermanDB final : public DB {
+  nt<uint64_t>* locks_;
+  nt<void*>* roots_;
+  void* sequences_;
+  bool nc_nodes_, direct_reads_;
+  void attach(bool create) {
+    cxl_transport::configure_nc_nodes(nc_nodes_,direct_reads_);
+    cxl_transport::configure_shared_sequences(sequences_);
+    if(!create) { global_lock_table=locks_; root_ptr_list=roots_; }
+    DSMConfig config;
+    config.machineNR=1;
+    // DSM IDs persist across the load and transaction thread lifetimes.
+    config.cacheConfig.cacheSize=((SimThreadInfo::worker_thread_count+20)*12+1023)/1024;
+    local_dsm=DSM::getInstance(config);
+    local_dsm->set_process_id(SimThreadInfo::worker_machine_id);
+    local_dsm->set_direct_nc_reads(direct_reads_);
+    local_dsm->registerThread();
+    local_tree=new Tree(local_dsm,0,create);
+    std::cout << "SHERMAN_ACCESS nodes=" << (nc_nodes_ ? "NC" : "CACHE")
+              << " reads=" << (direct_reads_ ? "direct-fields" : "page-copy") << std::endl;
+    if(create) { locks_=global_lock_table; roots_=root_ptr_list; }
+  }
+ public:
+  ShermanDB() {
+    const char* access=std::getenv("YCSB_UB_SHERMAN_ACCESS");
+    const std::string mode=access ? access : "cache";
+    if(mode!="cache" && mode!="nc-direct" && mode!="nc-memcpy")
+      throw std::runtime_error("Unknown Sherman access mode: "+mode);
+    nc_nodes_=mode!="cache"; direct_reads_=mode=="nc-direct";
+    sequences_=cxl_transport::allocate_atomic(cxl_transport::shared_sequences_bytes());
+    std::memset(sequences_,0,cxl_transport::shared_sequences_bytes());
+    std::call_once(sherman_attach,[&]{ attach(true); });
+  }
+  int ThreadInit() override {
+    std::call_once(sherman_attach,[&]{ attach(false); });
+    local_dsm->registerThread(); local_tree->register_thread(0);
+    return SimThreadInfo::worker_thread_id;
+  }
+  int ReadInternal(uint64_t key,uintptr_t& value) override {
+    if(!local_tree->search(key,value)) return kErrorNoData;
+    if(nc_nodes_ && !direct_reads_) {
+      thread_local std::vector<char> scratch;
+      scratch.resize(VALUE_ADDR_SIZE);
+      void* (*volatile copy)(void*, const void*, size_t)=&std::memcpy;
+      copy(scratch.data(),reinterpret_cast<void*>(value),scratch.size());
+      utils::AccessValueByAddress(reinterpret_cast<uintptr_t>(scratch.data()));
+    } else utils::AccessValueByAddress(value);
+    return kOK;
+  }
+  int InsertInternal(uint64_t key,uintptr_t value) override {
+    local_tree->insert(key,value); return kOK;
+  }
+  int UpdateInternal(uint64_t key,uintptr_t value) override { return InsertInternal(key,value); }
+};
+#endif
 
 // One outstanding request per A client. Only NC addresses/numbers cross hosts;
 // no std::function, stack reference, or process-private buffer crosses the queue.
@@ -126,6 +189,9 @@ DB* CreateUbDB(const std::string& name,int threads) {
 #endif
 #ifdef ENABLE_CLEVEL_HASH_DB
   if(name=="clevelhash") target=shared_new<CLevelHashDB>(threads+1);
+#endif
+#ifdef ENABLE_SHERMAN_DB
+  if(name=="sherman") target=shared_new<ShermanDB>();
 #endif
   if(!target) throw std::runtime_error("UB index not built: "+name);
   return shared_new<UbDB>(target);

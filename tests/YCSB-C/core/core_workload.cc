@@ -8,6 +8,7 @@
 
 #include "core/core_workload.h"
 #include "core/db_config.h"
+#include "core/ub_session.h"
 
 #include <cassert>
 #include <string>
@@ -20,6 +21,32 @@
 
 using std::string;
 using ycsbc::CoreWorkload;
+
+namespace {
+void initialize_value(void* value, size_t bytes) {
+#ifdef YCSB_UB_TWO_HOST
+  if(ycsbc_ub::nc_data()) {
+    const auto* pattern=reinterpret_cast<const unsigned char*>(&bytes);
+    if(ycsbc_ub::nc_direct_data()) {
+      auto* dst=static_cast<volatile unsigned char*>(value);
+      for(size_t i=0;i<bytes;++i) dst[i]=pattern[i%sizeof(bytes)];
+    } else {
+      std::vector<unsigned char> scratch(bytes);
+      for(size_t i=0;i<bytes;++i) scratch[i]=pattern[i%sizeof(bytes)];
+      void* (*volatile copy)(void*,const void*,size_t)=&std::memcpy;
+      copy(value,scratch.data(),bytes);
+    }
+    mfence();
+    return;
+  }
+#endif
+  for(size_t i=0;i+sizeof(bytes)<=bytes;i+=sizeof(bytes))
+    memcpy(static_cast<char*>(value)+i,&bytes,sizeof(bytes));
+#ifdef YCSB_UB_TWO_HOST
+  clwb(value,bytes);
+#endif
+}
+}
 
 const string CoreWorkload::TABLENAME_PROPERTY = "table";
 const string CoreWorkload::TABLENAME_DEFAULT = "usertable";
@@ -238,13 +265,7 @@ void *CoreWorkload::BuildPrefillValue() {
   void *value = malloc(value_size);
 #endif
   assert(value != nullptr);
-  size_t copy_size = sizeof(value_size);
-  for (size_t i = 0; i + copy_size <= value_size; i += copy_size) {
-    memcpy(static_cast<char *>(value) + i, &value_size, copy_size);
-  }
-#ifdef YCSB_UB_TWO_HOST
-  clwb(value, value_size);
-#endif
+  initialize_value(value,value_size);
   return value;
 }
 
@@ -259,12 +280,6 @@ void *CoreWorkload::BuildTransactionValue() {
   void *value = malloc(value_size);
 #endif
   assert(value != nullptr);
-  size_t copy_size = sizeof(value_size);
-  for (size_t i = 0; i + copy_size <= value_size; i += copy_size) {
-    memcpy(static_cast<char *>(value) + i, &value_size, copy_size);
-  }
-#ifdef YCSB_UB_TWO_HOST
-  clwb(value, value_size);
-#endif
+  initialize_value(value,value_size);
   return value;
 }

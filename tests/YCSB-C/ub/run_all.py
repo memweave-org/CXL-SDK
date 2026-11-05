@@ -8,6 +8,8 @@ from pathlib import Path
 import signal
 import subprocess
 import tempfile
+import threading
+import time
 
 from cpu_affinity import select_cpus
 
@@ -17,16 +19,39 @@ CASES=('bwtree','bwtree+opt','bwtree+rpc',
 
 
 def run_command(command, env, log):
-    process=subprocess.Popen(command,cwd=HERE,env=env,stdout=log,stderr=subprocess.STDOUT,start_new_session=True)
+    run_commands([(command,env,log)])
+
+
+def run_commands(commands):
+    processes=[]
+    readers=[]
+    def output(process,log):
+        with process.stdout:
+            for line in process.stdout:
+                log.write(line); log.flush()
+                print(line,end='',flush=True)
     try:
-        if process.wait():
-            raise RuntimeError(f'Command exited {process.returncode}: {command}; see {log.name}')
+        for command,env,log in commands:
+            process=subprocess.Popen(command,cwd=HERE,env=env,stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,text=True,errors='replace',bufsize=1,start_new_session=True)
+            processes.append((process,command,log))
+            reader=threading.Thread(target=output,args=(process,log),daemon=True)
+            reader.start(); readers.append(reader)
+        while True:
+            statuses=[process.poll() for process,_,_ in processes]
+            for status,(_,command,log) in zip(statuses,processes):
+                if status not in (None,0):
+                    raise RuntimeError(f'Command exited {status}: {command}; see {log.name}')
+            if all(status is not None for status in statuses): break
+            time.sleep(0.1)
     finally:
-        if process.poll() is None:
-            os.killpg(process.pid,signal.SIGTERM)
-            try: process.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                os.killpg(process.pid,signal.SIGKILL); process.wait()
+        for process,_,_ in processes:
+            if process.poll() is None:
+                os.killpg(process.pid,signal.SIGTERM)
+                try: process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    os.killpg(process.pid,signal.SIGKILL); process.wait()
+        for reader in readers: reader.join(timeout=3)
 
 
 def main(argv=None):
@@ -52,7 +77,13 @@ def main(argv=None):
     spec=Path(os.environ['SPEC'])
     if not spec.is_absolute(): spec=HERE/spec
     common={key:os.environ[key] for key in ('A_IP','B_IP','RECORDS','OPS','SIZE_MB','NC_SIZE_MB','SEED','A_WRITABLE')}
+    memory_by_case={case:{
+        'cache_mb':0 if case.startswith('sherman+nc-') or case.endswith('+rpc') else int(common['SIZE_MB']),
+        'nc_mb':int(os.environ.get('SHERMAN_NC_SIZE_MB',common['NC_SIZE_MB'])
+                    if case.startswith('sherman+nc-') else common['NC_SIZE_MB'])}
+        for case in CASES}
     plan={'cases':list(CASES),'thread_counts':counts,'rounds':rounds,'common':common,'spec':str(spec),'workload':spec.read_text(),
+          'memory_by_case':memory_by_case,
           'A_workload':'100% read','B_workload':'90% read / 10% update',
           'update_semantics':'replace-existing-key','fixture':args.fixture}
     plan['sherman']={'mapping':'NC only','writers':'B only, no RPC',
@@ -103,6 +134,7 @@ def main(argv=None):
                 directory=out/stage; directory.mkdir(parents=True)
                 mode='opt' if case.endswith('+opt') else 'noopt'
                 env=dict(os.environ,YCSB_UB_ROLE=role,YCSB_UB_CASE=case,YCSB_UB_OUTPUT=str(directory),
+                         NC_SIZE_MB=str(memory_by_case[case]['nc_mb']),
                          YCSB_UB_SUITE='1',THREADS_A=str(n),THREADS_B=str(n),
                          YCSB_UB_THREAD_SWEEP=json.dumps({'runner':'run_all','cases':list(CASES),
                              'counts':counts,'case':case,'threads':n}),
@@ -117,7 +149,7 @@ def main(argv=None):
                 if n in baselines and hashes!=baselines[n]:
                     raise RuntimeError(f'{stage} generated a different workload trace for {n} workers')
                 baselines[n]=hashes
-                result.update(threads_A=n,threads_B=n)
+                result.update(threads_A=n,threads_B=n,memory=memory_by_case[case])
                 (directory/'result.json').write_text(json.dumps(result,indent=2))
                 reports.append(result)
                 print(f'[{role}] PASS {stage}: A {result["A"]["reads"]}R/{result["A"]["writes"]}W, B {result["B"]["reads"]}R/{result["B"]["writes"]}W',flush=True)

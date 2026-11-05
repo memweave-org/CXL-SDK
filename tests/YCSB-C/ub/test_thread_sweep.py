@@ -40,6 +40,51 @@ class ThreadSweepTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, '128-worker round.*available=127'):
                 run_threads.check_cpus([32, 64, 128], 8, allowed)
 
+    def test_cxl_entry_preserves_ab_workload_and_uses_32_workers_per_role(self):
+        env={k:v for k,v in os.environ.items() if not k.startswith('YCSB_') and
+             k not in ('THREAD_COUNTS','OPT','A_WRITABLE')}
+        for entry in ([str(HERE.parent/'run.sh'),'--backend','cxl'],
+                      [str(HERE.parent/'run_shm_ds.sh'),'-mode=cxl_two_process']):
+            result=subprocess.run(['bash',*entry,'--dry-run'],env=env,text=True,capture_output=True,check=True)
+            plan=json.loads(result.stdout)
+            self.assertEqual(plan['backend'],'cxl')
+            self.assertEqual(plan['rounds'],[{'threads_A':32,'threads_B':32}])
+            self.assertEqual(plan['A_workload'],'100% read')
+            self.assertEqual(plan['B_workload'],'90% read / 10% update')
+            self.assertFalse(plan['rpc'])
+
+    def test_cxl_pair_reuses_coordinator_and_separate_cpu_sets(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary); out=root/'results'; bundle=root/'bundle'
+            (bundle/'lib').mkdir(parents=True); (bundle/'ycsbc').touch()
+            calls=[]
+            def pair(commands):
+                self.assertEqual(len(commands),2)
+                envs={env['YCSB_UB_ROLE']:env for command,env,log in commands}
+                self.assertEqual(set(envs),{'A','B'})
+                for command,env,log in commands:
+                    self.assertEqual(command,['bash','run.sh'])
+                    self.assertEqual(env['YCSB_BACKEND'],'cxl')
+                    self.assertEqual(env['THREADS_A'],'32')
+                    self.assertEqual(env['THREADS_B'],'32')
+                self.assertEqual(envs['B']['CPU_B'],'0')
+                self.assertEqual(envs['A']['CPU_A'],'32')
+                self.assertEqual(envs['A']['YCSB_CXL_DIRECTORY'],envs['B']['YCSB_CXL_DIRECTORY'])
+                result={'pass':True,'common_seconds':1.0,'total_mops':0.0002,
+                        'A':{'reads':100,'writes':0,'bwtree_opt':True},
+                        'B':{'reads':90,'writes':10,'bwtree_opt':True}}
+                (Path(envs['A']['YCSB_UB_OUTPUT'])/'result.json').write_text(json.dumps(result))
+                calls.append(envs)
+            env={'SPEC':str(HERE/'workloadb_90read.spec'),'RECORDS':'100','OPS':'100'}
+            with patch.dict(os.environ,env,clear=True),patch.object(run_threads,'run_commands',pair), \
+                 patch.object(run_threads.os,'sched_getaffinity',return_value=set(range(64))), \
+                 patch.object(run_threads.tempfile,'mkdtemp',return_value=str(root/'backing')):
+                (root/'backing').mkdir()
+                self.assertEqual(run_threads.main(['--backend','cxl','--cxl-node','0','--thread-counts','32',
+                                                   '--bundle',str(bundle),'--output',str(out)]),0)
+            self.assertEqual(len(calls),1)
+            self.assertFalse((root/'backing').exists())
+
     def test_handshake_rejects_different_rounds_or_counts(self):
         identity = {'thread_sweep': '{"counts":[32,64,128],"threads":32}', 'threads': 32}
         check_thread_sweep(identity, dict(identity))

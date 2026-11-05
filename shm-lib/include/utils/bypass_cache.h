@@ -43,10 +43,12 @@ static inline void mfence() {
 }
 
 // Cache operations with architecture-specific implementations
+// The split layout is also used by native CXL, which has no UB range registry.
+// Dispatch through that registry only when a real UB backend is selected.
 #ifdef __x86_64__
 // x86_64 implementations
 static inline void clflush(const void* data, size_t len, bool fence = true) {
-#if defined(SHM_UB_SPLIT)
+#if defined(SHM_UB_SPLIT) && (defined(SHM_LIB_WITH_UBSM) || defined(SHM_LIB_WITH_UB))
     ub_cache_maintenance(data, len, false, fence);
     return;
 #elif defined(SHM_LIB_WITH_UBSM)
@@ -69,7 +71,7 @@ static inline void clflush(const void* data, size_t len, bool fence = true) {
 }
 
 static inline void clwb(const void* data, size_t len, bool fence = true) {
-#if defined(SHM_UB_SPLIT)
+#if defined(SHM_UB_SPLIT) && (defined(SHM_LIB_WITH_UBSM) || defined(SHM_LIB_WITH_UB))
     ub_cache_maintenance(data, len, true, fence);
     return;
 #elif defined(SHM_LIB_WITH_UBSM)
@@ -96,7 +98,7 @@ static inline void clwb(const void* data, size_t len, bool fence = true) {
 #elif defined(__aarch64__)
 // ARM64 implementations
 static inline void clflush(const void* data, size_t len, bool fence = true) {
-#if defined(SHM_UB_SPLIT)
+#if defined(SHM_UB_SPLIT) && (defined(SHM_LIB_WITH_UBSM) || defined(SHM_LIB_WITH_UB))
     ub_cache_maintenance(data, len, false, fence);
     return;
 #elif defined(SHM_LIB_WITH_UBSM)
@@ -116,7 +118,7 @@ static inline void clflush(const void* data, size_t len, bool fence = true) {
 }
 
 static inline void clwb(const void* data, size_t len, bool fence = true) {
-#if defined(SHM_UB_SPLIT)
+#if defined(SHM_UB_SPLIT) && (defined(SHM_LIB_WITH_UBSM) || defined(SHM_LIB_WITH_UB))
     ub_cache_maintenance(data, len, true, fence);
     return;
 #elif defined(SHM_LIB_WITH_UBSM)

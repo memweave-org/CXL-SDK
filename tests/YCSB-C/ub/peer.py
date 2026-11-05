@@ -4,6 +4,7 @@ import argparse
 from collections import deque
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import queue
@@ -99,6 +100,7 @@ class Worker:
         self.finished = False
         self.log_tail = deque(maxlen=12)
         env=dict(os.environ, YCSB_UB_NAME=name, YCSB_UB_PROVIDER=provider,
+                 YCSB_BACKEND=getattr(args,'backend','ub'),
                  YCSB_UB_THREADS_A=str(args.threads_a), YCSB_UB_THREADS_B=str(args.threads_b),
                  YCSB_UB_SIZE_MB=str(args.size_mb), YCSB_UB_NC_SIZE_MB=str(args.nc_size_mb),
                  YCSB_UB_RECORDS=str(args.records), YCSB_UB_OPS=str(args.ops), YCSB_UB_CPU=str(args.cpu))
@@ -235,18 +237,33 @@ def summary(a, b, seconds, ops, suite=False, rpc=0, a_writable=0):
     for role, result in [('A', a), ('B', b)]:
         if result['role'] != role or result['reads'] + result['writes'] != ops or result['errors']:
             raise RuntimeError('incomplete/failed workload on ' + role)
-    if (a_writable or a['writes']) or seconds <= 0:
+    if (a_writable or a['writes']) or not math.isfinite(seconds) or seconds <= 0:
         raise RuntimeError('invalid read-only workload or duration')
     if b['framework_total_operations'] != 2*ops or a['bwtree_opt'] != b['bwtree_opt']:
         raise RuntimeError('framework result mismatch')
     control_seconds=seconds
     seconds=b['seconds']
-    if seconds <= 0: raise RuntimeError('invalid framework duration')
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise RuntimeError('invalid framework duration')
+    # A's monotonic control window starts before RUN is sent and ends after
+    # B's RESULT arrives, so it encloses B's transaction timer. Allow a small
+    # cross-host clock-rate/measurement margin, never publish impossible Mops.
+    tolerance = max(0.05, control_seconds * 0.01)
+    if seconds > control_seconds + tolerance:
+        raise RuntimeError(f'Timing mismatch: B seconds={seconds:.6f} exceeds '
+                           f'controller_seconds={control_seconds:.6f}; '
+                           'throughput is invalid; rebuild workers with the steady-clock timer')
     if suite:
-        expected_rpc=ops if rpc else 0
-        if b.get('rpc_completed')!=expected_rpc:
-            raise RuntimeError('RPC completion count mismatch')
-        transport='mpmc-shared-queue' if rpc else 'none'
+        for local,remote in ((a,b),(b,a)):
+            if rpc:
+                sent=local.get('rpc_sent')
+                if (sent is None or sent!=local.get('rpc_expected_remote') or
+                    sent!=remote.get('rpc_completed') or
+                    local.get('rpc_local',-1)+sent!=ops or local.get('index_storage')!='local-dram'):
+                    raise RuntimeError('Partitioned RPC routing/completion/storage mismatch')
+            elif local.get('rpc_completed')!=0:
+                raise RuntimeError('Unexpected RPC completion in direct mode')
+        transport='bidirectional-mpmc-shared-queue' if rpc else 'none'
         if any(r.get('rpc_transport')!=transport for r in (a,b)):
             raise RuntimeError('RPC transport mismatch; rebuild bundles')
     return {'framework': 'tests/YCSB-C/ycsbc', 'controller_seconds': control_seconds, 'pass': True, 'A': a, 'B': b, 'total_operations': 2*ops,
@@ -254,7 +271,7 @@ def summary(a, b, seconds, ops, suite=False, rpc=0, a_writable=0):
             'total_mops': 2*ops/seconds/1e6, 'update_semantics': 'replace-existing-key' if suite else 'fresh-insert',
             'A_observed_read_fraction': a['reads']/ops,
             'B_observed_read_fraction': b['reads']/ops,
-            'cache_policy': 'A-RO/B-RW',
+            'cache_policy': 'local-DRAM partitions; NC RPC transport' if rpc else 'A-RO/B-RW',
             'reclamation': 'retain-until-both-processes-exit', 'bwtree_opt': b.get('bwtree_opt', False)}
 
 
@@ -271,6 +288,7 @@ def check_thread_sweep(identity, peer):
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--role', choices=['A', 'B'], required=True)
+    p.add_argument('--backend', choices=['ub','cxl'], default='ub')
     p.add_argument('--peer', required=True)
     p.add_argument('--provider', default='')
     p.add_argument('--port', type=int, default=18982)
@@ -280,7 +298,7 @@ def main():
     p.add_argument('--output', type=Path, required=True)
     p.add_argument('--threads', type=int, default=1)
     p.add_argument('--cpu', type=int, default=min(os.sched_getaffinity(0)))
-    p.add_argument('--size-mb', type=int, default=32768)
+    p.add_argument('--size-mb', type=int, default=65536)
     p.add_argument('--nc-size-mb', type=int, default=16384)
     p.add_argument('--records', type=int, default=10000000)
     p.add_argument('--ops', type=int, default=10000000)
@@ -343,6 +361,9 @@ def main():
         connection.settimeout(args.timeout)
         channel = PeerChannel(connection, args.timeout)
         identity = {'host':socket.gethostname(), 'role':args.role, 'provider':args.provider,
+                    'backend':args.backend,
+                    'cxl_node':os.environ.get('YCSB_CXL_NODE') if args.backend=='cxl' else None,
+                    'cxl_directory':os.environ.get('YCSB_CXL_DIRECTORY') if args.backend=='cxl' else None,
                     'binary_sha256':hashlib.sha256(Path(args.binary).read_bytes()).hexdigest(),
                     'spec_sha256':hashlib.sha256(Path(args.spec).read_bytes()).hexdigest(),
                     'threads':args.threads,'size_mb':args.size_mb,'nc_size_mb':args.nc_size_mb,'records':args.records,'ops':args.ops,
@@ -352,10 +373,12 @@ def main():
                     'worker_cpus':args.worker_cpus}
         status('TCP connected; exchanging configuration and binary hashes')
         send(identity); peer = receive()
-        if peer['role'] == args.role or (not args.fixture and peer['host'] == identity['host']):
+        if peer['role'] == args.role or (args.backend=='ub' and not args.fixture and peer['host'] == identity['host']):
             raise RuntimeError('expected two different physical hosts and roles')
+        if args.backend=='cxl' and peer['host']!=identity['host']:
+            raise RuntimeError('CXL queue mode requires two processes on the same CXL host')
         check_thread_sweep(identity, peer)
-        for key in ('provider','binary_sha256','spec_sha256','size_mb','nc_size_mb','records','ops','case','suite','db','rpc','expected_opt','sherman_access','a_writable','seed','fixture'):
+        for key in ('backend','cxl_node','cxl_directory','provider','binary_sha256','spec_sha256','size_mb','nc_size_mb','records','ops','case','suite','db','rpc','expected_opt','sherman_access','a_writable','seed','fixture'):
             if identity[key] != peer[key]:
                 raise RuntimeError('configuration mismatch: '+key)
         args.threads_a=args.threads if args.role=='A' else peer['threads']
@@ -405,7 +428,10 @@ def main():
             status('Original YCSB execution complete; collecting native throughput and cleaning up')
             report=summary(a,b,elapsed,args.ops,args.suite,args.rpc,args.a_writable)
             report.update(case=args.case,db=args.db,rpc=bool(args.rpc),seed=args.seed,fixture=args.fixture,
+                          backend=args.backend,cxl_node=identity['cxl_node'],
                           sherman_access=args.sherman_access if args.db=='sherman' else None)
+            if args.db=='bwtree' and not args.rpc:
+                report['reclamation']='epoch-gc-reuse; published-values-retained'
             if args.db=='sherman' and args.sherman_access!='cache':
                 report['cache_policy']='NC-only; A reads, B reads/updates'
             worker.finish('close')

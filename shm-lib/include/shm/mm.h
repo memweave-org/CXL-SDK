@@ -10,6 +10,7 @@
 #include <cstring>
 #include <new>
 #include <utility>
+#include <thread>
 
 #ifndef CACHE_LINE_SIZE
 #define CACHE_LINE_SIZE (64)
@@ -111,7 +112,27 @@ private:
 
 extern MemoryManager cacheable;
 extern MemoryManager ub_atomic_memory;
+// An RPC-owned index is private to one process, including its atomic metadata.
+// Scope the override to index calls; transport/control allocations stay shared.
+inline thread_local MemoryManager* private_index_memory = nullptr;
+class PrivateIndexMemoryScope {
+  MemoryManager* previous_;
+public:
+  explicit PrivateIndexMemoryScope(MemoryManager* memory)
+      : previous_(private_index_memory) { private_index_memory = memory; }
+  ~PrivateIndexMemoryScope() { private_index_memory = previous_; }
+  PrivateIndexMemoryScope(const PrivateIndexMemoryScope&) = delete;
+  PrivateIndexMemoryScope& operator=(const PrivateIndexMemoryScope&) = delete;
+};
+template<class F> std::thread index_memory_thread(F work) {
+  auto* memory = private_index_memory;
+  return std::thread([memory, work=std::move(work)]() mutable {
+    PrivateIndexMemoryScope scope(memory);
+    work();
+  });
+}
 inline MemoryManager& shared_atomic_memory(MemoryManager& fallback = cacheable) {
+  if (private_index_memory) return *private_index_memory;
 #ifdef SHM_UB_SPLIT
   return ub_atomic_memory;
 #else

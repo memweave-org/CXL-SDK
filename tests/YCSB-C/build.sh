@@ -15,6 +15,8 @@ for variant in "$@"; do
     esac
     build_dir="build_$lower_variant"
     if [ "${YCSB_UB_TWO_HOST:-0}" = 1 ]; then build_dir="${build_dir}_ub"; fi
+    if [ "${YCSB_CXL_TWO_PROCESS:-0}" = 1 ]; then build_dir="build_${lower_variant}_cxl"; fi
+    build_dir=${YCSB_BUILD_DIR:-$build_dir}
     mkdir -p "$build_dir" || { echo "Failed to create directory $build_dir"; exit 1; }
     # Environment selection overrides a cached API; SDK paths remain explicit.
     set --
@@ -22,11 +24,15 @@ for variant in "$@"; do
     [ -z "${UBSM_INCLUDE_DIR:-}" ] || set -- "$@" "-DUBSM_INCLUDE_DIR=$UBSM_INCLUDE_DIR"
     [ -z "${UBSM_LIBRARY:-}" ] || set -- "$@" "-DUBSM_LIBRARY=$UBSM_LIBRARY"
     [ -z "${UB_MEMLINK_LIBRARY:-}" ] || set -- "$@" "-DUB_MEMLINK_LIBRARY=$UB_MEMLINK_LIBRARY"
-    if [ "${YCSB_UB_TWO_HOST:-0}" = 1 ]; then
-        set -- "$@" -DYCSB_UB_TWO_HOST=ON "-DYCSB_INDEXES=${YCSB_INDEXES:-bwtree}" "-DBWTREE_MAPPING_TABLE_BITS=${MAPPING_BITS:-20}"
+    if [ "${YCSB_UB_TWO_HOST:-0}" = 1 ] || [ "${YCSB_CXL_TWO_PROCESS:-0}" = 1 ]; then
+        set -- "$@" -DYCSB_UB_TWO_HOST=ON "-DYCSB_INDEXES=${YCSB_INDEXES:-bwtree}" "-DBWTREE_MAPPING_TABLE_BITS=${MAPPING_BITS:-24}"
+    fi
+    if [ "${YCSB_CXL_TWO_PROCESS:-0}" = 1 ]; then
+        set -- "$@" -DYCSB_CXL_TWO_PROCESS=ON -DUB_API=none -DWITH_UB=OFF
     fi
     cmake -B "$build_dir" "$@" -DVARIANT="$lower_variant" -DBUILD_EXTRA_INDEXES=OFF -DCMAKE_EXPORT_COMPILE_COMMANDS=ON || { echo "CMake configuration failed for $variant ($lower_variant)"; exit 1; }
     cmake --build "$build_dir" --parallel "${JOBS:-8}" || { echo "Make failed for $variant"; exit 1; }
+    [ "${YCSB_UPDATE_SYMLINKS:-1}" = 1 ] || continue
     ln -sf "$build_dir/ycsbc_$lower_variant" ycsbc || { echo "Failed to create symlink for $variant"; exit 1; }
     ln -sf "$build_dir" build || { echo "Failed to create symlink for build_$lower_variant"; exit 1; }
     ln -sf "$(pwd)/$build_dir/compile_commands.json" ../../compile_commands.json || echo "Warning: failed to create compile_commands.json symlink for $variant"

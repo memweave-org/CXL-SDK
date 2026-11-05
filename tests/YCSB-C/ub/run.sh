@@ -19,6 +19,9 @@ case "$case_name" in
   sherman+nc-memcpy) db=sherman; OPT=0; sherman_access=nc-memcpy;;
   *) echo "Unknown UB case: $case_name" >&2; exit 2;;
 esac
+if [[ $sherman_access != cache ]]; then
+  NC_SIZE_MB=${SHERMAN_NC_SIZE_MB:-$NC_SIZE_MB}
+fi
 case $OPT in 0|1) ;; *) echo 'OPT must be 0 or 1' >&2; exit 2;; esac
 role=${YCSB_UB_ROLE:-}
 if [[ -z $role ]]; then
@@ -50,16 +53,19 @@ fi
 export LD_LIBRARY_PATH="$out/lib:$SDK_ROOT/lib:$SDK_ROOT/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 deps=$(ldd -r "$out/ycsbc" 2>&1) || { echo "$deps"; exit 1; }
 if [[ $deps == *'not found'* || $deps == *'undefined symbol'* ]]; then echo "$deps"; exit 1; fi
-echo "物理机 $(hostname)，角色 $role，原框架 ycsbc，case=$case_name OPT=$OPT RPC=$rpc，NT backend=UB（直接访问 NC），日志 $out"
+nt_backend='UB（直接访问 NC）'
+[[ ${YCSB_BACKEND:-ub} != cxl ]] || nt_backend='queue（CXL 内存上的原子延迟模拟）'
+echo "物理机 $(hostname)，角色 $role，原框架 ycsbc，case=$case_name OPT=$OPT RPC=$rpc，NT backend=$nt_backend，日志 $out"
 if [[ $role == A ]]; then threads=$THREADS_A; cpu=${CPU_A:-}; else threads=$THREADS_B; cpu=${CPU_B:-}; fi
 cpu_args=(); if [[ -n $cpu ]]; then cpu_args=(--cpu "$cpu"); fi
 spec=$SPEC
 [[ $spec == /* ]] || spec="$PWD/$spec"
 suite_args=()
+backend_args=(--backend "${YCSB_BACKEND:-ub}")
 if [[ $case_name != bwtree || $suite == 1 ]]; then
   suite_args=(--suite --case "$case_name" --db "$db" --rpc "$rpc" --a-writable "$A_WRITABLE" --seed "$SEED" --sherman-access "$sherman_access")
 fi
 if [[ ${YCSB_UB_FIXTURE:-0} == 1 ]]; then suite_args+=(--fixture); fi
 python3 ./peer.py --role "$role" --peer "$B_IP" --port "$PORT" --provider "$PROVIDER_B" \
   --binary "$out/ycsbc" --output "$out" --threads "$threads" --records "$RECORDS" --ops "$OPS" \
-  --size-mb "$SIZE_MB" --nc-size-mb "$NC_SIZE_MB" --spec "$spec" --ini "$PWD/config.ini" --expected-opt "$OPT" "${cpu_args[@]}" "${suite_args[@]}"
+  --size-mb "$SIZE_MB" --nc-size-mb "$NC_SIZE_MB" --spec "$spec" --ini "$PWD/config.ini" --expected-opt "$OPT" "${cpu_args[@]}" "${suite_args[@]}" "${backend_args[@]}"

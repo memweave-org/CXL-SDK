@@ -23,8 +23,15 @@ bool InsertClient::DoInsert() {
 #elif defined(INT_KEY_ADDR)
   OpGeneratorIntKeyAddr op_gen(workload_);
   uint64_t key = workload_->NextSequenceNumKey();
+#ifdef YCSB_UB_TWO_HOST
+  if(ycsbc_ub::rpc_mode() && UbRpcOwner(key)!=SimThreadInfo::worker_machine_id)
+    return false; // Not a local record; neither allocate nor RPC during prefill.
+#endif
   void *value = workload_->BuildPrefillValue();
   memory_fence();
+#ifdef YCSB_UB_TWO_HOST
+  if(ycsbc_ub::rpc_mode()) return UbPrefillLocal(db_[get_db(key)],key,reinterpret_cast<uintptr_t>(value))==DB::kOK;
+#endif
   ret = (db_[get_db(key)]->Insert(key, (uint64_t)value) == DB::kOK);
 #elif defined(YCSB_KEY)
   std::string key = workload_->NextSequenceKey();

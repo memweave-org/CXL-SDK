@@ -14,10 +14,10 @@ bash run_all.sh
 | --- | --- | --- | --- | --- |
 | bwtree | NOOPT | 直接读 | 本地索引 | CACHE |
 | bwtree+opt | OPT | 直接读 | 本地索引 | CACHE |
-| bwtree+rpc | NOOPT | 共享内存队列 RPC 读 | 本地索引 | CACHE |
+| bwtree+rpc | NOOPT | 本地分区直接读 / 远端 RPC 读 | 本地分区直接访问 / 远端 RPC 读写 | 两端本地 DRAM |
 | clevelhash | NOOPT | 直接读 | 本地索引 | CACHE |
 | clevelhash+opt | OPT | 直接读 | 本地索引 | CACHE |
-| clevelhash+rpc | NOOPT | 共享内存队列 RPC 读 | 本地索引 | CACHE |
+| clevelhash+rpc | NOOPT | 本地分区直接读 / 远端 RPC 读 | 本地分区直接访问 / 远端 RPC 读写 | 两端本地 DRAM |
 | sherman+nc-direct | NOOPT | NC 字段直接 load | NC 字段直接 load/store | NC |
 | sherman+nc-memcpy | NOOPT | memcpy 到本地读取 | memcpy 到本地，修改后复制回 NC | NC |
 
@@ -37,22 +37,35 @@ RECORDS=1000 OPS=1000 bash run_all.sh --thread-counts 32
 ```
 
 BwTree/ClevelHash 继续使用已有启动 CACHE 失效及发布修复，A CACHE 只读、B 可写。
-普通模式不分配 RPC 队列、不启动服务线程。`+rpc` 仅把 A 的读请求发给 B：
-复用 `shm-lib/include/msg/mpmc_queue.h` 的 `MPMCQueue<uint32_t>`（`USE_NO_CC_QUEUE`），
-队列、请求和回复都位于共享 NC。队列传递 client 编号，每个 client 只保留一个
-在途读请求，B 出队执行读取后通过 `response_sequence` 发布结果。
-B 的自身 workload 直接访问索引；B 有一个额外的 RPC 服务线程，默认与 B client
-共用 `CPU_B`。普通模式 RPC 完成数必须为 0，`+rpc` 必须等于 A 的全部读次数。
-`A_WRITABLE=1` 会在启动前报错，不能开启 A 更新。
+普通模式不分配 RPC 队列、不启动服务线程。`+rpc` 在 A/B 各建立一个本地 DRAM
+索引，按 `key % 2` 分区（0 属于 B，1 属于 A）；`RECORDS` 是两端合计的初始记录数。
+两端分别装载自己的记录，本机 key 直接访问，远端 key 通过双向共享队列请求所属机器。
+A 的 workload 仍全读，B 的 workload 仍为 90% read / 10% update；B 更新 A 所属的 key 时，
+由 A 的服务线程更新 A 的本地索引。
 
-Sherman 两项都只 mmap 一块 NC 对象，节点、value、根、锁和控制信息全部在 NC，
+复用 `shm-lib/include/msg/mpmc_queue.h` 的 `MPMCQueue<uint32_t>`，每个方向一条队列，
+每个 client 最多一个在途请求。共享 NC 只保存队列、请求/回复 payload、启动描述及跨机同步；
+索引控制对象、原子元数据、节点、value 都在所属机器的 DRAM，RPC 模式不创建 CACHE 映射。
+读回复和更新请求传递完整 value 字节；对端不会解引用发送方的 DRAM 指针。
+每端都有一个额外服务线程，与该端第一个 worker 共用 CPU。
+所有两进程模式的 pthread 句柄、线程参数、Client DB 列表和 master 的计时/启动对象
+均在本地 DRAM；用于跨机分发的 trace 暂存、索引描述和 barrier 保留在共享 NC。
+结果核对本地/远端操作计数及 `A.rpc_sent == B.rpc_completed`、
+`B.rpc_sent == A.rpc_completed`，也按 workload 的 key 分区核对发送次数。
+`A_WRITABLE=1` 仍会在启动前报错，不能开启 A workload 更新。
+
+Sherman 两项都只 mmap 一块 NC 对象，节点、value、共享根和锁在 NC，
+DB 包装对象、Tree/DSM、线程句柄及启动参数在本地 DRAM，
 不创建 CACHE 映射。A/B 使用相同访问机制，A 只读索引，只有 B 更新，RPC 完成数为 0。
 NC 映射仍需可写以支持控制信息及 epoch 等元数据；这不允许 A 执行索引更新。
 `nc-direct` 直接遍历 NC 节点字段，B 在锁和版本保护下原地修改、分裂节点；
 `nc-memcpy` 将完整节点复制到本地查询，B 在本地修改后复制修改部分回 NC。
 value 也分别使用直接访问或本地复制。两项都关闭本地内部节点缓存，保持相同节点布局；
 每个 1024 字节节点占一个 4 KiB 分配槽并带独立 NC 版本头，避免修改/分裂时版本锁别名。
-`NC_SIZE_MB` 包含节点、value 和原框架的 trace/控制数据，默认 16384 MiB，耗尽即报错。
+NC 模式不再分配旧的 4 MiB 哈希版本表；CACHE 模式仍使用它。独立版本头和哈希版本表
+都是适配层机制，与上游节点/叶子记录内嵌的 front/rear 版本字段不同。
+Sherman 的 NC 包含节点、value 和原框架的 trace/控制数据，默认 65536 MiB，
+由 `SHERMAN_NC_SIZE_MB` 单独配置；耗尽即报错。
 这里的 NC 是 UB SDK 的 non-cacheable 映射，不是 cacheable 内存上的 streaming 指令。
 
 每端构建包含三种索引的 NOOPT/OPT 两份二进制，按 case 复用。镜像需包含 CityHash、
@@ -96,7 +109,9 @@ NOOPT/OPT 各构建一次，全部轮次复用；每轮新建共享对象，清�
 同时设 `-DBWTREE_MAPPING_TABLE_BITS=10 -DYCSB_CLEVEL_HASH_POWER=10`，构建
 `readonly_rpc_contract`。设置独立的 `UBSM_TEST_DIRECTORY` 后，分别传入 `queue` 或
 上表中的 case；OPT 两项必须运行 OPT 构建。该测试使用两个进程、四个 A client，
-验证实际操作生成器、A 更新/插入拒绝、B 更新可见性及 RPC 完成计数。
+验证实际操作生成器、A workload 更新/插入拒绝、B 更新可见性及 RPC 完成计数。
+`bwtree+rpc` / `clevelhash+rpc` 还验证两端私有分区、双向路由、完整 value 字节传输、
+远端更新的 value 独立副本，以及装载/扩容/读写期间 NC 分配量不增长。
 `queue` 额外用容量为 2 的原有 MPMC 队列核对重复复用和各 client 的回复。
 `bwtree+legacy` 覆盖未设置 suite 的默认入口。
 这不是无 CC 硬件模拟，也不输出吞吐或延迟；正式性能测试仍须等待独占资源。
@@ -106,7 +121,80 @@ NOOPT/OPT 各构建一次，全部轮次复用；每轮新建共享对象，清�
 两份产物，断言小 arena 下反复释放复用、合并、对齐、并发、无效释放，以及
 ClevelHash 重复插入、失败更新和扩容临时对象的内存有界性。此项也不计时。
 
+## BwTree OPT 的进程私有 mapping cache
+
+协调运行的 OPT 构建启用 `BWTREE_PROCESS_MAPPING_CACHE=1`。每个进程、每棵树只分配
+一张 cached mapping table，同进程的 worker 共用它。表使用匿名私有 mmap，并在首次
+触页前绑定到本机有 CPU 的 DRAM NUMA 节点；可用 `BWTREE_MAPPING_CACHE_NODE` 指定
+其中一个节点。共享树内只保留权威 mapping table 和清理消息通道，不存私有表地址。
+默认 24-bit 表每项只有一个 64-bit 原子值，共 128 MiB/进程；NOOPT 不创建该表。
+B 在构造树时分配，A 在 worker 注册时分配，两者都在 READY 和吞吐计时之前完成。
+启动日志 `BWTREE_MAPPING_CACHE` 包含 pid、表地址、大小、`invalidation=message-ack`
+和 `fill=busy-slot`。
+
+GC 通过共享 NC 环形消息通道发送 node ID，各进程的接收线程只清自己的对应表项，
+清完后返回 ACK。GC 收齐消息发送时已注册进程的 ACK，再记录新的 epoch；只有这个
+epoch 的读操作也已退出，才释放旧节点。队列满或 ACK 未到只延后回收，普通读操作
+不等待消息。接收线程空闲时休眠 50 微秒；缓存不会因 epoch 改变而整体失效。
+本地命中只对表项做一次 acquire load。回填先用 CAS 取得表项的忙标记，再读取权威
+mapping table 并发布指针；接收线程与回填互斥，等已有回填结束后才清空并 ACK。
+读线程遇到忙标记或竞争失败时直接读 NC，不等待、不回填。这样旧操作不会在清理
+之后重新填入先前保存的旧指针，也不需要版本字段。叶节点仍检查权威映射：叶链头
+未变时不做 CAS、不重新读节点头；变化时在取得忙标记后重新读一次 NC，保证回填顺序。
+持有忙标记的线程被抢占会延后清理和 GC，其他读线程仍可继续。
+A/B 都在解除共享映射前停止接收线程、注销缓存。这里的清理是软件表项清零，不是
+CPU cacheline invalidate，也没有改变 UB 原生 NC 原子的后端。
+
+这会改变共享树布局，A/B 必须同步源码并重新构建 OPT bundle，不能混用旧二进制。
+本地构建可增加 `-DYCSB_BUILD_MAPPING_CACHE_CONTRACT=ON`，生成不计时的
+`mapping_cache_contract`，覆盖两个进程的私有表、同进程线程复用、清理等待已有回填、
+忙表项读绕过、ACK 时序、异常释放忙标记、队列满、定向清理及退出/重建。用显式屏障
+固定回填与清理的交错顺序，不依赖线程速度；普通共享 mmap 不代表 NC 硬件验证。
+前述 SDK fixture 的 `readonly_rpc_contract bwtree+cache-gc` 另覆盖真实 BwTree 的
+回收路径：A 在新的 epoch 继续持有旧缓存指针时，即使清理已 ACK，B 也必须延后释放；
+读端退出宽限期后，验证 CACHE 存活字节下降、旧地址复用且分配高水位不增长。
+运行这些用例前仍须完成测试资源互斥检查；性能结论还需独占环境下的 OPT/NOOPT 对比。
+
 ## BwTree 线程数扫描与单项入口
+
+两进程框架中的 BwTree、ClevelHash（包括 OPT/NOOPT/RPC）在计时前，
+由每个 worker 将自己的 workload 操作描述符复制到进程私有 DRAM。
+分配绑定到该 worker CPU 所在 NUMA 节点，核对页面位置后才发布 READY；
+计时循环读取本地数组，结果标记 `operation_storage=local-dram`。
+原共享数组仅供准备阶段分发同一条 trace，仍保留到回收阶段；key、顺序和 value 指针不变，
+索引 value 本身继续位于共享数据区。日志 `WORKLOAD_STORAGE` 记录各线程的位置和操作数。
+
+同一个 `run.sh` 用 `--backend ub|cxl` 选择运行后端（默认 `ub`）：
+
+```sh
+# UB：A、B 各执行一次，复用原 SDK 和 NC 原子路径。
+bash ./run.sh --backend ub --thread-counts 32
+# 本地 CXL：执行一次，自动启动 A/B 两个进程，各 32 个 worker。
+bash ./run.sh --backend cxl --thread-counts 32 --cxl-node 4
+```
+
+CXL 模式复用原 `CXLSystemMemoryMmapper`、memkind 和 `QUEUE_SIM_CAS`，
+不加载 UB SDK。OPT/NOOPT 均显式启用 queue：`nt`/`nt_pointer` 的远端
+load/store/CAS 继续走原 `AtomicRequestQueue`；显式本地访问仍沿用原绕过逻辑。
+`clwb`/`clflush` 直接执行本机 cacheline 指令（x86 默认 CLWB/CLFLUSHOPT），
+不会因共享地址分区而转到 UB 的地址登记分支。节点发布仍在原来的位置写回，
+BwTree 不增加逐次读节点的 flush。编译时拒绝关闭 flush 或混用 UB 原子后端；
+启动日志显示 `atomic_backend=queue cache_maintenance=native`。
+两个进程仍走同一个 `peer.py`、原操作生成器和事务控制器：
+A 100% 读，B 90% 读/10% update，默认 OPT、fresh-insert、无 RPC。
+每端 1,000 万次操作、1,000 万条初始记录，线程数是每个进程的 worker 数。
+本地 CPU 集合不重叠，因此 32 档需要 64 个可用逻辑 CPU；可用 `CPU_A`、`CPU_B`
+指定两组起始 CPU。CXL 默认只跑 32 档，可通过 `--thread-counts` 扩展。
+
+CXL 在 `/dev/shm` 创建本轮独占的共享文件，将节点和元数据映射绑定到指定的
+CXL NUMA 节点，并在 READY 前核对实际页面所在节点。这里的元数据用 queue 模拟
+原子访问延迟，物理映射可缓存；A 的节点映射仍为只读。A 解除映射后 B 才删除文件。
+原 `run_shm_ds.sh -mode=cxl_two_process --thread-counts 32` 也转到这一入口。
+目前此 A/B CXL 入口支持 BwTree OPT/NOOPT（`OPT=1/0`），旧 CXL 测试模式继续可用。
+
+两种后端都会明确显示构建或复用 bundle，并将编译、等待对端和运行日志同步显示到
+终端。CXL 默认原生编译，UB 默认 Docker 编译；每次扫描只构建一次。
+`--bundle` 只能复用同一后端的产物；二进制会在映射前拒绝后端不匹配。
 
 两机同步完整源码，在各自物理机执行一次：
 
@@ -157,6 +245,8 @@ bash ./run.sh
 mmap 地址执行 CPU 原子 load/store/CAS/fetch 操作。共享原子对象由 NC arena 分配；
 栈上/进程内临时对象仍可使用。对象本身不保存模拟副本、queue 或计时状态。
 NC 的 `flush()` 只执行内存屏障，CACHE 节点仍走原有显式 cache maintenance。
+BwTree 读侧仅在映射启动时整区失效一次，后续节点和 value 直接读取，不执行
+逐节点/逐对象的首次读取 flush；写端发布新节点前仍执行原有写回。
 UB 构建不编译 queue 模拟源文件；`UB_API=none` 的 NO_CC 模式继续使用原 queue backend。
 兼容参数 `nt=false` 不会绕过 UB 原子操作或 CACHE 地址检查。
 `run.sh` 自动设置 `UB_API=ubsm` 并重新编译，更新后仍用相同入口，无需额外 backend 参数。
@@ -172,16 +262,24 @@ NC 的分配空间分成互不重叠的两半，分配偏移位于各进程本�
 B 的 SDK provider 默认使用 B 系统 hostname；可在配置中填写 `PROVIDER_B`。
 TCP 控制端口默认 18982。
 
-默认 CACHE 32768 MiB、NC 16384 MiB，为千万级初始数据及每端千万次操作预留空间。
+默认 CACHE 65536 MiB（64 GiB）、NC 16384 MiB（16 GiB）。
+Sherman 两项不创建 CACHE 对象，默认 NC 65536 MiB（64 GiB）；
+其节点和 value 均在 NC，不能沿用其他索引的元数据预算。
 NC 分配区由 A/B 各占一半，B 预生成两端全部操作序列；仅 trace 数组就超过 1 GiB，
 还需容纳索引元数据，以及 Sherman 模式的节点和 value。
-可通过 `SIZE_MB` / `NC_SIZE_MB` 覆盖容量；更大负载可能仍需增加。耗尽即报错，不回退到私有堆。
+`SIZE_MB` 覆盖 CACHE 容量（RPC 中为每端本地索引的 DRAM 容量）；
+显式设置 `NC_SIZE_MB` 会覆盖所有 case，`SHERMAN_NC_SIZE_MB` 可进一步单独覆盖 Sherman。
+例如 `SIZE_MB=65536 NC_SIZE_MB=16384 SHERMAN_NC_SIZE_MB=65536 bash run_all.sh`。
+`--dry-run` 的 `memory_by_case` 和每轮结果记录实际共享容量；RPC 的 CACHE 为 0。
+更大负载可能仍需增加容量。耗尽即报错，不回退到私有堆。
 UB arena 按进程分区，`MemoryManager::free()` 将安全释放的块合并并供后续分配复用，
 分配器账本留在进程本地；支持 CACHE/NC、64 字节隔离及绝对地址对齐，拒绝跨分区、
 跨分配器、内部指针和重复释放。`ub_arena_used()` 为地址高水位，`ub_arena_live()` 为未释放字节数。
 ClevelHash 的未发布 KV、失败的扩容数组和元数据会回收；扩容分配串行化以限制临时数组峰值，
 普通查询和更新不经过此扩容锁。已发布 KV 尚无跨机回收宽限期，继续保留到对象退出，
-不能在替换指针后立即复用。BwTree CACHE 节点仍采用地址不复用策略，NC 回收走原 epoch/GC。
+不能在替换指针后立即复用。UB 和 CXL 的 BwTree CACHE 节点均允许在原 epoch/GC
+确认安全后回收复用；OPT 还等待 mapping-cache 清理 ACK 及之后的读端宽限期。
+CXL 保留严格的共享分配要求，但不再强制保留每个已退休的分配。已发布 value 仍保留至退出。
 整个 UB 对象在退出时释放。NodeID 的空闲栈没有入栈路径，UB 模式跳过其无用的 128-bit CAS。
 所有节点由 B 分配/回收，不启动不需要的跨机 GC 消息队列 dispatcher。
 
@@ -191,6 +289,10 @@ Python 只协调两边已启动的进程，替代 SSH 拉起 follower，不执�
 B 发布原线程控制器，A 完成映射和线程初始化后，两边通过原 NC start/finish 变量运行。
 最终吞吐使用原 `MasterTransactionManager` 的 **成功操作总数 / duration**，
 `result.json` 中 `common_seconds` 为此原生计时；`controller_seconds` 单独记录 TCP 控制窗口。
+原生计时使用 `steady_clock`，避免系统校时影响耗时。启动清缓存、加载和 READY 等待不在
+此计时内；计时覆盖 B 放行事务到 A/B 均完成，包含等待较慢一端。Python 以单调时钟
+记录更外层的 RUN→双方 RESULT 窗口。若 B 原生耗时超过该窗口加上
+`max(50ms, 1% × controller_seconds)` 的容差，结果判为计时异常，不发布有效吞吐。
 固定操作数下，较快的一端结束后会等待另一端，因此不是固定时长的稳态测量。
 任何操作失败都使汇总失败，不能把失败操作计入成功吞吐。
 
@@ -236,23 +338,133 @@ A/B 之间仍走独立 TCP 连接。worker 必须通过 run.sh/peer.py 启动。
 任一端失败，另一端中止本轮 worker；SIGTERM 后 2 秒仍未退出则发送 SIGKILL 并等待确认。
 仅操作控制器自己启动的子进程，失败结果标记 pass=false，UB 对象仍保留供诊断。
 
+## 本地真实双副本：检查 CoW 发布与启动残留缓存
 
-## 正常 UB 运行的缓存修复
+`YCSB_UB_LOCAL_NCC=ON` 是额外的本地调试构建，不加载真实 UB SDK。
+运行的仍是原 `LoadManager / Client` 和 `BwTreeDB / CLevelHashDB`。CACHE 使用 A、B 各自独立的
+memfd，同一 VA 对应不同物理存储；公共后备文件只由模拟后端访问。
+NC 元数据仍共享，代表现有 UB 的非缓存原子区域。A 的应用映射保持 `PROT_READ`。
 
-重新编译后，`run.sh` 默认在两端 CACHE 映射取得 ownership 后、分配和读取之前，
-各自执行一次整区缓存失效。它不清零共享内存，也不依赖对端 cache coherence。
-日志中的 `UB_STARTUP_INVALIDATE` 可确认执行；仅显式设置
-`SHM_UB_STARTUP_INVALIDATE=0` 才关闭，供故障对照使用。
+这个模型按 **64 字节 cacheline** 为 A、B 分别维护有效位和脏位，保留原有
+节点分配布局。默认**两端的每一行都已经缓存了旧零值**，即使公共内存非零也不会
+自动更新。公共 UB 映射代码默认在每端映射完成、访问数据之前各执行一次整区失效；
+运行器默认不设置启动失效环境变量，以直接验证生产代码的默认行为。
+`--no-startup-invalidate` 保留初始残留缓存，`--initial-cache cold` 则选择初始无效行。
 
-`YCSB_UB_CASE=clevelhash bash ./run.sh` 选择 ClevelHash NOOPT，
-`YCSB_UB_CASE=clevelhash+opt bash ./run.sh` 选择 OPT；默认仍是 BwTree，
-由 `OPT=0/1` 选择变体。ClevelHash 的可变 bucket、metadata、root 和线程状态放在 NC，
-不可变 KV pair 放在 CACHE，并在发布指针前完整写回；读取 pair 时执行原有缓存失效。
-两端 ClevelHash 均执行 90% 读、10% 更新已有 key，A 直接读取、写请求转交 B，
-默认 A 的 CACHE 映射保持只读。`clevelhash+rpc` 和 `bwtree+rpc` 可将 A 的全部操作交给 B。
+这里无效行就是 **EMPTY**，与“有效且内容为零”严格区分：
 
-默认 `run.sh` 每次从当前源码构建。若显式设置 `YCSB_UB_BUNDLE`，必须使用修复后
-重新构建的 bundle；旧二进制不会因为脚本更新自动获得修复。
+| 本端行状态 | 下一次读的行为 |
+| --- | --- |
+| EMPTY（`valid=false`） | 从公共内存取整行，再标记有效 |
+| 有效、干净，包括旧零值 | 直接读本端副本，不自动更新 |
+| 有效、脏 | 读本端写入值，等待显式写回 |
 
-这些修复用于真实 SDK 构建，不启用独立内存副本模拟。启动失效不能阻止随后对未来
-地址的预取；CoW 地址不复用且未提前重新缓存，是仅靠启动失效读取新对象的前提。
+失效只清有效位，不在失效时复制公共内存，也不清零底层数据。默认路径是：
+两端初始有效零缓存 → 各自整区失效为 EMPTY → B 构造、写回并发布 CoW 对象 →
+A 首次读取 EMPTY 行时获取已写回的内容 → 后续复用缓存。
+默认不开启按对象首次使用失效，也不注入 next-line 预取。
+
+无效行首次读或写时从公共内存填充，部分写入也会先取整行，保留其他字段。
+写入把行标为脏；`clwb` 只写回脏行，不刷新或失效任何对端副本；
+`clflush` 先写回本端脏行，再将本端行置为无效。干净的旧零值不会被错误写回。
+单独 fence 不复制数据。已完整写回并发布的新 CoW 节点，在地址未提前进入缓存时
+可以直接读取；如果地址被预取或曾被读取，仍需相应失效协议。
+
+使用 Clang/LLVM 15 的编译插桩，覆盖优化后的普通 load/store、内存复制/清零、
+`memcmp/bcmp` 和显式 `__builtin_prefetch`。CACHE 中的原子操作会被拒绝，
+原子元数据必须在共享 NC 区。BwTree 不增加按对象首次使用刷新；ClevelHash 原有的
+KV pair 读取失效仍然执行，BwTree 则保留其 CoW 读路径。
+模拟器本身不插桩，非 CACHE 地址快速跳过。
+
+`--read-ahead-lines N` 在每次读取或写入取行时，额外预取后续最多 N 行（0..64，
+默认 0），可以把尚未分配或发布的地址提前缓存。预取不会覆盖已经有效的行。
+启动失效之后仍可能再次预取旧数据，因此“一开始刷过”不等于以后不会有旧缓存。
+这是确定性的 next-line 策略，不声称重现某款 CPU 的全部预取行为。
+它是额外的预取压力场景，和启动时提前失效 cacheline 是两种操作。
+
+BwTree 保留原来的 CoW 读路径：每端映射 CACHE 后，在开始访问前整区失效一次；
+之后从 NC 元数据取得已发布节点指针，节点和 value 都直接读取并复用缓存。
+`GetType()`、high/low key、depth、item count 等访问器不执行读前 flush，
+也不查询首次访问地址集合。写端发布新节点前原有的 `FlushNode()` 写回仍保留。
+已移除 BwTree 的 `PrepareRead()` 和 `--cow-acquire` 实验入口；设置
+`SHM_UB_COW_ACQUIRE=1` 也不会改变 BwTree 的节点或 value 读取路径。
+
+默认还会对 A 实际读取的字节执行只观察的后备内存比较：不一致就报
+`LOCAL_NCC_STALE_READ` 并失败，不修复数据。它能捕获错误非零值和 payload，
+而不仅是 NULL 指针或操作返回码；这项检查适用于本测试的不可变 CoW 数据。
+`--no-check-reads` 可关闭这个额外诊断，保留原程序的 NULL 指针/失败表现。
+需要 Linux、`clang++-15`、LLVM 15 开发文件及原 YCSB 的编译依赖：
+
+```sh
+cmake -S tests/YCSB-C -B build/local-ncc-opt \
+  -DCMAKE_C_COMPILER=clang-15 -DCMAKE_CXX_COMPILER=clang++-15 \
+  -DYCSB_UB_LOCAL_NCC=ON -DVARIANT=nocc '-DYCSB_INDEXES=bwtree;clevel-hash' \
+  -DBWTREE_MAPPING_TABLE_BITS=10 -DYCSB_CLEVEL_HASH_POWER=5 \
+  -DLLVM_DIR=/usr/lib/llvm-15/lib/cmake/llvm
+cmake --build build/local-ncc-opt --target ycsbc_nocc local_ncc_contract -j2
+
+# 默认两端缓存旧零值，映射完成后各自失效一次。
+python3 tests/YCSB-C/ub/run_local_ncc.py --build build/local-ncc-opt \
+  --output build/ncc-stale-both --records 1000 --ops 2000
+
+# ClevelHash：小初始容量让 1000 条预加载触发扩容，跨行 value 同时覆盖 payload。
+python3 tests/YCSB-C/ub/run_local_ncc.py --build build/local-ncc-opt \
+  --output build/ncc-clevelhash --db clevelhash --records 1000 --ops 20000 --value-size 192
+
+# 负对照：保留旧零缓存，不做启动失效，预期失败。
+python3 tests/YCSB-C/ub/run_local_ncc.py --build build/local-ncc-opt \
+  --output build/ncc-no-startup --no-startup-invalidate
+
+# 额外负对照：启动失效后再预取未来地址，旧读路径可能失败。
+python3 tests/YCSB-C/ub/run_local_ncc.py --build build/local-ncc-opt \
+  --output build/ncc-prefetch --read-ahead-lines 64 --ops 20000
+
+# 初始冷缓存对照，额外保留逐 cacheline 记录。
+python3 tests/YCSB-C/ub/run_local_ncc.py --build build/local-ncc-opt \
+  --output build/ncc-cold --initial-cache cold --no-startup-invalidate --trace
+```
+
+NOOPT 使用独立构建目录，改为 `-DVARIANT=nocc_no_opt`，构建目标
+`ycsbc_nocc_no_opt local_ncc_contract`，运行时增加 `--opt 0`。
+所有输出目录必须是新目录。`--drop writeback` 或 `--drop invalidate` 用于负对照，
+不会把被注入的失败当作通过。`--trace` 保存每条写回、失效、首次填充记录；
+整块失效汇总为一条记录，逐行填充/写回仍可能产生较大日志。默认仍记录计数和
+故障前最近 32 次缓存维护。`--value-size 192` 可额外覆盖跨 cacheline 的 value。
+
+每轮先跑 `local_ncc_contract`：检查独立副本、未写回不可见、冷 CoW 首次填充、
+写回不刷新旧缓存、fence/clean 不等于 invalidate、跨行维护、NC 可见性、A 写保护，
+以及两端都缓存旧零值、干净行不能覆盖公共数据、部分写取行、脏行写回后失效、
+提前失效后保持 EMPTY、B 写回后无需再次失效便可读到新值，以及显式预取、
+next-line 预取、提前失效后又预取旧值。另有独立的可选 acquisition 协议契约，
+以及不设置任何启动开关、两端均从旧零缓存正确读取非零后备内存的默认启动契约。
+契约测试自行设置这些条件，
+不继承本轮索引测试的故障注入或只读比较开关。
+然后运行 A/B 各一个事务线程，A 100% 读，B 90% 读、10% 更新已有 key。
+A 直接读取索引，不转发写请求；B 是唯一 CACHE 写进程。`--no-suite` 保留旧工作负载。
+默认 suite 在事务结束后逐个核对所有访问过的 key，要求 A/B 返回相同的最终 value
+地址；再对同一个 key 连续发布 32 个内容各异的新 value，每轮都检查 A 返回的地址
+和每个 payload 字节，确认 update 实际生效。验证器不执行额外缓存失效。
+`verified_keys / verified_versions` 记录在结果里，这些验证代码只编译进模拟构建。
+脚本持续检查同机其他测试和驱动，启动前连续确认
+三个空闲快照；运行中发现重叠则终止自己的 worker、标记 `interfered=true`，该轮
+必须重跑。`exclusivity.jsonl` 保存机器、UTC 时间、PID、CPU 使用及退出观察。
+这是基于可见进程的互斥检查，不能代替对不可见容器/远端调度器的外部协调。
+
+`result.json` 记录正确性结果、二进制 SHA256 和退出码，明确 `performance_valid=false`。
+发生 NULL `high_key_p` 时，仅在这个调试构建里打印节点/字段地址、同一缓存行的
+本地与后备内存值，随后失败退出；诊断不修复或刷新数据。失败轮保留对象文件和日志。
+普通 SDK 构建不包含模拟插桩。**正常 UBSM Cacheable 映射现在默认执行启动整区失效**，
+与模拟构建使用同一段代码和缓存维护接口，重新编译后运行 `run.sh / run_all.sh` 即生效，
+无需额外设置环境变量。只有显式 `SHM_UB_STARTUP_INVALIDATE=0` 才关闭，供负对照使用。
+旧调试环境变量
+`LOCAL_NCC_STARTUP_INVALIDATE` 仅作为兼容别名。失效发生在 map/ownership 之后、
+分配和读取之前，操作本端 cacheline，不清零数据，也不假设可以远程失效对端。
+
+边界：当前支持 BwTree 和 ClevelHash 的 A CACHE 只读、B 单写进程，每端一个事务线程；不验证多写方
+缓存所有权、真实设备原子语义、指令乱序完成或所有硬件预取策略。外部未插桩库、内联汇编
+的隐式 CACHE 读取不在普通 load 插桩覆盖范围内，不能直接扩展为任意程序验证器。
+`stale` 是显式注入的初始条件，不代表已证明真实 SDK 会留下旧缓存。初始零值
+被建模为干净缓存行；跨运行遗留的脏行及其写回所有权不在此模型内。
+当前 bump allocator 不重用已释放地址；测试通过不证明地址复用、物理内存重新分配
+或大规模并发下的正确性。真实 UB 是否需要启动失效，还取决于 SDK 的 map/ownership
+缓存保证，以及真实机器的冷启动与失效对照结果。

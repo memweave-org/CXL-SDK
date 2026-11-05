@@ -44,6 +44,9 @@
 #include <iostream>
 
 #include "shm/mm.h"
+#ifdef SHM_LOCAL_NCC
+#include "shm/local_ncc.h"
+#endif
 #include "allocation_context.h"
 #ifdef USE_CXL
 #include "msg/msg_collector.h"
@@ -54,6 +57,12 @@
 #include "utils/config.h"
 #ifndef BWTREE_MAPPING_CACHE_DRAM
 #define BWTREE_MAPPING_CACHE_DRAM 0
+#endif
+#ifndef BWTREE_PROCESS_MAPPING_CACHE
+#define BWTREE_PROCESS_MAPPING_CACHE 0
+#endif
+#if defined(NO_CC) && defined(OPT_IN_USE_FLAG) && BWTREE_PROCESS_MAPPING_CACHE
+#include "process_mapping_cache.h"
 #endif
 #if defined(NO_CC) && defined(OPT_IN_USE_FLAG) && !defined(NT_SIM) && BWTREE_MAPPING_CACHE_DRAM
 #include "dram_mapping_cache.h"
@@ -310,6 +319,10 @@ protected:
     NodeID node_id;
     size_t estimated_bytes;
     GarbageNode *next_p;
+#if defined(OPT_IN_USE_FLAG) && BWTREE_PROCESS_MAPPING_CACHE
+    MappingInvalidationTicket cache_invalidation{};
+    uint64_t cache_clear_epoch = std::numeric_limits<uint64_t>::max();
+#endif
 
     /*
      * Constructor
@@ -1401,6 +1414,8 @@ class BwTree : public BwTreeBase {
      * GetType() - Return the type of node
      *
      * This method does not allow overridding
+     * CoW node getters use ordinary cached loads. UB invalidates CACHE at
+     * mapping startup; writers flush new nodes before publishing pointers.
      */
     inline NodeType GetType() const { return metadata.type; }
 
@@ -1482,6 +1497,9 @@ class BwTree : public BwTreeBase {
      * and inner nodes.
      */
     inline const KeyType &GetHighKey() const {
+#ifdef SHM_LOCAL_NCC
+      CheckLocalHighKey();
+#endif
       return metadata.high_key_p->first;
     }
 
@@ -1489,6 +1507,9 @@ class BwTree : public BwTreeBase {
      * GetHighKeyPair() - Returns the pointer to high key node id pair
      */
     inline const KeyNodeIDPair &GetHighKeyPair() const {
+#ifdef SHM_LOCAL_NCC
+      CheckLocalHighKey();
+#endif
       return *metadata.high_key_p;
     }
 
@@ -1504,7 +1525,18 @@ class BwTree : public BwTreeBase {
     /*
      * GetNextNodeID() - Returns the next NodeID of the current node
      */
-    inline NodeID GetNextNodeID() const { return metadata.high_key_p->second; }
+    inline NodeID GetNextNodeID() const {
+#ifdef SHM_LOCAL_NCC
+      CheckLocalHighKey();
+#endif
+      return metadata.high_key_p->second;
+    }
+#ifdef SHM_LOCAL_NCC
+    inline void CheckLocalHighKey() const {
+      if (metadata.high_key_p == nullptr)
+        local_ncc_bad_pointer(this, &metadata.high_key_p, "high_key_p");
+    }
+#endif
 
     /*
      * GetLowKeyNodeID() - Returns the NodeID for low key
@@ -3056,6 +3088,9 @@ class BwTree : public BwTreeBase {
     root_help_update = nullptr;
 #endif
 
+#if defined(OPT_IN_USE_FLAG) && BWTREE_PROCESS_MAPPING_CACHE
+    LocalMappingCache::release(this);
+#endif
     return;
   }
 
@@ -3457,6 +3492,9 @@ class BwTree : public BwTreeBase {
     bwt_printf("Fast initialization: Do not set to zero\n");
 
 #ifdef OPT_IN_USE_FLAG
+#if BWTREE_PROCESS_MAPPING_CACHE
+    PrepareLocalMappingCache();
+#else
     for (size_t i = 0; i < DEFAULT_MACHINE_COUNT; i++) {
       // memset(&cached_mapping_table[i], 0, MAPPING_TABLE_SIZE);
       for (size_t j = 0; j < MAPPING_TABLE_SIZE; j++) {
@@ -3465,6 +3503,7 @@ class BwTree : public BwTreeBase {
         }
       }
     }
+#endif
 #endif
 
     return;
@@ -3714,12 +3753,18 @@ class BwTree : public BwTreeBase {
     // bypass_cache == true: should use data in mapping_table and update cache
     // bypass_cache == false: use data in cache
     if (bypass_cache == false) {
-      const uintptr_t cached_entry = GetLocalCacheMappingTable()[node_id].load();
+      const uintptr_t cached_entry = ReadCachedMapping(node_id);
       const BaseNode *cached = DecodeCachedNode(cached_entry);
       if (cached != nullptr) {
         if (CachedNodeIsLeaf(cached_entry)) {
           ret = mapping_table[node_id].load();
+#if BWTREE_PROCESS_MAPPING_CACHE
+          // Unchanged leaf hits need neither CAS nor another header read. If
+          // the head changed, acquire busy and reread before publishing a fill.
+          if (ret != cached) ret = FetchAndCacheMapping(node_id);
+#else
           CatchupLocalCacheMappingTable(node_id, ret);
+#endif
           assert(ret != nullptr);
           #ifdef PLOAD_COMMON_STAT
             timer_common.Stop();
@@ -3735,8 +3780,12 @@ class BwTree : public BwTreeBase {
         return cached;
       } else {    // else, cached is nullptr, meaning that the node is not cached
         // update cache to mapping_table
+#if BWTREE_PROCESS_MAPPING_CACHE
+        ret = FetchAndCacheMapping(node_id);
+#else
         ret = mapping_table[node_id].load();
         CatchupLocalCacheMappingTable(node_id, ret);
+#endif
         assert(ret != nullptr);
         #ifdef PLOAD_COMMON_STAT
           timer_common.Stop();
@@ -3762,6 +3811,9 @@ class BwTree : public BwTreeBase {
     }
 #endif
 
+#if defined(OPT_IN_USE_FLAG) && BWTREE_PROCESS_MAPPING_CACHE
+    ret = FetchAndCacheMapping(node_id);
+#else
 #ifdef NO_CC
     ret = mapping_table[node_id].load(std::memory_order_seq_cst, bypass_cache);
     if (ret == nullptr && bypass_cache == false) [[unlikely]] {
@@ -3774,6 +3826,7 @@ class BwTree : public BwTreeBase {
 #ifdef OPT_IN_USE_FLAG
     assert(bypass_cache == true);
     GetLocalCacheMappingTable()[node_id].store(EncodeCachedNode(ret));
+#endif
 #endif
 
   #ifdef PLOAD_COMMON_STAT
@@ -9102,6 +9155,12 @@ class BwTree : public BwTreeBase {
   using mapping_table_t = std::array<nt<const BaseNode *>, MAPPING_TABLE_SIZE>;
   mapping_table_t mapping_table;
   #ifdef OPT_IN_USE_FLAG
+#if BWTREE_PROCESS_MAPPING_CACHE
+    using LocalMappingCache = ProcessMappingCache<MAPPING_TABLE_SIZE, nt>;
+    using cached_mapping_table_t = typename LocalMappingCache::Table;
+    // No private pointer or table is stored in this shared object.
+    typename LocalMappingCache::Channel mapping_cache_invalidations;
+#else
     // Bit 0 records leaf-chain membership; publish it with the pointer.
     using cached_mapping_table_t = std::array<std::atomic<uintptr_t>, MAPPING_TABLE_SIZE>;
     static_assert(alignof(BaseNode) >= 2, "Cached node pointers need a free low bit");
@@ -9117,6 +9176,7 @@ class BwTree : public BwTreeBase {
     #else // define NT_SIM, use only one cached_mapping_table_t
       cached_mapping_table_t cached_mapping_table{};
     #endif
+#endif
   #endif
 #else
   using mapping_table_t = std::array<std::atomic<const BaseNode *>, MAPPING_TABLE_SIZE>;
@@ -9170,13 +9230,38 @@ class BwTree : public BwTreeBase {
   }
 
 #ifdef OPT_IN_USE_FLAG
+  void PrepareLocalMappingCache() {
+#if BWTREE_PROCESS_MAPPING_CACHE
+    LocalMappingCache::prepare(this, mapping_cache_invalidations,
+                               SimThreadInfo::worker_machine_id);
+#endif
+  }
   inline cached_mapping_table_t& GetLocalCacheMappingTable() {
-#ifndef NT_SIM
+#if BWTREE_PROCESS_MAPPING_CACHE
+    return LocalMappingCache::table(this);
+#elif !defined(NT_SIM)
     return cached_mapping_table[gc_id % DEFAULT_MACHINE_COUNT];
 #else
     return cached_mapping_table;
 #endif
   }
+
+  inline uintptr_t ReadCachedMapping(NodeID node_id) {
+#if BWTREE_PROCESS_MAPPING_CACHE
+    return LocalMappingCache::load(this, node_id);
+#else
+    return GetLocalCacheMappingTable()[node_id].load();
+#endif
+  }
+#if BWTREE_PROCESS_MAPPING_CACHE
+  inline const BaseNode *FetchAndCacheMapping(NodeID node_id) {
+    // Both miss and bypass paths must fetch inside the slot's critical section.
+    // If busy is already held, fetch_and_fill reads NC without waiting/filling.
+    return GetLocalCacheMappingTable()[node_id].fetch_and_fill(
+        [this, node_id] { return mapping_table[node_id].load(); },
+        [](const BaseNode *node) { return EncodeCachedNode(node); });
+  }
+#endif
 
   static constexpr uintptr_t kCachedLeafBit = uintptr_t{1};
 
@@ -9192,16 +9277,20 @@ class BwTree : public BwTreeBase {
     if (node_p == nullptr) return 0;
     const uintptr_t pointer = reinterpret_cast<uintptr_t>(node_p);
     assert((pointer & kCachedLeafBit) == 0);
+#if BWTREE_PROCESS_MAPPING_CACHE
+    static_assert(alignof(BaseNode) >= 4, "Cached nodes must not alias the busy marker");
+#endif
     return pointer | (node_p->IsOnLeafDeltaChain() ? kCachedLeafBit : 0);
   }
 
+#if !BWTREE_PROCESS_MAPPING_CACHE
   inline void CatchupLocalCacheMappingTable(NodeID node_id, const BaseNode *node_p) {
-    auto &slot = GetLocalCacheMappingTable()[node_id];
     // The node's type is immutable. Do not re-read its header on unchanged hits.
-    if (DecodeCachedNode(slot.load()) != node_p) {
-      slot.store(EncodeCachedNode(node_p));
+    if (DecodeCachedNode(ReadCachedMapping(node_id)) != node_p) {
+      GetLocalCacheMappingTable()[node_id].store(EncodeCachedNode(node_p));
     }
   }
+#endif
 #endif
 
   /*
@@ -9492,6 +9581,9 @@ class BwTree : public BwTreeBase {
     }
 
 #ifdef USE_OLD_EPOCH
+#if defined(OPT_IN_USE_FLAG) && BWTREE_PROCESS_MAPPING_CACHE
+#error Process-local mapping caches require the current per-thread epoch implementation
+#endif
 
     /*
      * AddGarbageNode() - Add garbage node into the current epoch
@@ -10942,9 +11034,33 @@ class BwTree : public BwTreeBase {
     GarbageNode *header_p = &GetGCMetaData(thread_id)->header;
     GarbageNode *first_p = header_p->next_p;
 
+#if defined(OPT_IN_USE_FLAG) && BWTREE_PROCESS_MAPPING_CACHE
+    // Clearing at reclamation time alone is insufficient: a newer reader may
+    // already hold a cached pointer. After every recipient ACKs, take a fresh
+    // epoch and wait another grace period. Never block a worker on remote ACKs.
+    for (auto *node = first_p; node != nullptr && node->delete_epoch < min_epoch;
+         node = node->next_p) {
+      if (!node->cache_invalidation.sequence) {
+        node->cache_invalidation = mapping_cache_invalidations.try_publish(node->node_id);
+        if (!node->cache_invalidation.sequence) break;
+      }
+      if (node->cache_clear_epoch == std::numeric_limits<uint64_t>::max() &&
+          mapping_cache_invalidations.acknowledged(node->cache_invalidation))
+        node->cache_clear_epoch = GetGlobalEpoch();
+    }
+#endif
+    const auto reclaimable = [min_epoch](const GarbageNode *node) {
+      if (node == nullptr || node->delete_epoch >= min_epoch) return false;
+#if defined(OPT_IN_USE_FLAG) && BWTREE_PROCESS_MAPPING_CACHE
+      return node->cache_clear_epoch < min_epoch;
+#else
+      return true;
+#endif
+    };
+
     uint64_t reclaimable_nodes = 0;
     uint64_t reclaimable_bytes = 0;
-    for (auto *node = first_p; node != nullptr && node->delete_epoch < min_epoch;
+    for (auto *node = first_p; reclaimable(node);
          node = node->next_p) {
       reclaimable_nodes++;
       reclaimable_bytes += node->estimated_bytes;
@@ -10956,7 +11072,7 @@ class BwTree : public BwTreeBase {
       header_p->next_p = garbage_p->next_p;
 
       // Remove cached data of the node
-#ifdef OPT_IN_USE_FLAG
+#if defined(OPT_IN_USE_FLAG) && !BWTREE_PROCESS_MAPPING_CACHE
       // should first make sure the node is not in the cache
       for (size_t i = 0; i < DEFAULT_MACHINE_COUNT; i++) {
         cached_mapping_table[i][garbage_p->node_id].store(0);
@@ -10980,13 +11096,13 @@ class BwTree : public BwTreeBase {
     };
 
     if (gc_flush_worker.IsEnabled() == true) {
-      while (first_p != nullptr && first_p->delete_epoch < min_epoch) {
+      while (reclaimable(first_p)) {
         std::vector<const BaseNode *> nodes_to_flush;
         nodes_to_flush.reserve(GC_NODE_COUNT_THREADHOLD);
         uint64_t batch_bytes = 0;
 
         GarbageNode *node = first_p;
-        while (node != nullptr && node->delete_epoch < min_epoch &&
+        while (reclaimable(node) &&
                nodes_to_flush.size() < GC_NODE_COUNT_THREADHOLD) {
           nodes_to_flush.push_back((const BaseNode *)node->node_p);
           batch_bytes += node->estimated_bytes;
@@ -11004,7 +11120,7 @@ class BwTree : public BwTreeBase {
     } else {
       // Then traverse the linked list
       // Only reclaim memory when the deleted epoch < min epoch
-      while (first_p != nullptr && first_p->delete_epoch < min_epoch) {
+      while (reclaimable(first_p)) {
         reclaim_one(first_p);
         first_p = header_p->next_p;
       }

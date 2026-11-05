@@ -23,13 +23,13 @@ template<class F> std::thread bwtree_background_thread(F work) {
 #ifdef BWTREE_LOCAL_NUMA
   auto* context = bwtree_allocation_context;
   if (!context) throw std::logic_error("Missing BwTree background context");
-  return std::thread([context, work=std::move(work)]() mutable {
+  return index_memory_thread([context, work=std::move(work)]() mutable {
     bwtree_allocation_context = context;
     if (pthread_setaffinity_np(pthread_self(), sizeof(context->cpus), &context->cpus)) std::abort();
     work();
   });
 #else
-  return std::thread(std::move(work));
+  return index_memory_thread(std::move(work));
 #endif
 }
 #ifdef BWTREE_LOCAL_NUMA

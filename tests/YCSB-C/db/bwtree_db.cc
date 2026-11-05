@@ -111,6 +111,11 @@ int BwTreeDB::ThreadInit() {
   // int thread_id = allocate();
   int thread_id = SimThreadInfo::worker_thread_id;
   tree->AssignGCID(thread_id);
+#if defined(OPT_IN_USE_FLAG) && BWTREE_PROCESS_MAPPING_CACHE
+  // A attaches to B's shared tree without running its constructor. Create
+  // this process's private table during registration, before worker READY.
+  tree->PrepareLocalMappingCache();
+#endif
   return thread_id;
 }
 

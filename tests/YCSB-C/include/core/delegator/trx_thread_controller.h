@@ -18,6 +18,9 @@
 #include "shm/cxl_type.h"
 #include "utils/cpu_dist.h"
 #include "utils/sim_id.h"
+#ifdef SHM_LOCAL_NCC
+#include "../../../ub/local_ncc_index_check.h"
+#endif
 
 namespace ycsbc {
 #ifdef YCSB_UB_TWO_HOST
@@ -40,6 +43,11 @@ public:
         finish_flags(SimThreadInfo::worker_machine_count) {}
 
   void PrepareThreads() {
+#ifdef YCSB_UB_TWO_HOST
+    auto& threads_=runtime().threads;
+    auto& thread_args_=runtime().args;
+    if(!thread_args_.empty()) return;
+#endif
     threads_.resize(SimThreadInfo::dispatcher_thread_count);
     thread_args_.reserve(SimThreadInfo::dispatcher_thread_count);
     for (uint32_t i = 0; i < SimThreadInfo::dispatcher_thread_count; ++i) {
@@ -55,6 +63,12 @@ public:
   }
 
   void StartThreads() {
+#ifdef YCSB_UB_TWO_HOST
+    PrepareThreads(); // A creates its own pthread handles and arguments.
+    auto& threads_=runtime().threads;
+    auto& thread_args_=runtime().args;
+    ycsbc_ub::stage("THREAD_CONTROL storage=local-dram");
+#endif
     uint32_t mid = SimThreadInfo::worker_machine_id;
 #ifdef YCSB_UB_TWO_HOST
     uint32_t first=ycsbc_ub::first_thread(mid), last=first+ycsbc_ub::threads(mid);
@@ -103,6 +117,9 @@ public:
   void StartExecution() { sync_var_.store(1, std::memory_order_release); }
 
   void WaitForLocalThreads() {
+#ifdef YCSB_UB_TWO_HOST
+    auto& threads_=runtime().threads;
+#endif
     uint32_t mid = SimThreadInfo::worker_machine_id;
 #ifdef YCSB_UB_TWO_HOST
     uint32_t first=ycsbc_ub::first_thread(mid), last=first+ycsbc_ub::threads(mid);
@@ -144,6 +161,7 @@ public:
   }
 
 #ifdef YCSB_UB_TWO_HOST
+  cxl_vector<DB*>* SharedDBs() { return dbs_; }
   void WaitForLocalReady() {
     auto mid=SimThreadInfo::worker_machine_id;
     while(local_ready[mid].load()!=unsigned(ycsbc_ub::threads(mid))) std::this_thread::yield();
@@ -154,10 +172,23 @@ public:
   }
   void ReportLocal(double seconds, uint64_t total=0) {
     auto mid=SimThreadInfo::worker_machine_id;
-    uint64_t reads=0,writes=0,trace_hash=14695981039346656037ULL;
+    // Keep both RPC servers running until all clients have received replies.
+    if(ycsbc_ub::rpc_mode())
+      for(const auto& flag:finish_flags)
+        while(!flag.load(std::memory_order_acquire)) std::this_thread::yield();
+#ifdef SHM_LOCAL_NCC
+    size_t verified_keys = 0;
+    if (std::getenv("YCSB_UB_SUITE")) {
+      for (const auto& flag : finish_flags)
+        while (!flag.load(std::memory_order_acquire)) std::this_thread::yield();
+      verified_keys = ncc_check_.run((*dbs_)[0], op_groups);
+    }
+#endif
+    uint64_t reads=0,writes=0,remote=0,trace_hash=14695981039346656037ULL;
     for(int t=ycsbc_ub::first_thread(mid);t<ycsbc_ub::first_thread(mid)+ycsbc_ub::threads(mid);++t)
       for(const auto& op:op_groups[t]) {
         if(op.type==READ) ++reads; else ++writes;
+        if(ycsbc_ub::rpc_mode() && UbRpcOwner(op.key)!=mid) ++remote;
         trace_hash=(trace_hash^uint64_t(t))*1099511628211ULL;
         trace_hash=(trace_hash^uint64_t(op.type))*1099511628211ULL;
         trace_hash=(trace_hash^uint64_t(op.key))*1099511628211ULL;
@@ -174,9 +205,17 @@ public:
       <<"false"
 #endif
       <<",\"rpc_completed\":"<<UbRpcCompleted()
+      <<",\"rpc_sent\":"<<UbRpcSent()<<",\"rpc_local\":"<<UbRpcLocal()
+      <<",\"rpc_expected_remote\":"<<remote
+      <<",\"index_storage\":\""<<(ycsbc_ub::rpc_mode()?"local-dram":"shared")<<"\""
+      <<",\"thread_control_storage\":\"local-dram\""
       <<",\"rpc_transport\":\""<<UbRpcTransport()<<"\""
       <<",\"nc_data\":"<<(ycsbc_ub::nc_data()?"true":"false")
       <<",\"nc_direct\":"<<(ycsbc_ub::nc_direct_data()?"true":"false")
+      <<",\"operation_storage\":\"local-dram\""
+#ifdef SHM_LOCAL_NCC
+      <<",\"verified_keys\":"<<verified_keys<<",\"verified_versions\":"<<(verified_keys ? 32 : 0)
+#endif
       <<",\"trace_hash\":\""<<std::hex<<trace_hash<<"\"}";
     ycsbc_ub::reply(response.str());
   }
@@ -188,8 +227,16 @@ private:
     uint32_t sim_thread_id;
   };
 
+#ifdef YCSB_UB_TWO_HOST
+  struct LocalRuntime {
+    std::vector<pthread_t> threads;
+    std::vector<ThreadArgsDeleTrans> args;
+  };
+  static LocalRuntime& runtime() { static LocalRuntime local; return local; }
+#else
   cxl_vector<pthread_t> threads_;
   cxl_vector<ThreadArgsDeleTrans> thread_args_;
+#endif
   ControllerAtomic<uint64_t> sum;
   cxl_vector<ycsbc::DB *> *dbs_;
   ControllerAtomic<int> sync_var_;
@@ -197,6 +244,9 @@ private:
   cxl_vector<ControllerAtomic<int>> finish_flags;
 #ifdef YCSB_UB_TWO_HOST
   nt<uint64_t> local_ready[2], local_success[2];
+#ifdef SHM_LOCAL_NCC
+  LocalNccIndexCheck ncc_check_;
+#endif
 #endif
 #ifdef ASYNC_CLIENT
   // The number of requests that a client can send simultaneously
@@ -249,6 +299,12 @@ private:
 #endif
 
 #ifdef YCSB_UB_TWO_HOST
+    // The shared array distributes the original trace to A and B. Only this
+    // worker-private DRAM copy is accessed after READY, for every index/mode.
+    const auto& shared_ops = op_groups[arg->sim_thread_id];
+    std::vector<Operation, ycsbc_ub::LocalDramAllocator<Operation>> ops(shared_ops.begin(), shared_ops.end());
+    ycsbc_ub::check_local_workload(ops.data(), ops.size() * sizeof(Operation),
+                                  arg->sim_thread_id, ops.size());
     ycsbc_ub::stage("thread " + std::to_string(arg->sim_thread_id) + " publishing ready flag");
     local_ready[arg->sim_machine_id].fetch_add(1);
     ycsbc_ub::stage("thread " + std::to_string(arg->sim_thread_id) + " ready flag published");
@@ -259,7 +315,9 @@ private:
     }
 
     int oks = 0;
+#ifndef YCSB_UB_TWO_HOST
     cxl_vector<Operation> &ops = op_groups[arg->sim_thread_id];
+#endif
 #ifdef ASYNC_CLIENT
     // Store the value of read for check
     std::vector<uint64_t> read_value(virtual_clients);

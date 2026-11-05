@@ -23,9 +23,20 @@
 #include "utils/timing.h"
 #include "replica_help_update/help_update.h"
 
-// Mutable index metadata uses NC in split UB mode; immutable pairs use CACHE.
+// The RPC adapter reuses the partition allocator and background-thread context.
+// Existing users retain the global CXL allocator and original startup path.
+#ifdef CLEVEL_RPC_ADAPTER
+#include "../BwTree/src/allocation_context.h"
+#include "partition_epoch_gc.h"
+#include <shared_mutex>
+#include <optional>
+#include <mutex>
+inline MemoryManager& clevel_memory() { return bwtree_memory(); }
+template<class T> using clevel_vector = std::vector<T, BwTreeAllocator<T>>;
+#else
 inline MemoryManager& clevel_memory() { return cacheable; }
 template<class T> using clevel_vector = cxl_vector<T>;
+#endif
 
 // #define OPT_NO_META
 // #define OPT_BATCH_FLUSH
@@ -83,6 +94,20 @@ public:
   using reference = value_type &;
   using const_reference = const value_type &;
 
+#ifdef CLEVEL_RPC_ADAPTER
+  std::shared_mutex rpc_resize_mutex;
+  std::unique_ptr<PartitionEpochGC<value_type>> rpc_gc;
+  std::atomic<bool> rpc_gc_running{false};
+  std::atomic<uint64_t> rpc_migrated_buckets{0};
+  std::thread rpc_gc_thread;
+  void stop_rpc_background() {
+    run_expand_thread.store(false);
+    if (expand_thread.joinable()) expand_thread.join();
+    rpc_gc_running.store(false);
+    if (rpc_gc_thread.joinable()) rpc_gc_thread.join();
+    rpc_gc->drain();
+  }
+#endif
 
   // using hasher = Hash;
   using hasher =
@@ -454,7 +479,9 @@ public:
     m->is_resizing = false;
 
     run_expand_thread.store(true);
-    expand_thread = std::thread(&clevel_hash::resize, this);
+#ifndef CLEVEL_RPC_ADAPTER
+    expand_thread = index_memory_thread([this] { resize(); });
+#endif
 
     KV_entry_ptr_s e = get_entry(meta.load()->first_level, 0, 0);
     if (e.addr() != nullptr) {
@@ -544,9 +571,31 @@ public:
   ~clevel_hash() {
     run_expand_thread.store(false);
     if (expand_thread.joinable()) expand_thread.join();
+#ifdef CLEVEL_RPC_ADAPTER
+    if (rpc_gc) stop_rpc_background();
+#endif
     clear();
   }
 
+#ifdef CLEVEL_RPC_ADAPTER
+  // Start only after per-worker buffers and replicas are initialized. Give the
+  // resizer its own slot and inherit the owning partition's NUMA allocator.
+  void start_partition_resizer(size_type worker_count) {
+    rpc_gc.reset(new PartitionEpochGC<value_type>(worker_count + 1, destroy_shared_value));
+    rpc_gc_running.store(true);
+    rpc_gc_thread = bwtree_background_thread([this] {
+      while (rpc_gc_running.load()) {
+        rpc_gc->collect();
+        usleep(1000);
+      }
+    });
+    expand_thread = bwtree_background_thread([this, worker_count] {
+      SimThreadInfo::setup_worker_ids(0, worker_count);
+      resize();
+    });
+  }
+  const void* replica_address() const { return meta_replicas.data(); }
+#endif
 
   // for debug
   void foo() {
@@ -808,7 +857,11 @@ void clevel_hash<Key, T, Hash, KeyEqual, HashPower>::del_dup(
       uint64_t expected = e2.p;
       bool ret = p2->p.compare_exchange_strong(expected, 0);
       if (ret) {
+#ifdef CLEVEL_RPC_ADAPTER
+        rpc_gc->retire(SimThreadInfo::worker_thread_id, e2.addr());
+#else
         retire_shared_value(e2.addr());
+#endif
       }
     }
   }
@@ -1418,6 +1471,11 @@ clevel_hash<Key, T, Hash, KeyEqual, HashPower>::generic_update(
 
       else if (expected = old_e.p,
                e->p.compare_exchange_strong(expected, created.p)) {
+#ifdef CLEVEL_RPC_ADAPTER
+        // RPC writes hold the shared resize lock: the resizer cannot republish
+        // old_e after this unlink. find(fix_dup=true) removed any duplicates.
+        if (old_e.p != created.p) rpc_gc->retire(thread_id, old_e.addr());
+#endif
         // Instead of simply issuing another find to guarantee
         // the update is successful, we apply context checking
         // to avoid unnecessary second find. The update fails
@@ -1642,11 +1700,22 @@ void clevel_hash<Key, T, Hash, KeyEqual, HashPower>::expand(
 template <typename Key, typename T, typename Hash, typename KeyEqual,
           size_t HashPower>
 void clevel_hash<Key, T, Hash, KeyEqual, HashPower>::resize() {
+#ifdef CLEVEL_RPC_ADAPTER
+  size_type thread_id = SimThreadInfo::worker_thread_id;
+#else
   size_type thread_id = SimThreadInfo::worker_thread_count - 1;
+#endif
   difference_type t_id = static_cast<difference_type>(thread_id);
   difference_type expand_bucket = 0;
 
   while (run_expand_thread.load()) {
+#ifdef CLEVEL_RPC_ADAPTER
+    // One bucket per iteration. Readers remain concurrent and use epochs;
+    // writers can run together but cannot race pointer migration.
+    std::unique_lock<std::shared_mutex> migration_lock(rpc_resize_mutex);
+    std::optional<typename PartitionEpochGC<value_type>::Guard> epoch_guard;
+    epoch_guard.emplace(*rpc_gc, thread_id);
+#endif
 #ifdef OPT_CLEVEL_ROOT_READ
     level_meta *m = (help_update != nullptr) ? help_update->load_ptr(SimThreadInfo::worker_thread_id) : meta.load();
 #else
@@ -1661,6 +1730,10 @@ void clevel_hash<Key, T, Hash, KeyEqual, HashPower>::resize() {
     }
 
     if (m == nullptr || n_levels == 2) {
+#ifdef CLEVEL_RPC_ADAPTER
+      epoch_guard.reset();
+      migration_lock.unlock();
+#endif
       usleep(10000);
       continue;
     }
@@ -1728,6 +1801,9 @@ void clevel_hash<Key, T, Hash, KeyEqual, HashPower>::resize() {
       } // end for (slot_idx)
 
       expand_bucket++;
+#ifdef CLEVEL_RPC_ADAPTER
+      rpc_migrated_buckets.fetch_add(1, std::memory_order_relaxed);
+#endif
       if (static_cast<size_type>(expand_bucket) == bl->capacity) {
         bool rc = false;
         while (true) {

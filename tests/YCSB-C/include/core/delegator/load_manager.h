@@ -18,10 +18,14 @@ public:
     std::vector<std::future<int>> actual_ops;
     int cur_op_count = 0;
     int loader_nr = std::min(dispatcher_nr, 16);
+#ifdef YCSB_UB_TWO_HOST
+    if(ycsbc_ub::rpc_mode()) loader_nr=std::min(ycsbc_ub::threads(SimThreadInfo::worker_machine_id),16);
+#endif
     cur_op_count = total_ops / loader_nr;
     for (int i = 0; i < loader_nr; ++i) {
 #ifdef YCSB_UB_TWO_HOST
-      IDPair ids(0, i); // Every loader runs on B; A only attaches after loading.
+      const unsigned machine=ycsbc_ub::rpc_mode() ? SimThreadInfo::worker_machine_id : 0;
+      IDPair ids(machine, ycsbc_ub::first_thread(machine)+i);
 #else
       IDPair ids(i / (loader_nr / machine_nr), i);
 #endif

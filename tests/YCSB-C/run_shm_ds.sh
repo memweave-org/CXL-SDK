@@ -3,9 +3,11 @@
 set -e
 
 # Real two-host UB: Docker builds; each physical host runs its local worker.
-if [[ ${1:-} == -mode=ub_two_host ]]; then
+if [[ ${1:-} == -mode=ub_two_host || ${1:-} == -mode=cxl_two_process ]]; then
+    backend=ub
+    [[ $1 != -mode=cxl_two_process ]] || backend=cxl
     shift
-    exec bash "$(dirname -- "${BASH_SOURCE[0]}")/run.sh" "$@"
+    exec bash "$(dirname -- "${BASH_SOURCE[0]}")/run.sh" --backend "$backend" "$@"
 fi
 
 export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}:/usr/local/lib"

@@ -7,7 +7,7 @@ const char* ub_api_name();
 enum class UbMappingMode { Legacy, Cacheable, Noncacheable };
 // UBSM Cacheable mappings invalidate this host's entire arena after ownership,
 // before application access. SHM_UB_STARTUP_INVALIDATE=0 disables this only for
-// controlled comparisons; invalidation does not clear memory contents.
+// controlled comparisons; clearing cached state does not clear memory contents.
 void* map_ub_memory(const char* name, void* base, size_t size, UbMappingMode mode = UbMappingMode::Legacy, bool read_only = false);
 void unmap_ub_memory(void* base, size_t size);
 // Create once; destroy only after both workers confirm unmap/finalize.
@@ -27,3 +27,12 @@ size_t ub_arena_used(bool atomic);
 size_t ub_arena_live(bool atomic);
 void ub_cache_maintenance(const void*, size_t, bool writeback, bool fence);
 void ub_assert_atomic_target(const void*);
+
+// Optional CoW reader acquisition (SHM_UB_COW_ACQUIRE=1, off by default) for the
+// split, read-only CACHE mapping. This does not replace startup invalidation.
+// Objects must
+// stay immutable and their addresses must not be reused within this mapping.
+// The local registry is cleared on unmap. No effect on writer/NC/non-UB data.
+bool ub_cache_needs_read_acquire(const void*);
+void ub_acquire_immutable(const void*, void (*invalidate)(const void*));
+void ub_acquire_immutable_bytes(const void*, size_t);

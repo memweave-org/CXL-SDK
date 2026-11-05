@@ -8,11 +8,14 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 
 constexpr uint64_t OLD = 0x1122334455667788ULL;
 constexpr uint64_t NEW = 0x8877665544332211ULL;
+static_assert(__atomic_always_lock_free(sizeof(uint64_t), nullptr),
+              "NC probe requires native lock-free 64-bit atomics");
 static void check(const char* op, int rc) {
   std::cerr << op << " rc=" << rc << std::endl;
   if (rc) throw std::runtime_error(op);
@@ -111,12 +114,36 @@ int main(int argc, char** argv) {
     std::cout << "UBMICRO READY" << std::endl;
     std::string command;
     while (std::getline(std::cin,command)) {
+      std::cerr << "BEGIN command " << command << std::endl;
       if (nc && command=="read") {
         barrier(); auto value=*word; barrier();
         std::cout << "UBMICRO VALUE " << value << std::endl;
       } else if (nc && command=="write") {
         *word=role=="B" ? NEW : OLD; barrier();
         std::cout << "UBMICRO OK" << std::endl;
+      } else if (nc && command.rfind("cas ",0)==0) {
+        std::istringstream input(command);
+        std::string op, expected_text, desired_text, extra;
+        if (!(input >> op >> expected_text >> desired_text) || (input >> extra))
+          throw std::runtime_error("usage: cas EXPECTED DESIRED");
+        uint64_t expected=number(expected_text.c_str());
+        const uint64_t desired=number(desired_text.c_str());
+        barrier();
+        const bool success=__atomic_compare_exchange_n(word,&expected,desired,false,
+                                                       __ATOMIC_SEQ_CST,__ATOMIC_SEQ_CST);
+        barrier();
+        // On failure expected must contain the actual old value; on success it is unchanged.
+        std::cout << "UBMICRO CAS " << success << ' ' << expected << std::endl;
+      } else if (nc && command.rfind("fetch_add ",0)==0) {
+        std::istringstream input(command);
+        std::string op, amount_text, extra;
+        if (!(input >> op >> amount_text) || (input >> extra))
+          throw std::runtime_error("usage: fetch_add AMOUNT");
+        const uint64_t amount=number(amount_text.c_str());
+        barrier();
+        const uint64_t previous=__atomic_fetch_add(word,amount,__ATOMIC_SEQ_CST);
+        barrier();
+        std::cout << "UBMICRO FETCH_ADD " << previous << std::endl;
       } else if (!nc && command=="prime" && role=="A") {
         invalidate(target); auto value=*word; barrier();
         std::cout << "UBMICRO VALUE " << value << std::endl;
@@ -132,11 +159,17 @@ int main(int argc, char** argv) {
         std::cout << "UBMICRO VALUE " << value << std::endl;
       } else if (command=="close" || (command=="release" && role=="B")) {
         if (owned) {
+          std::cerr << "BEGIN ownership NONE" << std::endl;
           check("ownership NONE",ubsmem_shmem_set_ownership(name.c_str(),address,bytes,PROT_NONE)); owned=false;
         }
+        std::cerr << "BEGIN unmap" << std::endl;
         check("unmap",ubsmem_shmem_unmap(address,bytes)); address=nullptr;
         // Coordinator sends release only after A has finalized and exited successfully.
-        if (command=="release") { check("deallocate",ubsmem_shmem_deallocate(name.c_str())); created=false; }
+        if (command=="release") {
+          std::cerr << "BEGIN deallocate" << std::endl;
+          check("deallocate",ubsmem_shmem_deallocate(name.c_str())); created=false;
+        }
+        std::cerr << "BEGIN finalize" << std::endl;
         check("finalize",ubsmem_finalize()); initialized=false;
         std::cout << "UBMICRO CLOSED" << std::endl;
         result=0; break;

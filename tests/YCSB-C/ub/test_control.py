@@ -181,7 +181,7 @@ os.write(fd,b'CLOSED\n')
         with self.assertRaises(RuntimeError): summary({**a,'writes':1},b,2,100)
 
     def test_suite_requires_read_only_a_and_correct_rpc_transport(self):
-        a={'role':'A','reads':100,'writes':0,'errors':0,'bwtree_opt':False,'rpc_transport':'none'}
+        a={'role':'A','reads':100,'writes':0,'errors':0,'bwtree_opt':False,'rpc_transport':'none','rpc_completed':0}
         b={**a,'role':'B','reads':90,'writes':10,'framework_total_operations':200,'seconds':2,'rpc_completed':0}
         self.assertEqual(summary(a,b,3,100,suite=True)['update_semantics'],'replace-existing-key')
         for rpc in (0,1):
@@ -191,13 +191,32 @@ os.write(fd,b'CLOSED\n')
             summary(a,b,3,100,suite=True,a_writable=1)
         with self.assertRaisesRegex(RuntimeError,'RPC completion'):
             summary(a,{**b,'rpc_completed':10},3,100,suite=True)
-        with self.assertRaisesRegex(RuntimeError,'RPC completion'):
+        with self.assertRaisesRegex(RuntimeError,'RPC routing'):
             summary(a,b,3,100,suite=True,rpc=1)
-        rpc_a={**a,'rpc_transport':'mpmc-shared-queue'}
-        rpc_b={**b,'rpc_completed':100,'rpc_transport':'mpmc-shared-queue'}
+        rpc_a={**a,'rpc_transport':'bidirectional-mpmc-shared-queue','index_storage':'local-dram',
+               'rpc_sent':43,'rpc_completed':57,'rpc_local':57,'rpc_expected_remote':43}
+        rpc_b={**b,'rpc_transport':'bidirectional-mpmc-shared-queue','index_storage':'local-dram',
+               'rpc_sent':57,'rpc_completed':43,'rpc_local':43,'rpc_expected_remote':57}
         self.assertTrue(summary(rpc_a,rpc_b,3,100,suite=True,rpc=1)['pass'])
         with self.assertRaisesRegex(RuntimeError,'RPC transport'):
-            summary(a,rpc_b,3,100,suite=True,rpc=1)
+            summary({**rpc_a,'rpc_transport':'mpmc-shared-queue'},rpc_b,3,100,suite=True,rpc=1)
+        for change in ({'rpc_sent':44},{'rpc_completed':56},{'rpc_local':58},{'index_storage':'shared'}):
+            with self.assertRaisesRegex(RuntimeError,'RPC routing'):
+                summary({**rpc_a,**change},rpc_b,3,100,suite=True,rpc=1)
+
+    def test_native_timer_must_fit_controller_window(self):
+        a={'role':'A','reads':100,'writes':0,'errors':0,'bwtree_opt':True}
+        b={'role':'B','reads':90,'writes':10,'errors':0,'bwtree_opt':True,
+           'framework_total_operations':200,'seconds':34.24}
+        with self.assertRaisesRegex(RuntimeError,'Timing mismatch'):
+            summary(a,b,2.0,100)
+        self.assertTrue(summary(a,b,34.3,100)['pass'])
+        # Network/controller delays can legitimately lengthen the outer window.
+        self.assertTrue(summary(a,{**b,'seconds':2.0},34.3,100)['pass'])
+        for invalid in (float('nan'),float('inf'),0.0,-1.0):
+            with self.subTest(seconds=invalid):
+                with self.assertRaises(RuntimeError): summary(a,{**b,'seconds':invalid},2.0,100)
+                with self.assertRaises(RuntimeError): summary(a,b,invalid,100)
 
     def test_two_peers(self):
         a,b=self.run_two_peers()

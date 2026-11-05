@@ -50,12 +50,22 @@ def main():
                 assert case['threads_A']==case['threads_B']==1
                 text=(root/role/case['case']/'threads-1'/'worker.log').read_text()
                 nc=case['case'].startswith('sherman+nc-')
-                assert f'CACHE={"NONE" if nc else "READ" if role=="A" else "RW"} NC=RW' in text
+                cache='NONE' if nc or case['rpc'] else 'READ' if role=='A' else 'RW'
+                # The worker, not just the launcher, reports the actual mapping.
+                assert f'CACHE={cache} metadata=RW' in text
+                assert 'THREAD_CONTROL storage=local-dram' in text
                 if nc:
                     assert case['B']['rpc_completed']==0,case
                     assert case['cache_policy']=='NC-only; A reads, B reads/updates',case
-                if case['rpc']: assert case['B']['rpc_completed']==128
+                if case['rpc']:
+                    for host,peer in (('A','B'),('B','A')):
+                        assert 0<case[host]['rpc_sent']<128,case
+                        assert case[host]['rpc_sent']==case[peer]['rpc_completed'],case
+                        assert case[host]['rpc_local']+case[host]['rpc_sent']==128,case
+                    assert 'RPC_INDEX_STORAGE' in text and 'RPC_PARTITION' in text
+                    assert case['cache_policy']=='local-DRAM partitions; NC RPC transport'
                 else: assert case['B']['rpc_completed']==0
+                if nc: assert 'shared_version_table_bytes=0' in text or role=='A'
         assert not list((root/'objects').iterdir()),'UB fixture objects leaked'
         print('PASS: all eight cases, native two-process shell flow, one CPU; logs:',root)
     finally:

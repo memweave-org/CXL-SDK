@@ -182,9 +182,13 @@ void master_process(utils::Properties &props) {
 
   size_t total_trx_ops =
       stoi(props.GetProperty(ycsbc::CoreWorkload::OPERATION_COUNT_PROPERTY));
+#ifdef YCSB_UB_TWO_HOST
+  auto master_trx_manager = new ycsbc::MasterTransactionManager(machine_list, dbs, wl, total_trx_ops);
+#else
   auto master_trx_manager =
       ALLOC_AND_CONSTRUCT(ycsbc::MasterTransactionManager, shared_atomic_memory().malloc,
                           machine_list, dbs, wl, total_trx_ops);
+#endif
   master_trx_manager->Execute(props, duration, sum);
 
   std::cerr << "dbname\t" << props["dbname"] << '\n'
@@ -214,6 +218,7 @@ void master_process(utils::Properties &props) {
 #ifdef YCSB_UB_TWO_HOST
   // A must have finished and unmapped before destroying the shared DB.
   ycsbc_ub::await_cleanup();
+  delete master_trx_manager;
 #endif
   for (uint32_t i = 0; i < SimThreadInfo::worker_db_count; i++) {
     ycsbc::DB *db = (*dbs)[i];
@@ -243,6 +248,13 @@ void follower_process(utils::Properties &props) {
   auto trx_thread_controller = g_var_struct->trx_thread_controller;
 
 #ifdef YCSB_UB_TWO_HOST
+  if(ycsbc_ub::rpc_mode()) {
+    auto* workload=build_workload(props);
+    ycsbc::LoadManager loader(trx_thread_controller->SharedDBs(),workload);
+    loader.LoadData(SimThreadInfo::dispatcher_thread_count,SimThreadInfo::worker_machine_count,
+                    stoi(props[ycsbc::CoreWorkload::RECORD_COUNT_PROPERTY]));
+    delete workload;
+  }
   ycsbc_ub::stage("A starting local threads");
 #endif
   trx_thread_controller->StartThreads();

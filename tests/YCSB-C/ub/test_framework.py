@@ -6,6 +6,7 @@ Pass --binary built with BWTREE_MAPPING_TABLE_BITS=10 and the fixture SDK.
 import argparse
 import json
 import os
+import re
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
@@ -16,6 +17,7 @@ def main():
     parser=argparse.ArgumentParser()
     parser.add_argument('--binary', required=True)
     parser.add_argument('--opt',type=int,choices=(0,1),required=True)
+    parser.add_argument('--db',choices=('bwtree','clevelhash'),default='bwtree')
     args=parser.parse_args()
     cpus=os.sched_getaffinity(0)
     cpu=next(c for c in sorted(cpus) if c+1 in cpus)
@@ -28,7 +30,7 @@ def main():
                 log=(root/(role+'.log')).open('w');logs.append(log)
                 settings=SimpleNamespace(role=role,binary=args.binary,threads_a=1,threads_b=2,
                     size_mb=128,nc_size_mb=128,records=35,ops=128,cpu=cpu,timeout=30,
-                    spec=str(HERE/'workloadb_90read.spec'),ini=str(HERE/'config.ini'))
+                    spec=str(HERE/'workloadb_90read.spec'),ini=str(HERE/'config.ini'),db=args.db)
                 worker=Worker(settings,'native-framework-test','fixture',log)
                 workers.append(worker)
                 assert worker.receive()=='READY'
@@ -40,10 +42,16 @@ def main():
             assert br['reads']+br['writes']==128 and br['errors']==0, br
             assert br['framework_total_operations']==256, br
             assert ar['bwtree_opt']==br['bwtree_opt']==bool(args.opt)
+            assert ar['operation_storage']==br['operation_storage']=='local-dram'
             a.finish('close');b.finish('release')
             assert not list((root/'objects').iterdir())
             atext=(root/'A.log').read_text();btext=(root/'B.log').read_text()
-            for log in (atext,btext):
+            for log,threads in ((atext,1),(btext,2)):
+                storage=re.findall(r'WORKLOAD_STORAGE thread=(\d+) operations=(\d+) storage=local-dram node=(\d+) address=(0x[0-9a-f]+) bytes=(\d+)',log)
+                assert len(storage)==threads and sum(int(row[1]) for row in storage)==128, storage
+                for tid,count,node,address,size in storage:
+                    assert int(size)>0 and not 0x300000000000 <= int(address,16) < 0x400008000000, storage
+                    assert log.index('WORKLOAD_STORAGE thread='+tid+' ') < log.index('thread '+tid+' publishing ready flag')
                 calls=[line for line in log.splitlines() if line.startswith('UB_MAP_CALL ')]
                 assert len(calls)==2, calls
                 assert 'index=1 name=native-framework-test-nc' in calls[0], calls
@@ -54,7 +62,7 @@ def main():
             assert 'address=0x300000000000 prot=3' in btext
             assert '# Loaded records:\t35' in btext
             assert 'throughput\t' in btext and 'total operations\t256' in btext
-            print('PASS: native ycsbc -> LoadManager/MasterTransactionManager/Client/BwTreeDB; OPT='+str(args.opt))
+            print('PASS: original framework, local-DRAM workload before READY, index='+args.db+' OPT='+str(args.opt))
         except BaseException:
             for log in logs:log.flush()
             for role in ('A','B'):

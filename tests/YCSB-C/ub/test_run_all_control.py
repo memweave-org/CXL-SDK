@@ -28,6 +28,30 @@ EXPECTED={
 
 
 class RoutingTests(unittest.TestCase):
+    def test_memory_defaults_and_overrides(self):
+        base={k:v for k,v in os.environ.items() if k not in
+              ('SIZE_MB','NC_SIZE_MB','SHERMAN_NC_SIZE_MB','YCSB_UB_CONFIG','A_WRITABLE')}
+        for override,cache,nc,sherman_nc in (
+            ({},65536,16384,65536),
+            ({'NC_SIZE_MB':'128'},65536,128,128),
+            ({'SIZE_MB':'256','SHERMAN_NC_SIZE_MB':'512'},256,16384,512),
+            ({'NC_SIZE_MB':'128','SHERMAN_NC_SIZE_MB':'512'},65536,128,512),
+        ):
+            with self.subTest(override=override):
+                result=subprocess.run(['bash',str(HERE/'run_all.sh'),'--dry-run'],
+                    env=dict(base,**override),capture_output=True,text=True,check=True)
+                plan=json.loads(result.stdout)
+                for case in EXPECTED:
+                    self.assertEqual(plan['memory_by_case'][case],{
+                        'cache_mb':0 if case.startswith('sherman+') or case.endswith('+rpc') else cache,
+                        'nc_mb':sherman_nc if case.startswith('sherman+') else nc})
+                # run_all.sh exports config before run.sh sources it again.
+                result=subprocess.run(['bash','-c',
+                    'set -a; source "$1"; source "$1"; printf "%s %s %s" "$SIZE_MB" "$NC_SIZE_MB" "$SHERMAN_NC_SIZE_MB"',
+                    'config-test',str(HERE/'config.sh')],env=dict(base,**override),
+                    capture_output=True,text=True,check=True)
+                self.assertEqual(result.stdout,f'{cache} {nc} {sherman_nc}')
+
     def test_batch_plan(self):
         result=subprocess.run(['bash',str(HERE/'run_all.sh'),'--dry-run'],
                               env={k:v for k,v in os.environ.items() if k not in ('THREAD_COUNTS','YCSB_UB_CONFIG','A_WRITABLE')},
@@ -68,6 +92,8 @@ class RoutingTests(unittest.TestCase):
                     self.assertEqual(env['CPU_A'],'0')
                     self.assertEqual(env['YCSB_UB_SUITE'],'1')
                     self.assertEqual(env['OPS'],'100')
+                    self.assertEqual(env['SIZE_MB'],'128')
+                    self.assertEqual(env['NC_SIZE_MB'],'512' if case.startswith('sherman+') else '128')
                     self.assertEqual(Path(env['YCSB_UB_BUNDLE']).name,'opt' if case.endswith('+opt') else 'noopt')
                     schedule=json.loads(env['YCSB_UB_THREAD_SWEEP'])
                     self.assertEqual(schedule,{'runner':'run_all','cases':list(EXPECTED),
@@ -84,7 +110,7 @@ class RoutingTests(unittest.TestCase):
                     (Path(env['YCSB_UB_OUTPUT'])/'result.json').write_text(json.dumps(result))
                 env={'YCSB_UB_ROLE':'A','SPEC':str(HERE/'workloadb_90read.spec'),
                      'A_IP':'unused','B_IP':'unused','RECORDS':'100','OPS':'100','SIZE_MB':'128',
-                     'NC_SIZE_MB':'128','SEED':'1','A_WRITABLE':'0','THREADS_A':'7','THREADS_B':'9'}
+                     'NC_SIZE_MB':'128','SHERMAN_NC_SIZE_MB':'512','SEED':'1','A_WRITABLE':'0','THREADS_A':'7','THREADS_B':'9'}
                 with patch.dict(os.environ,env,clear=True), patch.object(run_all,'run_command',run_command), \
                      patch.object(run_all.os,'sched_getaffinity',return_value=set(range(128))), \
                      patch.object(run_all.os,'getloadavg',side_effect=AssertionError('load detection forbidden')), \
@@ -102,6 +128,8 @@ class RoutingTests(unittest.TestCase):
                     for case,n in expected:
                         result=json.loads((out/case/f'threads-{n}'/'result.json').read_text())
                         self.assertEqual((result['threads_A'],result['threads_B']),(n,n))
+                        self.assertEqual(result['memory']['nc_mb'],
+                                         512 if case.startswith('sherman+') else 128)
                 else:
                     stop=('bwtree',64) if fault=='command' else ('bwtree+opt',64)
                     completed=expected.index(stop)
@@ -119,6 +147,19 @@ class RoutingTests(unittest.TestCase):
                 run_all.run_command([sys.executable,'-c','pass'],dict(os.environ),log)
                 with self.assertRaisesRegex(RuntimeError,'Command exited 7'):
                     run_all.run_command([sys.executable,'-c','raise SystemExit(7)'],dict(os.environ),log)
+
+    def test_pair_failure_stops_other_child_and_preserves_output(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary); pidfile=root/'child.pid'
+            waiting='import os,time,pathlib; pathlib.Path('+repr(str(pidfile))+').write_text(str(os.getpid())); print("waiting for peer",flush=True); time.sleep(30)'
+            failing='import time,pathlib\np=pathlib.Path('+repr(str(pidfile))+')\nwhile not p.exists(): time.sleep(.01)\nprint("peer failed",flush=True)\nraise SystemExit(17)'
+            with (root/'A.log').open('w') as a,(root/'B.log').open('w') as b,redirect_stdout(io.StringIO()) as terminal:
+                with self.assertRaisesRegex(RuntimeError,'Command exited 17'):
+                    run_all.run_commands([([sys.executable,'-c',waiting],dict(os.environ),a),
+                                          ([sys.executable,'-c',failing],dict(os.environ),b)])
+            self.assertIn('peer failed',terminal.getvalue())
+            self.assertIn('peer failed',(root/'B.log').read_text())
+            with self.assertRaises(ProcessLookupError): os.kill(int(pidfile.read_text()),0)
 
     def test_a_writable_is_rejected_before_build_or_run(self):
         for script,arguments in [('run.sh',[]),('run_all.sh',['--dry-run'])]:
@@ -150,7 +191,8 @@ printf '%s %s' "$OPT" "$YCSB_INDEXES" > "$1/build-routing"
                         YCSB_UB_ROLE='A',YCSB_UB_CASE='bwtree' if case=='legacy' else case,
                         YCSB_UB_SUITE='0' if case=='legacy' else '1',
                         YCSB_UB_OUTPUT=str(out),OPT='1',A_WRITABLE='0')
-                    for key in ('YCSB_UB_BUNDLE','YCSB_UB_FIXTURE','YCSB_UB_CONFIG'):
+                    for key in ('YCSB_UB_BUNDLE','YCSB_UB_FIXTURE','YCSB_UB_CONFIG',
+                                'SIZE_MB','NC_SIZE_MB','SHERMAN_NC_SIZE_MB'):
                         env.pop(key,None)
                     subprocess.run(['bash',str(root/'run.sh')],env=env,check=True,capture_output=True)
                     db,opt,rpc,access,writable=expected
@@ -159,6 +201,8 @@ printf '%s %s' "$OPT" "$YCSB_INDEXES" > "$1/build-routing"
                     args=json.loads((out/'peer-args.json').read_text())
                     def value(flag): return args[args.index(flag)+1]
                     self.assertEqual(value('--expected-opt'),str(opt))
+                    self.assertEqual(value('--size-mb'),'65536')
+                    self.assertEqual(value('--nc-size-mb'),'65536' if case.startswith('sherman+') else '16384')
                     self.assertEqual('--suite' in args,case!='legacy')
                     if case!='legacy':
                         self.assertEqual(value('--db'),db)

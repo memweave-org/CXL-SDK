@@ -12,6 +12,17 @@ export LD_LIBRARY_PATH="$(dirname -- "$SDK_LIBRARY"):$SDK_ROOT/lib:$SDK_ROOT/lib
 out=${1:?output directory required}
 mkdir -p "$out"
 out=$(cd "$out" && pwd)
+if [[ ${YCSB_BACKEND:-ub} == cxl ]]; then
+  variant=nocc
+  [[ $OPT != 0 ]] || variant=nocc_no_opt
+  YCSB_CXL_TWO_PROCESS=1 SHM_UB_API=none YCSB_BUILD_DIR="$out/build" \
+    YCSB_UPDATE_SYMLINKS=0 YCSB_INDEXES="$YCSB_INDEXES" JOBS="${JOBS:-2}" \
+    bash ../build.sh "$variant"
+  cp "$out/build/ycsbc_$variant" "$out/ycsbc"
+  python3 "$ROOT/tests/two-process-ycsb/collect_ub_runtime.py" --library "$out/ycsbc" --output "$out/lib"
+  rm "$out/lib/ycsbc"
+  exit 0
+fi
 context="$out/context"
 mkdir -p "$context/src/tests/YCSB-C" "$context/src/tests/two-process-ycsb" "$context/src/shm-lib" "$context/src/ds/BwTree"
 cp -Lr "$SDK_ROOT/include" "$context/include"

@@ -1,5 +1,8 @@
 #include "shm/ub.h"
 #include "shm/ub_arena.h"
+#ifdef SHM_LOCAL_NCC
+#include "shm/local_ncc.h"
+#endif
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <cstring>
@@ -13,6 +16,7 @@
 #include <new>
 #include <limits>
 #include <algorithm>
+#include <unordered_set>
 #ifdef SHM_LIB_WITH_UB
 extern "C" {
 #include "shm/memlink_client.h"
@@ -33,6 +37,9 @@ std::map<void*, std::string> mapping_names;
 UbArena arenas[2];
 // Published once before starting worker threads, unchanged until they join.
 std::atomic<uintptr_t> cache_begin{0}, cache_end{0};
+std::atomic<bool> cache_read_acquire{false};
+std::mutex acquire_mutex;
+std::unordered_set<const void*> acquired_objects;
 #ifdef SHM_LIB_WITH_UBSM
 bool initialized = false;
 void initialize() {
@@ -121,9 +128,18 @@ void* map_ub_memory(const char* name, void* base, size_t size, UbMappingMode mod
       finalize(); checked(rc, "ubsmem_shmem_set_ownership(RW)");
     }
     cache_end.store(uintptr_t(p) + size); cache_begin.store(uintptr_t(p));
-    // Discard this host's residual CACHE lines before allocation or reads.
-    // This preserves memory contents and does not invalidate the other host.
+    const char* acquire = std::getenv("SHM_UB_COW_ACQUIRE");
+    // Optional experiment, separate from startup invalidation and cold fills.
+    // Keep the original CoW read path unless explicitly requested.
+    cache_read_acquire.store(read_only && acquire && std::strcmp(acquire, "1") == 0);
+    // Each host invalidates its own CACHE mapping before application access.
+    // This is an explicit cache operation, not memset and not remote snooping.
     const char* invalidate = std::getenv("SHM_UB_STARTUP_INVALIDATE");
+#ifdef SHM_LOCAL_NCC
+    if (!invalidate) invalidate = std::getenv("LOCAL_NCC_STARTUP_INVALIDATE");
+#endif
+    // Real UBSM mappings and the simulator use the same safe startup default.
+    // Explicit 0 exists for controlled negative tests of residual cache state.
     if (!invalidate || std::strcmp(invalidate, "0") != 0) {
       ub_cache_maintenance(p, size, false, true);
       std::cerr << "UB_STARTUP_INVALIDATE read_only=" << read_only << " bytes=" << size << std::endl;
@@ -154,6 +170,12 @@ void unmap_ub_memory(void* base, size_t size) {
   checked(error, "MemlinkMemShmUnmmap");
 #endif
   if (mapping_modes.at(base) == UbMappingMode::Cacheable) {
+    cache_read_acquire.store(false);
+    {
+      std::lock_guard<std::mutex> acquired(acquire_mutex);
+      std::cerr << "UB_COW_ACQUIRE objects=" << acquired_objects.size() << std::endl;
+      acquired_objects.clear();
+    }
     cache_begin.store(0); cache_end.store(0);
   }
   for (auto& arena : arenas) {
@@ -244,6 +266,28 @@ void* ub_arena_allocate(bool atomic, size_t size, size_t alignment) {
 void ub_arena_deallocate(bool atomic, void* pointer) { arenas[atomic].deallocate(pointer); }
 size_t ub_arena_used(bool atomic) { return arenas[atomic].used.load(); }
 size_t ub_arena_live(bool atomic) { return arenas[atomic].live_bytes(); }
+bool ub_cache_needs_read_acquire(const void* p) {
+  if (!cache_read_acquire.load(std::memory_order_relaxed)) return false;
+  const auto address = uintptr_t(p);
+  return address >= cache_begin.load(std::memory_order_relaxed) &&
+         address < cache_end.load(std::memory_order_relaxed);
+}
+void ub_acquire_immutable(const void* p, void (*invalidate)(const void*)) {
+  if (!ub_cache_needs_read_acquire(p)) return;
+  std::lock_guard<std::mutex> guard(acquire_mutex);
+  if (acquired_objects.count(p)) return;
+  // Publish the local acquired state only after all invalidations complete.
+  // Another thread cannot use a half-acquired variable-sized node.
+  invalidate(p);
+  acquired_objects.insert(p);
+}
+void ub_acquire_immutable_bytes(const void* p, size_t bytes) {
+  if (!ub_cache_needs_read_acquire(p) || !bytes) return;
+  std::lock_guard<std::mutex> guard(acquire_mutex);
+  if (acquired_objects.count(p)) return;
+  ub_cache_maintenance(p, bytes, false, true);
+  acquired_objects.insert(p);
+}
 void ub_assert_atomic_target(const void* p) {
   const auto v = uintptr_t(p), b = cache_begin.load(std::memory_order_relaxed);
   if (b && v >= b && v < cache_end.load(std::memory_order_relaxed))
@@ -255,6 +299,9 @@ void ub_cache_maintenance(const void* p, size_t n, bool writeback, bool fence) {
   if (n > UINTPTR_MAX-first) throw std::runtime_error("cache range overflow");
   const auto lo = std::max(first,b), hi = std::min(first+n,e);
   if (b && lo < hi) {
+#ifdef SHM_LOCAL_NCC
+    local_ncc_maintain(reinterpret_cast<const void*>(lo), hi-lo, writeback);
+#else
     for (auto v = lo & ~uintptr_t(63); v < hi; v += 64) {
 #if defined(__aarch64__)
       if (writeback) asm volatile("dc cvac, %0" :: "r"(v) : "memory");
@@ -263,6 +310,7 @@ void ub_cache_maintenance(const void* p, size_t n, bool writeback, bool fence) {
       asm volatile("clflush (%0)" :: "r"(v) : "memory");
 #endif
     }
+#endif
   }
   if (fence) {
 #if defined(__aarch64__)

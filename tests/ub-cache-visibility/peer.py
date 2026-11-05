@@ -13,6 +13,55 @@ sys.dont_write_bytecode = True
 from run import Worker, OLD, NEW
 
 
+def check_nc(command, report):
+    """Check returned values and both mappings after every sequential operation."""
+    checks = report['checks'] = {}
+
+    def expect(name, role, operation, expected):
+        print(f'NC CHECK {name}: {role} {operation}', flush=True)
+        item = checks[name] = {'role': role, 'command': operation,
+                               'expected': expected, 'pass': False}
+        response = item['actual'] = command(role, operation)
+        item['pass'] = response == expected
+        if not item['pass']:
+            raise RuntimeError(f'{name}: expected {expected!r}, got {response!r}')
+        return response
+
+    def read_both(name, expected):
+        values = {}
+        for role in ('A', 'B'):
+            response = expect(f'{name}_{role}_read', role, 'read', f'VALUE {expected}')
+            values[role] = int(response.split()[1])
+        return values
+
+    report['initial'] = read_both('initial', OLD)['A']
+    expect('B_write', 'B', 'write', 'OK')
+    report['A_reads_B'] = read_both('B_write', NEW)['A']
+    expect('A_write', 'A', 'write', 'OK')
+    report['B_reads_A'] = read_both('A_write', OLD)['B']
+    current = OLD
+    for role, desired in (('A', NEW), ('B', OLD)):
+        expect(f'{role}_cas_success', role, f'cas {current} {desired}', f'CAS 1 {current}')
+        current = desired
+        read_both(f'{role}_cas_success', current)
+        # A failed CAS must return the observed value and leave memory unchanged.
+        expect(f'{role}_cas_failure', role, f'cas {current ^ 1} {current ^ 2}',
+               f'CAS 0 {current}')
+        read_both(f'{role}_cas_failure', current)
+    mask = (1 << 64) - 1
+    for role, amount in (('A', (1 << 32) + 7), ('B', (1 << 33) + 9)):
+        expect(f'{role}_fetch_add', role, f'fetch_add {amount}', f'FETCH_ADD {current}')
+        current = (current + amount) & mask
+        read_both(f'{role}_fetch_add', current)
+    for role in ('A', 'B'):
+        # Overflow from a high 64-bit value, then UINT64_MAX + 3 on the other host.
+        amount = mask - current + 4 if role == 'A' else mask
+        expect(f'{role}_fetch_add_wrap', role, f'fetch_add {amount}', f'FETCH_ADD {current}')
+        current = (current + amount) & mask
+        read_both(f'{role}_fetch_add_wrap', current)
+    report['final'] = current
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--role', choices=['A', 'B'], required=True)
@@ -32,6 +81,8 @@ def main():
         args.base = '0x400000000000'
     mode = {'nc': nc, 'size_mb': args.size_mb, 'base': args.base,
             'map_mode': os.environ.get('NC_MAP_MODE', 'noreplace')}
+    if nc:
+        mode['nc_protocol'] = 2
     worker = connection = server = stream = None
     report = {'pass': False, **mode}
     log = (args.output / 'worker.log').open('w')
@@ -40,10 +91,13 @@ def main():
         stream.flush()
 
     def receive():
-        line = stream.readline(8192)
+        line = stream.readline(65536)
         if not line:
             raise RuntimeError('peer disconnected; object may remain')
-        return json.loads(line)
+        message = json.loads(line)
+        if isinstance(message, dict) and 'error' in message:
+            raise RuntimeError('peer failed: ' + str(message['error']))
+        return message
 
     def local(command, expected=None):
         response = worker.command(command, args)
@@ -51,11 +105,12 @@ def main():
             raise RuntimeError('unexpected response: ' + response)
         return response
 
-    def remote(command):
+    def remote(command, expected='OK'):
         send(command)
         response = receive()
-        if response != 'OK':
+        if expected is not None and response != expected:
             raise RuntimeError('peer failed: ' + str(response))
+        return response
 
     try:
         print('Waiting for the other host (up to 10 minutes)...', flush=True)
@@ -83,7 +138,7 @@ def main():
         peer = receive()
         if peer['host'] == socket.gethostname() or peer['provider'] != args.provider:
             raise RuntimeError('hosts must differ and provider must match')
-        if any(peer[key] != value for key, value in mode.items()):
+        if any(peer.get(key) != value for key, value in mode.items()):
             raise RuntimeError('A/B NC configuration mismatch')
         args.provider = args.provider or (socket.gethostname() if args.role == 'B' else peer['host'])
         print('UB provider: ' + args.provider, flush=True)
@@ -100,16 +155,28 @@ def main():
             raise RuntimeError('worker did not initialize')
         if args.role == 'B':
             send('READY')
-            for expected in (('write', 'verify', 'release') if nc else ('write', 'flush', 'release')):
-                if receive() != expected:
-                    raise RuntimeError('unexpected protocol command')
-                if expected == 'verify':
-                    local('read', 'VALUE ' + str(OLD))
-                else:
+            if nc:
+                while True:
+                    operation = receive()
+                    if operation == 'release':
+                        local('release', 'CLOSED')
+                        if worker.process.wait(timeout=args.timeout):
+                            raise RuntimeError('B cleanup failed')
+                        send('OK')
+                        break
+                    if (not isinstance(operation, str) or '\n' in operation or '\r' in operation
+                            or not (operation in ('read', 'write')
+                                    or operation.startswith(('cas ', 'fetch_add ')))):
+                        raise RuntimeError('unexpected NC protocol command: ' + str(operation))
+                    send(local(operation))
+            else:
+                for expected in ('write', 'flush', 'release'):
+                    if receive() != expected:
+                        raise RuntimeError('unexpected protocol command')
                     local(expected, 'CLOSED' if expected == 'release' else 'OK')
-                if expected == 'release' and worker.process.wait(timeout=args.timeout):
-                    raise RuntimeError('B cleanup failed')
-                send('OK')
+                    if expected == 'release' and worker.process.wait(timeout=args.timeout):
+                        raise RuntimeError('B cleanup failed')
+                    send('OK')
             report = receive()
         else:
             def value(command):
@@ -118,16 +185,8 @@ def main():
                     raise RuntimeError('expected VALUE')
                 return int(response.split()[1])
             if nc:
-                report['initial'] = value('read')
-                if report['initial'] != OLD:
-                    raise RuntimeError('A did not read B initial value')
-                remote('write')
-                report['A_reads_B'] = value('read')
-                if report['A_reads_B'] != NEW:
-                    raise RuntimeError('A did not observe B write')
-                local('write', 'OK')
-                remote('verify')
-                report['B_reads_A'] = OLD
+                check_nc(lambda role, operation: local(operation) if role == 'A'
+                         else remote(operation, expected=None), report)
             else:
                 report['initial'] = value('prime')
                 if report['initial'] != OLD:
@@ -146,6 +205,11 @@ def main():
             send(report)
     except Exception as error:
         report.update(error=str(error), object_may_remain=True, **{'pass': False})
+        if stream:
+            try:
+                send({'error': str(error)})
+            except (OSError, ValueError):
+                pass
     finally:
         if worker:
             try:

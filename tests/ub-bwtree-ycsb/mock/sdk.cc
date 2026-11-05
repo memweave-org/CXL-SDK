@@ -1,5 +1,8 @@
 // Test-only file-backed SDK fixture; not vendor ABI or UB hardware.
 #include "ubs_mem.h"
+#ifdef SHM_LOCAL_NCC
+#include "shm/local_ncc.h"
+#endif
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -44,15 +47,28 @@ extern "C" int ubsmem_shmem_map(void* addr,size_t sz,int prot,int flags,const ch
   int fd=open(path(n).c_str(),O_RDWR);if(fd<0)return 6003;
   struct stat st{};fstat(fd,&st);if(size_t(st.st_size)!=sz){close(fd);return 6004;}
   if(getenv("UBSM_TEST_WRONG_ADDRESS")) {addr=nullptr;flags=MAP_SHARED;}
-  void* p=mmap(addr,sz,prot,flags,fd,offset);close(fd);if(p==MAP_FAILED)return 6005;
-  std::string marker=path(n)+".mapped."+std::to_string(getpid());
-  fd=open(marker.c_str(),O_CREAT|O_EXCL|O_WRONLY,0600);if(fd<0){munmap(p,sz);return 6006;}close(fd);
   uint64_t object_flags=0; std::ifstream(path(n)+".flags") >> object_flags;
+  void* p;
+#ifdef SHM_LOCAL_NCC
+  if(object_flags==UBSM_FLAG_CACHE) p=local_ncc_map(fd,addr,sz,prot,flags);
+  else
+#endif
+  p=mmap(addr,sz,prot,flags,fd,offset);
+  close(fd);if(p==MAP_FAILED)return 6005;
+  std::string marker=path(n)+".mapped."+std::to_string(getpid());
+  fd=open(marker.c_str(),O_CREAT|O_EXCL|O_WRONLY,0600);if(fd<0){
+#ifdef SHM_LOCAL_NCC
+    if(object_flags==UBSM_FLAG_CACHE) local_ncc_unmap(p,sz);
+#endif
+    munmap(p,sz);return 6006;}close(fd);
   maps[p]={sz,marker,object_flags};*out=p;return 0;
 }
 extern "C" int ubsmem_shmem_unmap(void* p,size_t sz) {
   if(int rc=event("unmap"))return rc;
   auto it=maps.find(p);if(!active || it==maps.end() || it->second.bytes!=sz)return 6002;
+#ifdef SHM_LOCAL_NCC
+  if(it->second.flags==UBSM_FLAG_CACHE) local_ncc_unmap(p,sz);
+#endif
   if(munmap(p,sz))return 6005;
   unlink(it->second.path.c_str());maps.erase(it);return 0;
 }

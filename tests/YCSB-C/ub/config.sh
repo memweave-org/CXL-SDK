@@ -9,8 +9,11 @@ THREADS_A=${THREADS_A:-1}
 THREADS_B=${THREADS_B:-1}
 RECORDS=${RECORDS:-10000000}
 OPS=${OPS:-10000000} # Per host, shared across its workers
-# Leave room for retained CoW allocations and the two hosts' shared traces.
-SIZE_MB=${SIZE_MB:-32768}
+# CACHE-node indexes and the two hosts' shared traces.
+SIZE_MB=${SIZE_MB:-65536}
+# An explicit NC_SIZE_MB overrides every case unless Sherman has its own override.
+# Resolve this before NC_SIZE_MB's default so repeated sourcing preserves the choice.
+SHERMAN_NC_SIZE_MB=${SHERMAN_NC_SIZE_MB:-${NC_SIZE_MB:-65536}}
 NC_SIZE_MB=${NC_SIZE_MB:-16384}
 SPEC=${SPEC:-workloadb_90read.spec}
 OPT=${OPT:-1} # Legacy run.sh: 1 OPT, 0 NOOPT

@@ -21,6 +21,7 @@
 #include "utils/config.h"
 #include "db/thread_pool.h"
 #include "shm/cxl_type.h"
+#include "db/ub_db.h"
 
 namespace ycsbc {
 class Client {
@@ -38,8 +39,14 @@ class Client {
       }
 #else
   Client(cxl_vector<DB *> &db)
+#ifdef YCSB_UB_TWO_HOST
+      : db_num(db.size()) {
+        for(auto* descriptor:db) db_.push_back(LocalUbDB(descriptor));
+      }
+#else
       : db_(db), db_num(db.size()) {
       }
+#endif
 #endif
 
   // virtual bool DoInsertNumKey();
@@ -156,7 +163,11 @@ class Client {
 #ifdef USE_CONSISTENT_HASH
   HashRing &ring_;
 #endif
+#ifdef YCSB_UB_TWO_HOST
+  std::vector<DB *> db_;
+#else
   cxl_vector<DB *> &db_;
+#endif
   int db_num;
   bool read_all_fields_ = false;
 };

@@ -30,7 +30,9 @@ public:
   }
 
 private:
-  typedef std::chrono::high_resolution_clock Clock;
+  // Elapsed transaction time must not follow wall-clock corrections (NTP or
+  // manual clock changes). high_resolution_clock can alias system_clock.
+  typedef std::chrono::steady_clock Clock;
   typedef std::chrono::duration<T> Duration;
 
   Clock::time_point getNow() {

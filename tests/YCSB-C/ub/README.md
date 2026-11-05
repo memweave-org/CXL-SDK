@@ -74,9 +74,6 @@ YCSB_UB_SUITE=1 YCSB_UB_CASE=bwtree bash run.sh
 结果位于 `ub/result-all-A-*` / `ub/result-all-B-*`：每项一个子目录，包含 worker/control 日志、
 配置和 `result.json`；`summary.json` / `summary.csv` 汇总八项。失败立即停止后续项，
 失败目录写入 `invalid.json`，失败样本不计入成功汇总。
-`exclusivity.jsonl` 记录驱动 PID、CPU、时间、退出情况；启动前连续确认空闲，运行中
-发现其他测试则只停止自身进程组并标记样本无效。识别器无法覆盖任意命名的调度程序，
-运行者仍须确认两台机器的其他整轮测试已经结束；受干扰项须待资源释放后重跑。
 
 `test_run_all_control.py` 只检查脚本选项和计划，不运行索引或计时。
 `test_run_all.py --bundles /absolute/path/fixture-bundles` 用文件映射 SDK 替身执行八项
@@ -113,8 +110,8 @@ bash ./run.sh
 例如允许 `0-49,96-239` 时，128 档使用 `0-49,96-173`，不会因缺少编号 50 而失败。
 日志、`manifest.json` 和每档 `config.json` 记录实际 CPU 列表；总数不足时明确报出
 可用数量，不自动把多个 worker 挤到同一个 CPU。更新后需要重新编译，旧 bundle 不支持此绑定方式。
-启动及运行期间沿用 `run_all` 的测试互斥检查，两端握手额外核对扫描列表和当前档位；
-失败或受干扰即停止，当前档保留 `invalid.json`，不进入下一档。
+两端握手核对扫描列表和当前档位；本轮执行失败即停止，
+当前档保留 `invalid.json`，不进入下一档。
 结果位于 `ub/result-threads-A-*` / `ub/result-threads-B-*` 的 `threads-32` 等子目录，
 `summary.json` / `summary.csv` 汇总各档结果；每档的 `launcher.log` 包含完整控制与 worker 输出。
 事务 worker 数不包括主线程、B 的 GC 线程、Python 控制器或 SDK 自建线程。
@@ -179,7 +176,7 @@ B 发布原线程控制器，A 完成映射和线程初始化后，两边通过�
 日志在 `ub/result-A-*` / `ub/result-B-*`，包括 build.log、worker.log、control.log、
 config.json、result.json。A 退出并解除两块映射后，B 才销毁 DB、停止 GC、解除映射并释放对象。
 异常时报告可能残留的对象，不释放可能还在被另一端访问的共享对象。
-运行脚本不扫描其他任务；实验互斥由运行者确认。
+`run.sh` 和 `run_all.sh` 均不检测其他任务或 CPU 负载，也不据此等待或中止。
 
 ## 小规模验证
 

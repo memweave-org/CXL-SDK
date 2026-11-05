@@ -2,7 +2,6 @@
 """Run the original A-read-only BwTree workload at equal per-host worker counts."""
 import argparse
 import csv
-import fcntl
 import json
 import os
 from pathlib import Path
@@ -10,7 +9,7 @@ import signal
 import subprocess
 import tempfile
 
-from run_all import ResourceGuard
+from run_all import run_command
 from cpu_affinity import select_cpus
 
 HERE = Path(__file__).resolve().parent
@@ -82,16 +81,6 @@ def main(argv=None):
                                                  'worker_cpus': cpus}, indent=2))
     print(f'[{role}] BwTree OPT={opt}, A reads only, no RPC; per-host workers={counts}; output={out}', flush=True)
     print(f'[{role}] Allowed logical CPUs={len(allowed)}; selected CPU IDs={cpus}', flush=True)
-    lock_path = Path(tempfile.gettempdir()) / 'cxl-sdk-ub-benchmark.lock'
-    lock = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o666)
-    if os.fstat(lock).st_uid == os.getuid():
-        os.fchmod(lock, 0o666)
-    try:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        os.close(lock)
-        parser.error(f'Another UB batch holds {lock_path}')
-    guard = ResourceGuard(out, False)
     report = {'pass': False, 'rounds': []}
     stage = 'build'
     directory = None
@@ -102,8 +91,8 @@ def main(argv=None):
         else:
             bundle = out / 'bundle'
             with (out / 'build.log').open('w') as log:
-                guard.run(['bash', 'build.sh', str(bundle)],
-                          dict(os.environ, OPT=str(opt), YCSB_INDEXES='bwtree'), log, watch=False)
+                run_command(['bash', 'build.sh', str(bundle)],
+                            dict(os.environ, OPT=str(opt), YCSB_INDEXES='bwtree'), log)
         if not (bundle / 'ycsbc').is_file() or not (bundle / 'lib').is_dir():
             raise RuntimeError(f'Incomplete bundle: {bundle}')
         for n in counts:
@@ -120,7 +109,7 @@ def main(argv=None):
             env['CPU_' + role] = str(cpu)
             print(f'[{role}] Starting {n} workers per host; log={directory / "launcher.log"}', flush=True)
             with (directory / 'launcher.log').open('w') as log:
-                guard.run(['bash', 'run.sh'], env, log)
+                run_command(['bash', 'run.sh'], env, log)
             result = json.loads((directory / 'result.json').read_text())
             if (not result.get('pass') or result['A']['writes'] != 0 or
                     result['A']['bwtree_opt'] != bool(opt) or result['B']['bwtree_opt'] != bool(opt) or
@@ -145,8 +134,6 @@ def main(argv=None):
                 r = row['result']
                 writer.writerow([row['threads_A'], row['threads_B'], r['common_seconds'],
                                  r['total_mops'], r['A']['reads'], r['B']['reads'], r['B']['writes']])
-        guard.log.close()
-        os.close(lock)
     return 0 if report['pass'] else 1
 
 

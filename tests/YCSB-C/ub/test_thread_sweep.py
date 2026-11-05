@@ -57,35 +57,30 @@ class ThreadSweepTests(unittest.TestCase):
                 out = Path(temporary) / 'results'
                 calls = []
 
-                class Guard:
-                    def __init__(self, directory, fixture):
-                        self.log = (directory / 'exclusivity.jsonl').open('w')
-
-                    def run(self, command, env, log, watch=True):
-                        if command[1] == 'build.sh':
-                            calls.append('build')
-                            bundle = Path(command[2])
-                            (bundle / 'lib').mkdir(parents=True)
-                            (bundle / 'ycsbc').touch()
-                            return
-                        n = int(env['THREADS_A'])
-                        calls.append(n)
-                        assert env['THREADS_B'] == str(n)
-                        assert env['YCSB_UB_SUITE'] == '0' and env['YCSB_UB_CASE'] == 'bwtree'
-                        assert json.loads(env['YCSB_UB_THREAD_SWEEP'])['threads'] == n
-                        if n == fail_at:
-                            raise RuntimeError('injected round failure')
-                        result = {'pass': True, 'common_seconds': 1.0, 'total_mops': 0.0002,
-                                  'A': {'reads': 100, 'writes': 0, 'bwtree_opt': True, 'rpc_completed': 0},
-                                  'B': {'reads': 90, 'writes': 10, 'bwtree_opt': True, 'rpc_completed': 0}}
-                        (Path(env['YCSB_UB_OUTPUT']) / 'result.json').write_text(json.dumps(result))
+                def run_command(command, env, log):
+                    if command[1] == 'build.sh':
+                        calls.append('build')
+                        bundle = Path(command[2])
+                        (bundle / 'lib').mkdir(parents=True)
+                        (bundle / 'ycsbc').touch()
+                        return
+                    n = int(env['THREADS_A'])
+                    calls.append(n)
+                    assert env['THREADS_B'] == str(n)
+                    assert env['YCSB_UB_SUITE'] == '0' and env['YCSB_UB_CASE'] == 'bwtree'
+                    assert json.loads(env['YCSB_UB_THREAD_SWEEP'])['threads'] == n
+                    if n == fail_at:
+                        raise RuntimeError('injected round failure')
+                    result = {'pass': True, 'common_seconds': 1.0, 'total_mops': 0.0002,
+                              'A': {'reads': 100, 'writes': 0, 'bwtree_opt': True, 'rpc_completed': 0},
+                              'B': {'reads': 90, 'writes': 10, 'bwtree_opt': True, 'rpc_completed': 0}}
+                    (Path(env['YCSB_UB_OUTPUT']) / 'result.json').write_text(json.dumps(result))
 
                 env = {'YCSB_UB_ROLE': 'A', 'SPEC': str(HERE / 'workloadb_90read.spec'),
                        'RECORDS': '100', 'OPS': '100', 'OPT': '1'}
                 with patch.dict(os.environ, env, clear=True), \
-                     patch.object(run_threads, 'ResourceGuard', Guard), \
-                     patch.object(run_threads.os, 'sched_getaffinity', return_value=set(range(128))), \
-                     patch.object(run_threads.tempfile, 'gettempdir', return_value=temporary):
+                     patch.object(run_threads, 'run_command', run_command), \
+                     patch.object(run_threads.os, 'sched_getaffinity', return_value=set(range(128))):
                     code = run_threads.main(['--output', str(out)])
                 report = json.loads((out / 'summary.json').read_text())
                 if fail_at is None:

@@ -51,6 +51,12 @@ static Table* make_table(char* data, char* nc, size_t nc_bytes) {
   auto* table = new (shared_atomic_memory().malloc(sizeof(Table))) Table;
   table->set_thread_num(5);
   stop_resize(table);
+#ifdef OPT_CLEVEL_ROOT_READ
+  require(ub_arena_owns(false, table->help_update), "replica descriptor must be cacheable");
+  require(ub_arena_owns(true, &table->meta), "global pointer must remain NC");
+  require(ub_arena_owns(true, table->meta_replicas.data()), "replica pointers must remain NC");
+  require(table->help_update->load_ptr(0) == table->meta.load(), "cacheable descriptor read wrong root");
+#endif
   for (uint64_t key = 1; key <= 16; ++key) table->insert({key, key + 100}, 0, key);
   migrate(table);
   // Any initial OPT expansion is allowed to finish reclamation first.

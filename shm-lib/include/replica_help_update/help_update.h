@@ -73,11 +73,20 @@ template <typename T>
 class HelpUpdate {
 private:
   // Pointer to global pointer (using nt type)
-  nt_pointer<T>* global_ptr_;
+  nt_pointer<T>* const global_ptr_;
   // Pointer to replica pointer array (using nt type)
-  nt_pointer<T>* replica_ptrs_;
+  nt_pointer<T>* const replica_ptrs_;
   // Number of replicas
-  size_t replica_num_;
+  const size_t replica_num_;
+
+  void acquire_metadata() const {
+#if defined(SHM_UB_SPLIT) && (defined(SHM_LIB_WITH_UBSM) || defined(SHM_LIB_WITH_UB))
+    // The descriptor is immutable and may live in CACHE while the pointed-to
+    // atomic words remain in NC. Follow the shared immutable-object acquire
+    // policy; never invalidate the descriptor on every replica read.
+    ub_acquire_immutable_bytes(this, sizeof(*this));
+#endif
+  }
 
   static bool current_cas(nt_pointer<T> &ptr, T* old_val, T* new_val) {
     T* expected = old_val;
@@ -103,6 +112,7 @@ public:
   // @return: Returns true if update succeeded and expected_val hasn't changed,
   //          false if expected_val has changed. Any return indicates successful update.
   bool help_update(T* expected_val, uint64_t start_check_id) {
+    acquire_metadata();
     // printf("help_update expected: %p, start_check_id: %lu\n", expected_val, start_check_id);
     assert(start_check_id < replica_num_);
     LockedPointer<T> expected(expected_val);
@@ -138,6 +148,7 @@ public:
   // Algorithm: Write G as A.1, then write each R[i] as A.1 in sequence,
   //            after all writes complete, write G as A.0
   bool cas_ptr(T* old_val, T* new_val) {
+    acquire_metadata();
     T* cur_global = global_ptr_->load();
 
     if (LockedPointer<T>::has_lock(cur_global)) {
@@ -162,6 +173,7 @@ public:
   // (2) If R[i] ends with .1, help update R[i+1] to R[N] as A.1
   // Returns correct ptr (with lock bit cleared)
   T* load_ptr(size_t thread_id) {
+    acquire_metadata();
     assert(thread_id < replica_num_);
     T* local_r = replica_ptrs_[thread_id].load();
 

@@ -761,7 +761,19 @@ public:
     for (size_type i = 0; i < thread_num; i++) {
       meta_replicas[i].store(meta.load());
     }
-    help_update = new (shared_atomic_memory(clevel_memory()).malloc(sizeof(HelpUpdate<level_meta>))) HelpUpdate<level_meta>(meta, meta_replicas, thread_num);
+    // Only the global/replica pointer words need NC atomics. The helper's
+    // addresses and replica count are immutable, ordinary cacheable reads.
+#if defined(SHM_UB_SPLIT) && (defined(SHM_LIB_WITH_UBSM) || defined(SHM_LIB_WITH_UB))
+    auto& helper_memory = private_index_memory ? *private_index_memory : clevel_memory();
+#else
+    auto& helper_memory = shared_atomic_memory(clevel_memory());
+#endif
+    auto* helper = new (helper_memory.malloc(sizeof(HelpUpdate<level_meta>)))
+        HelpUpdate<level_meta>(meta, meta_replicas, thread_num);
+#if defined(SHM_UB_SPLIT) && (defined(SHM_LIB_WITH_UBSM) || defined(SHM_LIB_WITH_UB))
+    clwb(helper, sizeof(*helper));
+#endif
+    help_update = helper;
 #endif
 #ifdef CLEVEL_UB_LEVEL_GC
     if (!level_epochs_ready.load()) {

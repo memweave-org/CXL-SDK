@@ -30,7 +30,7 @@ int main() {
   void* cache = map_ub_memory((name + "-cache").c_str(), nullptr, bytes, UbMappingMode::Cacheable);
   ub_configure_arena(true, nc, bytes);
   auto* value = new (ub_arena_allocate(true, sizeof(nt<uint64_t>))) nt<uint64_t>(10);
-  auto* aligned = new (ub_arena_allocate(true, sizeof(aligned_nt<uint64_t>))) aligned_nt<uint64_t>(7);
+  auto* aligned = new (ub_arena_allocate(true, sizeof(aligned_nt<uint64_t>), alignof(aligned_nt<uint64_t>))) aligned_nt<uint64_t>(7);
   auto* pointer = new (ub_arena_allocate(true, sizeof(nt_pointer<uint64_t>))) nt_pointer<uint64_t>();
   uint64_t* raw = value->get_raw_ptr();
   assert(static_cast<void*>(raw) == static_cast<void*>(value));

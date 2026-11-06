@@ -4,65 +4,67 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
-#include <map>
-#include <mutex>
+#include <memkind.h>
 #include <new>
 #include <stdexcept>
-#include <unordered_map>
+#include <string>
 
-// Allocator bookkeeping is process-local. In particular, a free must never
-// write a next pointer into a CACHE object still cached by another host.
-// Each process owns a disjoint arena slice; remote frees are rejected.
+// Use the same fixed-pool allocator as CXL. The kind and its allocator metadata
+// belong to this process; each process owns a disjoint slice of the mapping.
+// Reclamation still requires the caller's reader/epoch grace period.
 class UbArena {
  public:
   char* base{};
   size_t size{};
-  std::atomic<size_t> used{0}; // High-water mark, including alignment gaps.
 
-  // Configure/reset only while application threads are stopped.
+  UbArena() = default;
+  UbArena(const UbArena&) = delete;
+  UbArena& operator=(const UbArena&) = delete;
+  ~UbArena() { if (pool_) memkind_destroy_kind(pool_); }
+
+  // Configure/reset only while application threads are stopped. Destroy the
+  // old kind before giving up ownership of, or unmapping, its backing memory.
   void configure(void* address, size_t bytes, bool recycle = true) {
-    std::lock_guard<std::mutex> guard(mutex_);
-    free_.clear(); allocated_.clear(); live_ = 0;
-    if (bytes && recycle) free_.emplace(0, bytes);
+    if (pool_) {
+      const int rc = memkind_destroy_kind(pool_);
+      if (rc) throw std::runtime_error("UB memkind_destroy_kind failed: " + std::to_string(rc));
+      pool_ = nullptr;
+    }
+    base = nullptr; size = 0; cursor_.store(0);
+    recycle_ = recycle;
+    if (bytes && recycle) {
+      const int rc = memkind_create_fixed(address, bytes, &pool_);
+      if (rc) throw std::runtime_error("UB memkind_create_fixed failed: " + std::to_string(rc));
+    }
     base = static_cast<char*>(address); size = bytes;
-    recycle_ = recycle; used.store(0);
   }
 
-  void* allocate(size_t bytes, size_t alignment) {
-    if (!base || !alignment || (alignment & (alignment - 1)) || bytes > SIZE_MAX - 63)
-      throw std::bad_alloc();
-    alignment = std::max(alignment, size_t(64));
-    const size_t padded = (std::max(bytes, size_t(1)) + 63) & ~size_t(63);
+  // alignment=0 is ordinary malloc, exactly as in the CXL MemoryManager.
+  // Explicit posix_memalign/clalign requests retain their requested alignment.
+  void* allocate(size_t bytes, size_t alignment = 0) {
+    if (!base) throw std::bad_alloc();
     if (!recycle_) {
-      auto old = used.load(std::memory_order_relaxed);
+      // This cursor is allocation state for the optional bump allocator, not
+      // telemetry. The normal memkind path never reads or updates it.
+      if (!alignment) alignment = alignof(std::max_align_t);
+      if (alignment & (alignment - 1)) throw std::bad_alloc();
+      const size_t requested = std::max(bytes, size_t(1));
+      auto old = cursor_.load(std::memory_order_relaxed);
       for (;;) {
         size_t start;
-        if (!fit(old, size - old, padded, alignment, start)) throw std::bad_alloc();
-        if (used.compare_exchange_weak(old, start + padded, std::memory_order_relaxed))
+        if (!fit(old, size - old, requested, alignment, start)) throw std::bad_alloc();
+        if (cursor_.compare_exchange_weak(old, start + requested, std::memory_order_relaxed))
           return base + start;
       }
     }
-    std::lock_guard<std::mutex> guard(mutex_);
-    for (auto it = free_.begin(); it != free_.end(); ++it) {
-      size_t start;
-      if (!fit(it->first, it->second, padded, alignment, start)) continue;
-      const size_t end = start + padded, limit = it->first + it->second;
-      void* result = base + start;
-      auto record = allocated_.emplace(result, padded);
-      if (!record.second) throw std::logic_error("UB allocation overlaps a live block");
-      try {
-        if (end < limit) free_.emplace(end, limit - end);
-      } catch (...) {
-        allocated_.erase(record.first);
-        throw;
-      }
-      if (start != it->first) it->second = start - it->first;
-      else free_.erase(it);
-      live_ += padded;
-      used.store(std::max(used.load(std::memory_order_relaxed), end), std::memory_order_relaxed);
-      return result;
+    void* result = nullptr;
+    if (alignment) {
+      if (memkind_posix_memalign(pool_, &result, alignment, bytes)) throw std::bad_alloc();
+    } else {
+      result = memkind_malloc(pool_, bytes);
     }
-    throw std::bad_alloc();
+    if (!result) throw std::bad_alloc();
+    return result;
   }
 
   void deallocate(void* pointer) {
@@ -71,34 +73,10 @@ class UbArena {
     if (!base || address < begin || address - begin >= size)
       throw std::runtime_error("UB free outside this process's arena");
     if (!recycle_) return; // Explicit immutable-address lifetime policy.
-    std::lock_guard<std::mutex> guard(mutex_);
-    auto allocation = allocated_.find(pointer);
-    if (allocation == allocated_.end())
-      throw std::runtime_error("UB free requires a live allocation start (invalid or double free)");
-    const size_t offset = address - begin, bytes = allocation->second;
-    auto next = free_.lower_bound(offset);
-    auto previous = next == free_.begin() ? free_.end() : std::prev(next);
-    if (previous != free_.end() && previous->first + previous->second == offset) {
-      previous->second += bytes;
-      if (next != free_.end() && offset + bytes == next->first) {
-        previous->second += next->second;
-        free_.erase(next);
-      }
-    } else if (next != free_.end() && offset + bytes == next->first) {
-      auto node = free_.extract(next);
-      node.key() = offset; node.mapped() += bytes;
-      free_.insert(std::move(node));
-    } else {
-      free_.emplace(offset, bytes);
-    }
-    allocated_.erase(allocation);
-    live_ -= bytes;
-  }
-
-  size_t live_bytes() {
-    if (!recycle_) return used.load(std::memory_order_relaxed);
-    std::lock_guard<std::mutex> guard(mutex_);
-    return live_;
+    // As in CXL/memkind, the caller must supply a live allocation start.
+    // Interior pointers and double frees are allocator misuse, not validated
+    // with a second, globally locked allocation registry.
+    memkind_free(pool_, pointer);
   }
 
  private:
@@ -111,8 +89,6 @@ class UbArena {
     return true;
   }
   bool recycle_{true};
-  std::mutex mutex_;
-  std::map<size_t, size_t> free_;
-  std::unordered_map<void*, size_t> allocated_;
-  size_t live_{};
+  memkind_t pool_{};
+  std::atomic<size_t> cursor_{0}; // Used only when recycle=false.
 };

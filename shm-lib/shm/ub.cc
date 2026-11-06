@@ -159,6 +159,12 @@ void unmap_ub_memory(void* base, size_t size) {
   auto it = mappings.find(base);
   if (it == mappings.end() || it->second != size)
     throw std::runtime_error("UB unmap must use the exact original address and length");
+  // memkind must release its arenas while the backing mapping is still owned
+  // and accessible. Workers must have joined before teardown starts.
+  for (auto& arena : arenas) {
+    const auto a = uintptr_t(arena.base), b = uintptr_t(base);
+    if (arena.base && a >= b && a-b < size) arena.configure(nullptr, 0);
+  }
 #ifdef SHM_LIB_WITH_UBSM
   if (mapping_modes.at(base) == UbMappingMode::Cacheable)
     checked(ubsmem_shmem_set_ownership(mapping_names.at(base).c_str(), base, size, PROT_NONE),
@@ -177,10 +183,6 @@ void unmap_ub_memory(void* base, size_t size) {
       acquired_objects.clear();
     }
     cache_begin.store(0); cache_end.store(0);
-  }
-  for (auto& arena : arenas) {
-    const auto a = uintptr_t(arena.base), b = uintptr_t(base);
-    if (arena.base && a >= b && a-b < size) arena.configure(nullptr, 0);
   }
   mapping_modes.erase(base);
   mapping_names.erase(base);
@@ -252,20 +254,14 @@ void* ub_arena_allocate(bool atomic, size_t size, size_t alignment) {
   try {
     return a.allocate(size, alignment);
   } catch (const std::bad_alloc&) {
-    const auto used = a.used.load(std::memory_order_relaxed);
-    const auto live = a.live_bytes();
     std::cerr << "UB_ALLOC_FAILED arena=" << (atomic ? "NC" : "CACHE")
               << " requested_bytes=" << size << " alignment=" << alignment
-              << " process_capacity_bytes=" << a.size << " used_bytes=" << used
-              << " live_bytes=" << live
-              << " remaining_bytes=" << (live <= a.size ? a.size-live : 0)
+              << " process_capacity_bytes=" << a.size
               << " reason=arena exhausted or invalid size/alignment" << std::endl;
     throw;
   }
 }
 void ub_arena_deallocate(bool atomic, void* pointer) { arenas[atomic].deallocate(pointer); }
-size_t ub_arena_used(bool atomic) { return arenas[atomic].used.load(); }
-size_t ub_arena_live(bool atomic) { return arenas[atomic].live_bytes(); }
 bool ub_arena_owns(bool atomic, const void* pointer) {
   const auto& arena = arenas[atomic];
   const auto address = reinterpret_cast<uintptr_t>(pointer);

@@ -333,6 +333,8 @@ void *MemoryManager::malloc(size_t size) {
 int MemoryManager::posix_memalign(void **memptr, size_t alignment,
                                   size_t size) {
   if (backend_ == CacheableAllocatorBackend::UbCache || backend_ == CacheableAllocatorBackend::UbAtomic) {
+    if (!alignment || (alignment & (alignment - 1)) || alignment % sizeof(void*))
+      return EINVAL;
     try { *memptr = ub_arena_allocate(backend_ == CacheableAllocatorBackend::UbAtomic, size, alignment); return 0; }
     catch (const std::bad_alloc&) { *memptr = nullptr; return ENOMEM; }
   }

@@ -1,3 +1,4 @@
+#include "allocator_observer.h"
 // Bounded, untimed functional assertions with the file-backed SDK fixture.
 // No latency/throughput result. LOCAL_NCC additionally instruments ordinary
 // reads/writes against independent cache replicas; the plain fixture is coherent.
@@ -229,7 +230,7 @@ void mapping_gc_contract(bool owner,int in,int out,bool drop_remote_invalidate=f
   }
   barrier(in,out);
   if(owner) {
-    const size_t live_before_gc=ub_arena_live(false);
+    const size_t live_before_gc=allocator_test::live_bytes(false);
     const auto limit=std::chrono::steady_clock::now()+std::chrono::seconds(5);
     while(tree->GetGCMetaData(0)->node_count) {
       tree->IncreaseEpoch();
@@ -238,16 +239,14 @@ void mapping_gc_contract(bool owner,int in,int out,bool drop_remote_invalidate=f
       require(std::chrono::steady_clock::now()<limit,"combined cacheline ACK/GC timeout");
       std::this_thread::yield();
     }
-    require(ub_arena_live(false)<live_before_gc,"GC did not return CACHE storage to the allocator");
-    // The same-sized allocation must reuse the retired block, with no growth
-    // of the CACHE high-water mark. This also exercises prepare()'s policy.
-    const size_t high_water=ub_arena_used(false);
+    require(allocator_test::live_bytes(false)<live_before_gc,"GC did not return CACHE storage to the allocator");
+    // Verify actual retired-address reuse and the remote reread below.
+    // Production allocators no longer maintain a high-water statistic.
     auto* reused=reinterpret_cast<Tree::InnerNode*>(Tree::ElasticNode<Tree::KeyNodeIDPair>::Get(
         64,Tree::NodeType::InnerType,0,64,std::make_pair(41L,NodeID{0}),std::make_pair(99L,NodeID{0})));
     for(long i=0;i<64;++i) reused->PushBack(std::make_pair(300+i,NodeID{0}));
     reused->FlushNode();
     require(reused==state.old,"retired BwTree CACHE address was not reused");
-    require(ub_arena_used(false)==high_water,"reusing a retired node grew the CACHE arena");
     tree->mapping_table[id].store(reused);
   }
   barrier(in,out);
@@ -289,7 +288,7 @@ void partitioned_rpc_contract(bool owner,const std::string& index,int in,int out
   require(db!=descriptor,"RPC wrapper is still shared");
   require(ycsbc_ub::in_local_index(ycsbc::UbLocalIndexAddress(descriptor)),"RPC index is not in local DRAM");
   // After transport creation/attachment, index activity must not allocate NC.
-  const size_t nc_before=ub_arena_used(true);
+  const size_t nc_before=allocator_test::allocation_count(true);
   int id=db->ThreadInit();
   // More than the fixture's initial Clevel capacity: exercise its resizer too.
   for(int k=1;k<=1024;++k) if(ycsbc::UbRpcOwner(k)==unsigned(owner?0:1)) {
@@ -337,7 +336,7 @@ void partitioned_rpc_contract(bool owner,const std::string& index,int in,int out
   barrier(in,out);
   if(!owner) read_all(2);
   barrier(in,out);
-  require(ub_arena_used(true)==nc_before,"RPC index/control activity allocated NC storage");
+  require(allocator_test::allocation_count(true)==nc_before,"RPC index/control activity allocated NC storage");
   require(ycsbc::UbRpcSent()==uint64_t(owner?keys:3*clients*keys/2),"wrong outbound partition count");
   require(ycsbc::UbRpcCompleted()==uint64_t(owner?3*clients*keys/2:keys),"wrong inbound partition count");
   require(ycsbc::UbRpcLocal()==uint64_t(owner?keys:3*clients*keys/2),"local request incorrectly sent over RPC");

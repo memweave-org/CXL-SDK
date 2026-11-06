@@ -148,7 +148,7 @@ NOOPT/OPT/RPC 各构建一次，全部轮次复用；每轮新建共享对象，
 
 同一 `YCSB_BUILD_READONLY_RPC_CONTRACT=ON` 构建在启用 ClevelHash 时提供
 `ub_reuse_contract`。用 fixture SDK、独立 `UBSM_TEST_DIRECTORY` 运行 OPT/NOOPT
-两份产物，断言小 arena 下反复释放复用、合并、对齐、并发、无效释放，以及
+两份产物，断言小 arena 下反复释放复用、对齐、并发、跨分区释放拒绝，以及
 ClevelHash 重复插入、失败更新和扩容临时对象的内存有界性。此项也不计时。
 
 ## BwTree OPT 的进程私有 mapping cache
@@ -203,7 +203,7 @@ worker 队列、NOOPT 接收端退出。用显式屏障
 固定回填与清理的交错顺序，不依赖线程速度；普通共享 mmap 不代表 NC 硬件验证。
 前述 SDK fixture 的 `readonly_rpc_contract bwtree+cache-gc` 另覆盖真实 BwTree 的
 回收路径（70 个退休节点，跨越两个批次）：A 在清表后继续持有并读取旧节点时，禁止 ACK 和释放；
-读端退出宽限期后，验证 CACHE 存活字节下降、旧地址复用且分配高水位不增长，A 再次读取
+读端退出宽限期后，通过测试专用链接包装验证 CACHE 对象释放及旧地址复用，A 再次读取
 同一地址时必须看到新 header 和变长节点尾部内容。启用 `YCSB_UB_LOCAL_NCC=ON` 时该
 contract 也进行普通读写插桩，可用独立 CACHE 副本验证实际缓存行失效。
 模拟构建的 `bwtree+cache-gc-no-invalidate` 是预期失败的负对照：仅在 A 完成启动失效后
@@ -354,9 +354,14 @@ NC 分配区由 A/B 各占一半，B 预生成两端全部操作序列；默认�
 例如 `SIZE_MB=49152 NC_SIZE_MB=16384 SHERMAN_NC_SIZE_MB=65536 bash run_all.sh`。
 `--dry-run` 的 `memory_by_case` 和每轮结果记录实际共享容量；RPC 的 CACHE 为 0。
 更大负载可能仍需增加容量。耗尽即报错，不回退到私有堆。
-UB arena 按进程分区，`MemoryManager::free()` 将安全释放的块合并并供后续分配复用，
-分配器账本留在进程本地；支持 CACHE/NC、64 字节隔离及绝对地址对齐，拒绝跨分区、
-跨分配器、内部指针和重复释放。`ub_arena_used()` 为地址高水位，`ub_arena_live()` 为未释放字节数。
+UB arena 按进程分区，与 CXL 使用同样的 `memkind_create_fixed` 分配器，
+`MemoryManager::free()` 将安全释放的块交给 memkind 复用。UB 不再额外维护全局加锁的
+空闲区间表和分配记录表；保留 CACHE/NC 分区和禁止堆回退。
+普通 malloc/free 直接调用 `memkind_malloc` / `memkind_free`，不强制 64B 取整；
+显式 `posix_memalign` / `clalign` 保留调用方要求的对齐。
+跨分区、跨分配器释放仍会拒绝；内部指针和重复释放遵循 CXL/memkind 的未定义行为约定。
+生产路径不维护 live/high-water 统计，也不查询 usable size。GC contract 通过仅链接进
+测试程序的 memkind 包装观测对象生命周期，不向实际 benchmark 添加统计操作。
 ClevelHash 的未发布 KV、失败的扩容数组和元数据会回收；扩容分配串行化以限制临时数组峰值，
 普通查询和更新不经过此扩容锁。已发布 KV 尚无跨机回收宽限期，继续保留到对象退出，
 不能在替换指针后立即复用。UB 和 CXL 的 BwTree CACHE 节点均允许在原 epoch/GC
@@ -407,7 +412,7 @@ c++ -std=c++17 -shared -fPIC -Itests/ub-bwtree-ycsb/mock \
 c++ -std=c++17 -O2 -pthread -DSHM_LIB_WITH_UBSM -DSHM_UB_SPLIT \
   -Itests/ub-bwtree-ycsb/mock -Ishm-lib/include \
   tests/ub-api/nt_contract.cc shm-lib/shm/ub.cc \
-  -L"$out" -Wl,-rpath,"$out" -lubsm_sdk -o "$out/nt_contract"
+  -L"$out" -Wl,-rpath,"$out" -lubsm_sdk -lmemkind -o "$out/nt_contract"
 UBSM_TEST_DIRECTORY="$out/objects" "$out/nt_contract"
 ```
 

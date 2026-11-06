@@ -1,3 +1,4 @@
+#include "allocator_observer.h"
 // Untimed, small file-backed SDK assertions; no hardware/performance claims.
 #include "clevel_hash.hpp"
 #include <sys/wait.h>
@@ -9,6 +10,9 @@
 #error This contract requires UBSM split level GC
 #endif
 using Table = clevel_hash<uint64_t, uint64_t, std::hash<uint64_t>, std::equal_to<uint64_t>, 4>;
+// Allow for memkind's per-thread arena extents, as with the CXL allocator.
+// The assertions below still check exact live-object reclamation.
+static constexpr size_t pool_slice = 16ul << 20;
 static void require(bool ok, const char* message) {
   if (!ok) throw std::runtime_error(message);
 }
@@ -43,7 +47,7 @@ static void migrate(Table* table) {
   stop_resize(table);
 }
 static Table* make_table(char* data, char* nc, size_t nc_bytes) {
-  ub_configure_arena(false, data, 32 * 1024);
+  ub_configure_arena(false, data, pool_slice);
   ub_configure_arena(true, nc, nc_bytes);
   cacheable = MemoryManager(false);
   SimThreadInfo::setup_worker_machine_count(2);
@@ -74,8 +78,8 @@ static void expand(Table* table) {
   table->expand(0, root(table));
 }
 static void repeated_growth(char* data, char* nc) {
-  auto* table = make_table(data, nc, 4 * 1024 * 1024);
-  auto expected_cache_bytes = ub_arena_live(false);
+  auto* table = make_table(data, nc, 2 * pool_slice);
+  auto expected_cache_bytes = allocator_test::live_bytes(false);
   std::atomic<bool> reading{true};
   std::atomic<unsigned> errors{0};
   std::thread reader([&] {
@@ -102,9 +106,9 @@ static void repeated_growth(char* data, char* nc) {
       require(ub_arena_owns(false, root(table)), "replacement metadata must be cacheable");
 #endif
       wait_for([&] { return table->level_epoch.load() > entered; }, "background GC did not advance epoch");
-      pinned_bytes = ub_arena_live(true);
+      pinned_bytes = allocator_test::live_bytes(true);
       usleep(30000);
-      require(ub_arena_live(true) == pinned_bytes, "old level freed while reader still active");
+      require(allocator_test::live_bytes(true) == pinned_bytes, "old level freed while reader still active");
       require(old->buckets != nullptr, "old level descriptor was overwritten");
       for (uint64_t key = 1; key <= 16; ++key) {
         auto found = table->search(key);
@@ -112,9 +116,9 @@ static void repeated_growth(char* data, char* nc) {
       }
     }
     // No foreground collection calls: the background thread must do all free.
-    wait_for([&] { return ub_arena_live(true) == pinned_bytes - retired_bytes; },
+    wait_for([&] { return allocator_test::live_bytes(true) == pinned_bytes - retired_bytes; },
              "background did not free exactly the old level and buckets");
-    require(ub_arena_live(false) == expected_cache_bytes, "unexpected CACHE allocation or KV reclamation");
+    require(allocator_test::live_bytes(false) == expected_cache_bytes, "unexpected CACHE allocation or KV reclamation");
   }
   reading.store(false); reader.join();
   require(errors.load() == 0, "concurrent reader lost KV during level reclamation");
@@ -123,12 +127,12 @@ static void repeated_growth(char* data, char* nc) {
   table->update({1, 999}, 0);
   table->erase(1, 0);
   usleep(30000);
-  require(held.value->second == 101 && ub_arena_live(false) == expected_cache_bytes + 64,
+  require(held.value->second == 101 && allocator_test::live_bytes(false) == expected_cache_bytes + 64,
           "level-only GC unexpectedly reclaimed KV objects");
   table->~Table(); shared_atomic_memory().free(table);
 }
 static void cross_process(char* data, char* nc) {
-  auto* table = make_table(data, nc, 2 * 1024 * 1024);
+  auto* table = make_table(data, nc, pool_slice);
   table->stop_level_gc(); // fork only after both process-local workers stop
   int commands[2], replies[2];
   require(pipe(commands) == 0 && pipe(replies) == 0, "pipe failed");
@@ -137,8 +141,8 @@ static void cross_process(char* data, char* nc) {
   if (child == 0) {
     close(commands[1]); close(replies[0]);
     try {
-      ub_configure_arena(true, nc + 2 * 1024 * 1024, 2 * 1024 * 1024);
-      ub_configure_arena(false, data + 32 * 1024, 32 * 1024);
+      ub_configure_arena(true, nc + pool_slice, pool_slice);
+      ub_configure_arena(false, data + pool_slice, pool_slice);
       SimThreadInfo::setup_worker_ids(1, 0);
       auto gc = table->start_level_gc();
       char command;
@@ -159,10 +163,10 @@ static void cross_process(char* data, char* nc) {
       // Only the child's published root metadata is deliberately retained.
       const size_t metadata_bytes = (sizeof(Table::level_meta) + 63) & ~size_t(63);
 #ifdef OPT_CLEVEL_ROOT_READ
-      wait_for([&] { return ub_arena_live(true) == 0; }, "child-owned old level was not reclaimed");
-      require(ub_arena_live(false) == metadata_bytes, "child CACHE metadata was not retained");
+      wait_for([&] { return allocator_test::live_bytes(true) == 0; }, "child-owned old level was not reclaimed");
+      require(allocator_test::live_bytes(false) == metadata_bytes, "child CACHE metadata was not retained");
 #else
-      wait_for([&] { return ub_arena_live(true) == metadata_bytes; }, "child-owned old level was not reclaimed");
+      wait_for([&] { return allocator_test::live_bytes(true) == metadata_bytes; }, "child-owned old level was not reclaimed");
 #endif
       gc.reset();
       _exit(0);
@@ -182,11 +186,11 @@ static void cross_process(char* data, char* nc) {
     freed = old->capacity * sizeof(Table::bucket) + ((sizeof(Table::level_bucket) + 63) & ~size_t(63));
   }
   expand(table); migrate(table);
-  const auto pinned = ub_arena_live(true);
+  const auto pinned = allocator_test::live_bytes(true);
   usleep(30000);
-  require(ub_arena_live(true) == pinned, "remote worker epoch was ignored");
+  require(allocator_test::live_bytes(true) == pinned, "remote worker epoch was ignored");
   send('R'); receive('R');
-  wait_for([&] { return ub_arena_live(true) == pinned - freed; }, "remote grace period did not finish");
+  wait_for([&] { return allocator_test::live_bytes(true) == pinned - freed; }, "remote grace period did not finish");
   send('E'); receive('E'); migrate(table);
   for (int i = 0; i < 2; ++i) { expand(table); migrate(table); }
   send('X');
@@ -196,7 +200,7 @@ static void cross_process(char* data, char* nc) {
   table->~Table(); shared_atomic_memory().free(table);
 }
 int main() {
-  const size_t bytes = 4ul << 20;
+  const size_t bytes = 2 * pool_slice;
   const std::string name = "clevel-level-gc-" + std::to_string(getpid());
   create_ub_memory(name.c_str(), bytes, "fixture", UINT32_MAX, UbMappingMode::Cacheable);
   create_ub_memory((name + "-nc").c_str(), bytes, "fixture", UINT32_MAX, UbMappingMode::Noncacheable);

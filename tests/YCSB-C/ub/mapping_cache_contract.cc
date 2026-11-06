@@ -154,6 +154,42 @@ void concurrent_producers_contract() {
   channel.detach(0);channel.detach(1);
 }
 
+void cacheline_ack_contract() {
+  MappingInvalidationChannel<std::atomic, 1, 2, 1, 2> channel;
+  channel.attach(0); channel.attach(1);
+  alignas(64) char storage[192]{};
+  const CachelineRange ranges[]{{storage, 128}, {storage + 128, 64}};
+  const CachelineInvalidation request{ranges, 2};
+  const uint64_t id = 7;
+  const auto ticket = channel.try_publish_batch(0, &id, 1, &request);
+  std::promise<void> entered, resume;
+  auto entered_future = entered.get_future(), resume_future = resume.get_future();
+  std::thread reader([&] {
+    channel.consume(1, [&](uint64_t node, CachelineInvalidation payload) {
+      require(node == id && payload.ranges == ranges && payload.count == 2,
+              "range message changed");
+      require(payload.ranges[0].bytes == 128 && payload.ranges[1].address == storage + 128,
+              "allocation extent lost");
+      entered.set_value();
+      resume_future.wait(); // Stand in for pending local cache maintenance/fence.
+    });
+  });
+  entered_future.wait();
+  channel.consume(0, [](uint64_t, CachelineInvalidation) {});
+  require(!channel.acknowledged(ticket), "ACK before remote cache maintenance completed");
+  require(!channel.try_publish(id).sequence, "range descriptor overwritten before remote ACK");
+  resume.set_value(); reader.join();
+  require(channel.acknowledged(ticket), "missing cacheline ACK");
+  // Ring reuse must clear the old range payload for an ordinary mapping clear.
+  const auto next = channel.try_publish(id);
+  for (size_t process = 0; process < 2; ++process)
+    channel.consume(process, [](uint64_t, CachelineInvalidation payload) {
+      require(!payload.count && !payload.ranges, "old range payload survived ring reuse");
+    });
+  require(channel.acknowledged(next), "mapping ACK after range reuse");
+  channel.detach(0); channel.detach(1);
+}
+
 void refill_contract() {
   MappingInvalidationChannel<std::atomic, 2, 1> channel;
   channel.attach(0);
@@ -218,6 +254,61 @@ void refill_contract() {
 }
 
 using Cache = ProcessMappingCache<16, std::atomic>;
+
+void combined_grace_contract() {
+  auto channel = std::make_unique<Cache::Channel>();
+  std::atomic<bool> cleared{false}, quiescent{false}, old_line_valid{true};
+  std::atomic<unsigned> invalidations{0};
+  const auto* owner = channel.get();
+  Cache::prepare(owner, *channel, 0,
+      [&](CachelineInvalidation ranges) {
+        require(quiescent.load() && ranges.count == 1, "flush before reader quiescence");
+        old_line_valid.store(false);
+        ++invalidations;
+      }, [&] {
+        cleared.store(true);
+        return uint64_t{7};
+      }, [&](uint64_t epoch) {
+        require(epoch == 7, "grace checkpoint changed while batch pending");
+        return quiescent.load();
+      });
+  auto& slot = Cache::table(owner)[7];
+  std::atomic<uintptr_t> mapping{100};
+  require(refill(slot, mapping) == 100, "combined initial mapping");
+  const uint64_t id = 7;
+  const CachelineRange range{&old_line_valid, sizeof(old_line_valid)};
+  const CachelineInvalidation request{&range, 1};
+  const auto ticket = channel->try_publish_batch(0, &id, 1, &request);
+  eventually([&] { return cleared.load(); });
+  require(!slot.load() && !channel->acknowledged(ticket) && !invalidations.load(),
+          "combined message ACKed/flushed before the pre-clear reader left");
+  const uint64_t other_id = 8;
+  const auto independent = channel->try_publish_batch(1, &other_id, 1);
+  eventually([&] { return channel->acknowledged(independent); });
+  require(!channel->acknowledged(ticket), "pending lane was ACKed by another lane");
+  old_line_valid.store(true); // An old pointer can refill AFTER mapping clear.
+  mapping.store(200);
+  require(refill(slot, mapping) == 200, "new readers blocked by pending invalidation");
+  quiescent.store(true);
+  eventually([&] { return channel->acknowledged(ticket); });
+  require(!old_line_valid.load() && invalidations.load() == 1 && slot.load() == 200,
+          "combined message lost flush, repeated clear or acknowledged too early");
+  Cache::release(owner);
+
+  // NOOPT participates without allocating a software table. Shutdown must not
+  // wait forever on a pending grace callback; the caller has stopped readers.
+  using NoCache = ProcessMappingCache<0, std::atomic>;
+  quiescent.store(false); cleared.store(false);
+  NoCache::prepare(owner, *channel, 0, [](CachelineInvalidation) {},
+      [&] { cleared.store(true); return uint64_t{7}; },
+      [&](uint64_t) { return quiescent.load(); });
+  const auto pending = channel->try_publish_batch(0, &id, 1, &request);
+  eventually([&] { return cleared.load(); });
+  require(!channel->acknowledged(pending), "NOOPT skipped range invalidation");
+  NoCache::release(owner);
+  require(channel->acknowledged(pending), "detached receiver left a pending ACK obligation");
+}
+
 struct Shared {
   Cache::Channel channel;
   std::atomic<uintptr_t> mapping{100};
@@ -344,6 +435,8 @@ int main() {
     channel_contract();
     batch_contract();
     concurrent_producers_contract();
+    cacheline_ack_contract();
+    combined_grace_contract();
     refill_contract();
     process_contract();
     std::cout << "PASS: private tables, fill/clear exclusion, busy-reader bypass, batch ACK, independent concurrent producers, backpressure, detach/reuse\n";

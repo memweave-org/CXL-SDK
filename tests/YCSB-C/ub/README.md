@@ -160,39 +160,54 @@ ClevelHash 重复插入、失败更新和扩容临时对象的内存有界性。
 默认 24-bit 表每项只有一个 64-bit 原子值，共 128 MiB/进程；NOOPT 不创建该表。
 B 在构造树时分配，A 在 worker 注册时分配，两者都在 READY 和吞吐计时之前完成。
 启动日志 `BWTREE_MAPPING_CACHE` 包含 pid、表地址、大小、`invalidation=per-worker-batch-ack`
-和 `fill=busy-slot`。
+和 `fill=busy-slot`。NOOPT 也注册消息接收线程，但日志中的 `tables=0 bytes=0`，
+不分配软件 mapping table。
 
-GC 为每个 worker 使用独立的共享 NC 单写者环形队列，每批最多 64 个 node ID，
+GC 为每个 worker 使用独立的共享 NC 单写者环形队列，每批最多 64 个 node ID 及其
+待回收内存范围描述。范围列表保存在 NC，由写端枚举完整分配块（包含变长节点尾部、
+inline delta 的所有扩展 chunk，以及单独分配的 remove/abort 节点），接收端无需
+读取可能过期的 CACHE 节点来确定地址和长度。
 每条队列最多保留 16 批。常规发送仅用 load/store 发布，不争用全局 tail、CAS 或锁；
 不同 worker 的批次没有全局顺序。首次出现更大的 worker ID 时用一次 CAS 公布队列范围，
 进程注册/退出用 CAS 更新成员位图，这些均不在每批发送的竞争路径上。最多支持 512 个
 GC worker ID，覆盖当前每端最多 192 worker 的双端脚本。
 
-后台接收线程分别读取各 worker 队列，清完一次 drain 内的所有批次后，仅写一次 ACK。
-一条队列满只延后该 worker 的回收，不阻塞其他 worker 发布。GC 对同批节点只检查一次
-两端 ACK，再共享一个新 epoch；只有这个 epoch 的读操作也退出，才允许复用旧节点。
+一次通知同时完成软件 mapping cache 清理和 CPU cacheline 失效。后台接收线程先清完
+该批的 mapping 表项，再记录 epoch，等待所有可能持有清理前旧指针的读操作退出，
+随后对该批内存范围执行 `clflush` 及完成屏障，最后发布 ACK。等待期间该批保留在队列中，
+接收线程继续轮询其他 worker 队列；不会重复清掉已回填的新 mapping，也不再发送第二轮通知。
+一次 drain 只为已完成的连续批次写一次 ACK。GC 收到所有仍注册接收端的 ACK 后才能
+释放节点和 NC 范围描述，允许分配器复用地址。NOOPT 同样执行 cacheline 失效和 ACK。
+一条队列满只延后该 worker 的回收，不阻塞其他 worker 发布。
 普通读不等待消息。接收线程空闲时休眠 50 微秒；缓存不会因 epoch 改变而整体失效。
 队列 payload 是 NC 普通读写，使用发布与 ACK 的 acquire/release（UB 的全系统屏障）
 保证写完整批后才能消费、清完整批后才能复用槽位。注册先加入接收者集合，再快照各
 队列头；私有空缓存只在注册结束后开放给读线程，避免注册期间队列绕回覆盖未处理数据。
 本地命中只对表项做一次 acquire load。回填先用 CAS 取得表项的忙标记，再读取权威
-mapping table 并发布指针；接收线程与回填互斥，等已有回填结束后才清空并 ACK。
+mapping table 并发布指针；接收线程与回填互斥，等已有回填结束后才清空，之后仍须
+完成读者宽限期和 cacheline 失效才能 ACK。
 读线程遇到忙标记或竞争失败时直接读 NC，不等待、不回填。这样旧操作不会在清理
 之后重新填入先前保存的旧指针，也不需要版本字段。叶节点仍检查权威映射：叶链头
 未变时不做 CAS、不重新读节点头；变化时在取得忙标记后重新读一次 NC，保证回填顺序。
 持有忙标记的线程被抢占会延后清理和 GC，其他读线程仍可继续。
-A/B 都在解除共享映射前停止接收线程、注销缓存。这里的清理是软件表项清零，不是
-CPU cacheline invalidate，也没有改变 UB 原生 NC 原子的后端。
+A/B 的 OPT/NOOPT 都在解除共享映射前停止接收线程、注销缓存。
+此协议保证回收复用时不遗留旧读者缓存；它不能阻止硬件在失效后重新预取尚未发布的地址，
+因此不能据此宣称任意预取场景下都满足缓存一致性。UB 原生 NC 原子的后端保持原样。
 
-这会改变共享树布局，A/B 必须同步源码并重新构建 OPT bundle，不能混用旧二进制。
+这会改变共享树和节点分配元数据布局，A/B 必须同步源码并重新构建 OPT/NOOPT bundle，不能混用旧二进制。
 本地构建可增加 `-DYCSB_BUILD_MAPPING_CACHE_CONTRACT=ON`，生成不计时的
 `mapping_cache_contract`，覆盖两个进程的私有表、同进程线程复用、清理等待已有回填、
 忙表项读绕过、批量 ACK 时序、四发送者独立队列、队列满不互相阻塞、异常释放忙标记、
-定向清理及退出/重建。用显式屏障
+定向清理及退出/重建，以及合并通知的宽限期、完成屏障前禁止 ACK、待处理批次不阻塞其他
+worker 队列、NOOPT 接收端退出。用显式屏障
 固定回填与清理的交错顺序，不依赖线程速度；普通共享 mmap 不代表 NC 硬件验证。
 前述 SDK fixture 的 `readonly_rpc_contract bwtree+cache-gc` 另覆盖真实 BwTree 的
-回收路径（70 个退休节点，跨越两个批次）：A 在新的 epoch 继续持有旧缓存指针时，即使清理已 ACK，B 也必须延后释放；
-读端退出宽限期后，验证 CACHE 存活字节下降、旧地址复用且分配高水位不增长。
+回收路径（70 个退休节点，跨越两个批次）：A 在清表后继续持有并读取旧节点时，禁止 ACK 和释放；
+读端退出宽限期后，验证 CACHE 存活字节下降、旧地址复用且分配高水位不增长，A 再次读取
+同一地址时必须看到新 header 和变长节点尾部内容。启用 `YCSB_UB_LOCAL_NCC=ON` 时该
+contract 也进行普通读写插桩，可用独立 CACHE 副本验证实际缓存行失效。
+模拟构建的 `bwtree+cache-gc-no-invalidate` 是预期失败的负对照：仅在 A 完成启动失效后
+屏蔽后续失效，复用地址后必须报旧读或新内容校验失败，不能算作通过。
 运行这些用例前仍须完成测试资源互斥检查；性能结论还需独占环境下的 OPT/NOOPT 对比。
 
 ## BwTree 线程数扫描与单项入口
@@ -447,6 +462,7 @@ BwTree 保留原来的 CoW 读路径：每端映射 CACHE 后，在开始访问�
 之后从 NC 元数据取得已发布节点指针，节点和 value 都直接读取并复用缓存。
 `GetType()`、high/low key、depth、item count 等访问器不执行读前 flush，
 也不查询首次访问地址集合。写端发布新节点前原有的 `FlushNode()` 写回仍保留。
+GC 复用节点地址前则执行上面的批量通知、读者宽限期及各端 cacheline 失效协议。
 已移除 BwTree 的 `PrepareRead()` 和 `--cow-acquire` 实验入口；设置
 `SHM_UB_COW_ACQUIRE=1` 也不会改变 BwTree 的节点或 value 读取路径。
 

@@ -1,5 +1,6 @@
 // Bounded, untimed functional assertions with the file-backed SDK fixture.
-// No latency/throughput result. This does not emulate non-coherent CPU caches.
+// No latency/throughput result. LOCAL_NCC additionally instruments ordinary
+// reads/writes against independent cache replicas; the plain fixture is coherent.
 #include "core/ub_session.h"
 #include "core/op_generator_int_key_addr.h"
 #include "db/db_factory.h"
@@ -102,7 +103,7 @@ void queue_contract(bool owner,int in,int out) {
   if(owner) queue->~UbReadQueue();
 }
 #if defined(ENABLE_BWTREE_DB) && defined(OPT_IN_USE_FLAG) && BWTREE_PROCESS_MAPPING_CACHE
-void mapping_gc_contract(bool owner,int in,int out) {
+void mapping_gc_contract(bool owner,int in,int out,bool drop_remote_invalidate=false) {
   using Tree=wangziqi2013::bwtree::BwTree<long,long>;
   constexpr NodeID id=MAPPING_TABLE_SIZE-1;
   constexpr size_t retired_count=70; // Cross the production 64-node batch boundary.
@@ -114,8 +115,11 @@ void mapping_gc_contract(bool owner,int in,int out) {
     state.tree=new(shared_atomic_memory().malloc(sizeof(Tree))) Tree(false,false);
     state.tree->UpdateThreadLocal(2);
     auto node=[] {
-      return reinterpret_cast<Tree::InnerNode*>(Tree::ElasticNode<Tree::KeyNodeIDPair>::Get(
-          0,Tree::NodeType::InnerType,0,0,std::make_pair(0L,NodeID{0}),std::make_pair(0L,NodeID{0})));
+      auto* result = reinterpret_cast<Tree::InnerNode*>(Tree::ElasticNode<Tree::KeyNodeIDPair>::Get(
+          64,Tree::NodeType::InnerType,0,64,std::make_pair(0L,NodeID{0}),std::make_pair(0L,NodeID{0})));
+      for(long i=0;i<64;++i) result->PushBack(std::make_pair(i,NodeID{0}));
+      result->FlushNode();
+      return result;
     };
     state.old=node(); state.replacement=node();
     state.tree->mapping_table[id].store(state.old);
@@ -128,6 +132,15 @@ void mapping_gc_contract(bool owner,int in,int out) {
   auto* tree=state.tree;
   tree->AssignGCID(owner?0:1);
   tree->PrepareLocalMappingCache();
+  if(!owner && drop_remote_invalidate) {
+#ifdef SHM_LOCAL_NCC
+    // Startup invalidation has already completed. Suppress only subsequent
+    // reader invalidations to prove the reuse check detects this regression.
+    setenv("LOCAL_NCC_DROP","invalidate",1);
+#else
+    throw std::runtime_error("GC invalidation fault injection requires LOCAL_NCC");
+#endif
+  }
   require(tree->GetNode(id,false)==state.old,"initial inner cache fill");
   for(size_t i=1;i<retired_count;++i)
     require(tree->GetNode(id-i,false)==state.more_old[i-1],"initial batch cache fill");
@@ -181,43 +194,73 @@ void mapping_gc_contract(bool owner,int in,int out) {
       require(cursor->cache_invalidation.sequence==garbage->cache_invalidation.sequence,
               "GC sent per-node messages instead of one batch");
     const auto limit=std::chrono::steady_clock::now()+std::chrono::seconds(5);
-    while(!tree->mapping_cache_invalidations.acknowledged(last->cache_invalidation)) {
-      require(std::chrono::steady_clock::now()<limit,"GC message ACK timeout");
-      std::this_thread::sleep_for(std::chrono::microseconds(100));
+    while(tree->GetLocalCacheMappingTable()[id].load()) {
+      require(std::chrono::steady_clock::now()<limit,"mapping clear timeout");
+      std::this_thread::yield();
     }
-    tree->PerformGC(0); // Record an epoch after all ACKs, even if already ACKed above.
-    require(meta->node_count==retired_count && garbage->cache_clear_epoch==2,"missing post-ACK grace period");
+    require(!tree->mapping_cache_invalidations.acknowledged(last->cache_invalidation),
+            "combined ACK before old readers left");
     tree->UpdateLastActiveEpoch();
-    tree->IncreaseEpoch(); // epoch 3, min 1: A still holds the cached old node.
+    tree->IncreaseEpoch(); // epoch 3, min 1: A can still refill old cachelines.
     tree->PerformGC(0);
     require(meta->node_count==retired_count,"freed while A still holds an old cached pointer");
   }
   barrier(in,out);
   if(!owner) {
+    const auto limit=std::chrono::steady_clock::now()+std::chrono::seconds(5);
+    // The first batch waits for this reader. Subsequent batches on the same
+    // producer lane may remain queued until its grace period completes.
+    for(size_t i=0;i<64;++i) while(tree->GetLocalCacheMappingTable()[id-i].load()) {
+      require(std::chrono::steady_clock::now()<limit,"remote mapping clear timeout");
+      std::this_thread::yield();
+    }
     require(state.old->GetType()==Tree::NodeType::InnerType,"old node died inside read operation");
+    require(static_cast<const Tree::InnerNode*>(state.old)->Begin()[63].first==63,
+            "variable-sized old node payload changed before reader quiescence");
     require(tree->GetNode(id,false)==state.replacement,"message failed to refresh A's cache");
-    for(size_t i=1;i<retired_count;++i)
+    for(size_t i=1;i<64;++i)
       require(tree->GetNode(id-i,false)==state.more_new[i-1],"batch failed to clear A's cache");
     tree->UpdateLastActiveEpoch();
+    tree->UnregisterThread(1);
+    // Keep the receiver attached through invalidation, ACK, reuse and reread.
+  }
+  barrier(in,out);
+  if(owner) {
+    const size_t live_before_gc=ub_arena_live(false);
+    const auto limit=std::chrono::steady_clock::now()+std::chrono::seconds(5);
+    while(tree->GetGCMetaData(0)->node_count) {
+      tree->IncreaseEpoch();
+      tree->UpdateLastActiveEpoch();
+      tree->PerformGC(0);
+      require(std::chrono::steady_clock::now()<limit,"combined cacheline ACK/GC timeout");
+      std::this_thread::yield();
+    }
+    require(ub_arena_live(false)<live_before_gc,"GC did not return CACHE storage to the allocator");
+    // The same-sized allocation must reuse the retired block, with no growth
+    // of the CACHE high-water mark. This also exercises prepare()'s policy.
+    const size_t high_water=ub_arena_used(false);
+    auto* reused=reinterpret_cast<Tree::InnerNode*>(Tree::ElasticNode<Tree::KeyNodeIDPair>::Get(
+        64,Tree::NodeType::InnerType,0,64,std::make_pair(41L,NodeID{0}),std::make_pair(99L,NodeID{0})));
+    for(long i=0;i<64;++i) reused->PushBack(std::make_pair(300+i,NodeID{0}));
+    reused->FlushNode();
+    require(reused==state.old,"retired BwTree CACHE address was not reused");
+    require(ub_arena_used(false)==high_water,"reusing a retired node grew the CACHE arena");
+    tree->mapping_table[id].store(reused);
+  }
+  barrier(in,out);
+  if(!owner) {
+    tree->AssignGCID(1);
+    const auto* reused=tree->GetNode(id,true);
+    require(reused==state.old && reused->GetLowKey()==41 && reused->GetHighKey()==99,
+            "remote cacheline survived allocation reuse");
+    require(static_cast<const Tree::InnerNode*>(reused)->Begin()[63].first==363,
+            "remote variable-sized payload cacheline survived reuse");
     tree->UnregisterThread(1);
     bwtree_process_cache::shutdown();
   }
   barrier(in,out);
   if(owner) {
-    const size_t live_before_gc=ub_arena_live(false);
-    tree->UpdateLastActiveEpoch();
-    tree->IncreaseEpoch(); // epoch 4, min 3: second grace period has ended.
-    tree->PerformGC(0);
-    require(tree->GetGCMetaData(0)->node_count==0,"GC did not resume after A quiesced");
-    require(ub_arena_live(false)<live_before_gc,"GC did not return CACHE storage to the allocator");
-    // The same-sized allocation must reuse the retired block, with no growth
-    // of the CACHE high-water mark. This also exercises prepare()'s policy.
-    const size_t high_water=ub_arena_used(false);
-    const auto* reused=reinterpret_cast<Tree::InnerNode*>(Tree::ElasticNode<Tree::KeyNodeIDPair>::Get(
-        0,Tree::NodeType::InnerType,0,0,std::make_pair(0L,NodeID{0}),std::make_pair(0L,NodeID{0})));
-    require(reused==state.old,"retired BwTree CACHE address was not reused");
-    require(ub_arena_used(false)==high_water,"reusing a retired node grew the CACHE arena");
-    tree->epoch_manager.FreeEpochDeltaChain(reused);
+    tree->epoch_manager.FreeEpochDeltaChain(state.old);
     tree->mapping_table[id].store(nullptr);
     tree->epoch_manager.FreeEpochDeltaChain(state.replacement);
     for(size_t i=1;i<retired_count;++i) {
@@ -413,9 +456,9 @@ void run(bool owner,const std::string& mode,int in,int out) {
   VALUE_ADDR_SIZE=64;
   if(owner) generation_contract(props);
   if(mode=="bwtree+legacy") unsetenv("YCSB_UB_SUITE");
-  if(mode=="bwtree+cache-gc") {
+  if(mode=="bwtree+cache-gc" || mode=="bwtree+cache-gc-no-invalidate") {
 #if defined(ENABLE_BWTREE_DB) && defined(OPT_IN_USE_FLAG) && BWTREE_PROCESS_MAPPING_CACHE
-    mapping_gc_contract(owner,in,out);
+    mapping_gc_contract(owner,in,out,mode=="bwtree+cache-gc-no-invalidate");
 #else
     throw std::runtime_error("mapping cache GC contract requires BwTree OPT");
 #endif
@@ -446,7 +489,7 @@ int main(int argc,char** argv) {
     close(ab[0]);close(ba[1]);run(true,argv[1],ba[0],ab[1]);
     int status=0;waitpid(child,&status,0);require(WIFEXITED(status)&&WEXITSTATUS(status)==0,"child failed");
     if(std::string(argv[1])=="bwtree+cache-gc")
-      std::cout<<"PASS bwtree+cache-gc: busy-reader bypass, post-ACK reclamation and CACHE reuse verified\n";
+      std::cout<<"PASS bwtree+cache-gc: combined mapping/cacheline notification, held-reader grace, ACK and remote CACHE reuse verified\n";
     else std::cout<<"PASS "<<argv[1]<<": A read-only; routing, value bytes and memory placement verified\n";
   } catch(const std::exception& e) {
     std::cerr<<e.what()<<'\n';

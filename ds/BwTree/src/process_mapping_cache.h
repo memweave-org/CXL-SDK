@@ -5,10 +5,12 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <mutex>
 #include <thread>
+#include <type_traits>
 #include <unordered_map>
 #include <unistd.h>
 #include "dram_mapping_cache.h"
@@ -67,6 +69,17 @@ struct MappingInvalidationTicket {
   size_t producer = 0;
 };
 
+// The producer enumerates allocation ranges into shared NC memory. Receivers
+// must never traverse a retired CACHE node: its own replica may already be stale.
+struct CachelineRange {
+  const void* address;
+  size_t bytes;
+};
+struct CachelineInvalidation {
+  const CachelineRange* ranges = nullptr;
+  size_t count = 0;
+};
+
 // One single-writer broadcast ring per GC worker. Producers do not share a
 // tail, reservation CAS or lock, and there is no ordering between their rings.
 // Capacity counts batches; payload lives in NC, ordered by published/ACK.
@@ -84,6 +97,7 @@ class MappingInvalidationChannel {
   struct Batch {
     size_t count = 0;
     std::array<uint64_t, BatchSize> nodes{};
+    std::array<CachelineInvalidation, BatchSize> invalidations{};
   };
   struct Lane {
     Counter published;
@@ -129,7 +143,8 @@ public:
     registered_[process].store(0);
   }
   MappingInvalidationTicket try_publish_batch(size_t producer, const uint64_t* ids,
-                                              size_t count) {
+                                              size_t count,
+                                              const CachelineInvalidation* invalidations = nullptr) {
     if (producer >= Producers || !count || count > BatchSize || !ids)
       throw std::out_of_range("BwTree invalidation batch/producer bounds");
     // This CAS is a one-time announcement when a new highest producer ID
@@ -147,7 +162,10 @@ public:
         return {}; // This lane is full; independent producers can still publish.
     auto& batch = lane.batches[head % Capacity];
     batch.count = count;
-    for (size_t i = 0; i < count; ++i) batch.nodes[i] = ids[i];
+    for (size_t i = 0; i < count; ++i) {
+      batch.nodes[i] = ids[i];
+      batch.invalidations[i] = invalidations ? invalidations[i] : CachelineInvalidation{};
+    }
     lane.published.value.store(head + 1, std::memory_order_release);
     return {head + 1, recipients, producer};
   }
@@ -155,23 +173,44 @@ public:
   MappingInvalidationTicket try_publish(uint64_t node_id) {
     return try_publish_batch(0, &node_id, 1);
   }
-  template<class Clear> bool consume_lane(size_t process, size_t producer, Clear clear) {
+  // A receiver can defer completion while pre-clear readers leave their epoch.
+  // Its batch stays in the ring, and no ACK permits reuse of its descriptors.
+  template<class ClearBatch> bool consume_lane_batches(size_t process, size_t producer,
+                                                      ClearBatch clear_batch) {
     if (process >= Processes || producer >= Producers)
       throw std::out_of_range("BwTree cache consumer/producer ID");
     auto& lane = lanes_[producer];
-    auto ack = lane.consumers[process].value.load(std::memory_order_relaxed);
+    const auto initial = lane.consumers[process].value.load(std::memory_order_relaxed);
+    auto ack = initial;
     const auto end = lane.published.value.load(std::memory_order_acquire);
     if (ack == end) return false;
     while (ack < end) {
       const auto& batch = lane.batches[ack % Capacity];
-      for (size_t i = 0; i < batch.count; ++i) clear(batch.nodes[i]);
+      if (!clear_batch(batch.nodes.data(), batch.invalidations.data(), batch.count)) break;
       ++ack;
     }
-    // One release ACK for this entire drain, after every cache clear. A
-    // producer cannot overwrite any of its payload while we are using it.
-    lane.consumers[process].value.store(end, std::memory_order_release);
+    // One release ACK for the completed part of this drain. Pending batches
+    // retain their payload until cache maintenance and its fence finish.
+    if (ack == initial) return false;
+    lane.consumers[process].value.store(ack, std::memory_order_release);
     return true;
   }
+  template<class Clear> bool consume_lane(size_t process, size_t producer, Clear clear) {
+    return consume_lane_batches(process, producer,
+        [&](const uint64_t* nodes, const CachelineInvalidation* invalidations, size_t count) {
+      for (size_t i = 0; i < count; ++i) {
+        if constexpr (std::is_invocable_v<Clear, uint64_t, CachelineInvalidation>) {
+          clear(nodes[i], invalidations[i]);
+        } else {
+          if (invalidations[i].count)
+            throw std::logic_error("Cacheline invalidation requires a range receiver");
+          clear(nodes[i]);
+        }
+      }
+      return true;
+    });
+  }
+  size_t producer_count() const { return producer_count_.load(std::memory_order_acquire); }
   template<class Clear> bool consume(size_t process, Clear clear) {
     bool progress = false;
     const auto count = producer_count_.load(std::memory_order_acquire);
@@ -224,19 +263,54 @@ private:
     const void* owner;
     Channel& channel;
     size_t process;
-    DramMappingCache<Table, 1> table;
+    std::unique_ptr<DramMappingCache<Table, 1>> table;
+    std::function<void(CachelineInvalidation)> invalidate_lines;
+    std::function<uint64_t()> begin_grace;
+    std::function<bool(uint64_t)> grace_complete;
+    std::array<bool, Channel::producer_limit> pending{};
+    std::array<uint64_t, Channel::producer_limit> epochs{};
     std::atomic<bool> stopping{false};
     std::thread receiver;
-    State(const void* key, Channel& shared, size_t id)
-        : owner(key), channel(shared), process(id) {
+    State(const void* key, Channel& shared, size_t id,
+          std::function<void(CachelineInvalidation)> invalidator,
+          std::function<uint64_t()> begin, std::function<bool(uint64_t)> complete)
+        : owner(key), channel(shared), process(id), invalidate_lines(std::move(invalidator)),
+          begin_grace(std::move(begin)), grace_complete(std::move(complete)) {
+      if (bool(begin_grace) != bool(grace_complete))
+        throw std::logic_error("BwTree invalidation requires both grace callbacks");
+      if constexpr (Entries != 0) table = std::make_unique<DramMappingCache<Table, 1>>();
       channel.attach(process);
       try {
         receiver = std::thread([this] {
           while (!stopping.load()) {
-            if (!channel.consume(process, [this](uint64_t id) {
-                  if (id >= Entries) std::terminate();
-                  table[0][id].invalidate();
-                })) std::this_thread::sleep_for(std::chrono::microseconds(50));
+            bool progress = false;
+            for (size_t producer = 0; producer < channel.producer_count(); ++producer) {
+              progress = channel.consume_lane_batches(process, producer,
+                  [this, producer](const uint64_t* ids, const CachelineInvalidation* ranges, size_t count) {
+                bool has_ranges = false;
+                for (size_t i = 0; i < count; ++i) has_ranges |= ranges[i].count != 0;
+                if (!pending[producer]) {
+                  if constexpr (Entries != 0) {
+                    for (size_t i = 0; i < count; ++i) {
+                      if (ids[i] >= Entries) std::terminate();
+                      (*table)[0][ids[i]].invalidate();
+                    }
+                  }
+                  if (has_ranges && begin_grace) epochs[producer] = begin_grace();
+                  pending[producer] = true;
+                }
+                // A pre-clear reader may refill the old cacheline. Wait before
+                // invalidating, rather than ACKing a flush it can undo.
+                if (has_ranges && grace_complete && !grace_complete(epochs[producer])) return false;
+                for (size_t i = 0; i < count; ++i) if (ranges[i].count) {
+                  if (!invalidate_lines) std::terminate();
+                  invalidate_lines(ranges[i]); // Must include a completion fence.
+                }
+                pending[producer] = false;
+                return true;
+              }) || progress;
+            }
+            if (!progress) std::this_thread::sleep_for(std::chrono::microseconds(50));
           }
         });
       } catch (...) {
@@ -245,8 +319,9 @@ private:
       }
       live.store(true);
       std::fprintf(stderr,
-          "BWTREE_MAPPING_CACHE pid=%ld tree=%p address=%p bytes=%zu tables=1 placement=process-private-dram invalidation=per-worker-batch-ack batch_nodes=64 publish=single-writer fill=busy-slot\n",
-          long(getpid()), key, static_cast<void*>(&table[0]), sizeof(Table));
+          "BWTREE_MAPPING_CACHE pid=%ld tree=%p address=%p bytes=%zu tables=%zu placement=process-private-dram invalidation=per-worker-batch-ack batch_nodes=64 publish=single-writer fill=busy-slot cachelines=clear-grace-invalidate-ack\n",
+          long(getpid()), key, table ? static_cast<void*>(&(*table)[0]) : nullptr,
+          Entries ? sizeof(Table) : 0, size_t(Entries != 0));
     }
     void stop() override {
       if (!live.exchange(false)) return;
@@ -274,13 +349,20 @@ private:
     return *local;
   }
 public:
-  static void prepare(const void* owner, Channel& channel, size_t process) {
+  static void prepare(const void* owner, Channel& channel, size_t process,
+                      std::function<void(CachelineInvalidation)> invalidator = {},
+                      std::function<uint64_t()> begin_grace = {},
+                      std::function<bool(uint64_t)> grace_complete = {}) {
     auto& all = bwtree_process_cache::registry();
     std::lock_guard<std::mutex> guard(all.mutex);
     if (!all.states.count(owner))
-      all.states.emplace(owner, std::make_shared<State>(owner, channel, process));
+      all.states.emplace(owner, std::make_shared<State>(owner, channel, process, std::move(invalidator),
+          std::move(begin_grace), std::move(grace_complete)));
   }
-  static Table& table(const void* owner) { return bound(owner).table[0]; }
+  static Table& table(const void* owner) {
+    static_assert(Entries != 0, "NOOPT has no software mapping table");
+    return (*bound(owner).table)[0];
+  }
   static uintptr_t load(const void* owner, size_t index) {
     return table(owner)[index].load();
   }

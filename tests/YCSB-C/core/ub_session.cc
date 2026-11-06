@@ -7,7 +7,7 @@
 #include "shm/ub.h"
 #include "utils/bypass_cache.h"
 #include "utils/sim_id.h"
-#if defined(ENABLE_BWTREE_DB) && defined(OPT_IN_USE_FLAG) && BWTREE_PROCESS_MAPPING_CACHE
+#if defined(ENABLE_BWTREE_DB) && defined(NO_CC) && BWTREE_PROCESS_MAPPING_CACHE
 #include "process_mapping_cache.h"
 #endif
 #include <cstdlib>
@@ -352,9 +352,9 @@ void ready() {
 void await_cleanup() { command(owner?"release":"close"); }
 void finish() {
   ycsbc::ReleaseLocalUbDBs();
-#if defined(ENABLE_BWTREE_DB) && defined(OPT_IN_USE_FLAG) && BWTREE_PROCESS_MAPPING_CACHE
+#if defined(ENABLE_BWTREE_DB) && defined(NO_CC) && BWTREE_PROCESS_MAPPING_CACHE
   // A does not destroy B's shared tree. Stop its local invalidation receiver
-  // and retire its private cache before either shared mapping is unmapped.
+  // and retire any private cache before either shared mapping is unmapped (OPT/NOOPT).
   bwtree_process_cache::shutdown();
 #endif
 #ifdef YCSB_CXL_TWO_PROCESS

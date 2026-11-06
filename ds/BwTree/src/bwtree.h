@@ -61,7 +61,7 @@
 #ifndef BWTREE_PROCESS_MAPPING_CACHE
 #define BWTREE_PROCESS_MAPPING_CACHE 0
 #endif
-#if defined(NO_CC) && defined(OPT_IN_USE_FLAG) && BWTREE_PROCESS_MAPPING_CACHE
+#if defined(NO_CC) && BWTREE_PROCESS_MAPPING_CACHE
 #include "process_mapping_cache.h"
 #endif
 #if defined(NO_CC) && defined(OPT_IN_USE_FLAG) && !defined(NT_SIM) && BWTREE_MAPPING_CACHE_DRAM
@@ -319,9 +319,9 @@ protected:
     NodeID node_id;
     size_t estimated_bytes;
     GarbageNode *next_p;
-#if defined(OPT_IN_USE_FLAG) && BWTREE_PROCESS_MAPPING_CACHE
+#if defined(NO_CC) && BWTREE_PROCESS_MAPPING_CACHE
     MappingInvalidationTicket cache_invalidation{};
-    uint64_t cache_clear_epoch = std::numeric_limits<uint64_t>::max();
+    CachelineInvalidation cacheline_ranges{};
 #endif
 
     /*
@@ -390,11 +390,7 @@ protected:
           node_count{0UL}, pending_bytes{0UL} {}
   };
 
-  // Make sure class Data does not exceed one cache line
-  #ifndef NT_SIM
-  static_assert(sizeof(GCMetaData) < 2 * cl_size,
-                "class Data size exceeds cache line length!");
-                #endif
+  // GC metadata includes the combined invalidation ticket and NC range list.
 
   /*
    * class PaddedData - Padded data to the length of a cache line
@@ -429,11 +425,8 @@ protected:
                 "class PaddedMetadata size does"
                 " not conform to the alignment!");
 
-#ifndef NT_SIM  
-  using PaddedGCMetadata = PaddedData<GCMetaData, 2 * cl_size>;
-#else
-  using PaddedGCMetadata = PaddedData<GCMetaData, 3 * cl_size>;
-#endif
+  using PaddedGCMetadata = PaddedData<GCMetaData,
+      (sizeof(GCMetaData) / cl_size + 1) * cl_size>;
 
   static_assert(sizeof(PaddedGCMetadata) == PaddedGCMetadata::ALIGNMENT,
                 "class PaddedGCMetadata size does"
@@ -2152,6 +2145,9 @@ class BwTree : public BwTreeBase {
 #endif
     // This points to the lower limit of the memory region we could use
     char *const limit;
+#if defined(NO_CC) && BWTREE_PROCESS_MAPPING_CACHE
+    const size_t allocation_bytes;
+#endif
     // This forms a linked list which needs to be traversed in order to
     // free chunks of memory
 #ifdef SHM_UB_SPLIT
@@ -2164,14 +2160,21 @@ class BwTree : public BwTreeBase {
     /*
      * Constructor
      */
-    AllocationMeta(char *p_tail, char *p_limit)
+    AllocationMeta(char *p_tail, char *p_limit, size_t bytes = CHUNK_SIZE)
 #ifdef SHM_UB_SPLIT
         : tail(make_shared_atomic<nt<char *>>(p_tail)), limit{p_limit},
+#if defined(NO_CC) && BWTREE_PROCESS_MAPPING_CACHE
+          allocation_bytes(bytes),
+#endif
           next(make_shared_atomic<std::atomic<AllocationMeta *>>(nullptr)) {
       clwb(this, sizeof(*this));
     }
 #else
-        : tail{p_tail}, limit{p_limit}, next{nullptr} {}
+        : tail{p_tail}, limit{p_limit},
+#if defined(NO_CC) && BWTREE_PROCESS_MAPPING_CACHE
+          allocation_bytes(bytes),
+#endif
+          next{nullptr} { (void)bytes; }
 #endif
 
     /*
@@ -2314,6 +2317,12 @@ class BwTree : public BwTreeBase {
      * This function is not thread-safe and should only be called in a single
      * thread environment such as GC
      */
+#if defined(NO_CC) && BWTREE_PROCESS_MAPPING_CACHE
+    void CollectCachelineRanges(std::vector<CachelineRange>& ranges) const {
+      for (auto* meta = this; meta; meta = meta->next.load())
+        ranges.push_back({meta, meta->allocation_bytes});
+    }
+#endif
     void Destroy() {
       AllocationMeta *meta_p = this;
 
@@ -2632,7 +2641,8 @@ class BwTree : public BwTreeBase {
       // AllocationMeta
       new (reinterpret_cast<AllocationMeta *>(alloc_base))
           AllocationMeta{alloc_base + AllocationMeta::CHUNK_SIZE,
-                         alloc_base + sizeof(AllocationMeta)};
+                         alloc_base + sizeof(AllocationMeta),
+                         sizeof(ElasticNode) + size * sizeof(ElementType) + AllocationMeta::CHUNK_SIZE};
 
       // The first CHUNK_SIZE byte is used by class AllocationMeta
       // and chunk data
@@ -3088,7 +3098,7 @@ class BwTree : public BwTreeBase {
     root_help_update = nullptr;
 #endif
 
-#if defined(OPT_IN_USE_FLAG) && BWTREE_PROCESS_MAPPING_CACHE
+#if defined(NO_CC) && BWTREE_PROCESS_MAPPING_CACHE
     LocalMappingCache::release(this);
 #endif
     return;
@@ -8820,6 +8830,49 @@ class BwTree : public BwTreeBase {
     }
   }
 
+#if defined(NO_CC) && BWTREE_PROCESS_MAPPING_CACHE
+  // Mirror FreeEpochDeltaChain's ownership rules. Inline deltas belong to the
+  // base node's allocation chunks; remove/abort nodes own only themselves.
+  // Enumerate on the writer, while all retired storage is still allocated.
+  void CollectRetiredCachelineRanges(const BaseNode* node,
+                                    std::vector<CachelineRange>& ranges) const {
+    while (node) {
+      switch (node->GetType()) {
+        case NodeType::LeafType:
+          ElasticNode<KeyValuePair>::GetAllocationHeader(
+              static_cast<const LeafNode*>(node))->CollectCachelineRanges(ranges);
+          return;
+        case NodeType::InnerType:
+          ElasticNode<KeyNodeIDPair>::GetAllocationHeader(
+              static_cast<const InnerNode*>(node))->CollectCachelineRanges(ranges);
+          return;
+        case NodeType::LeafMergeType:
+          CollectRetiredCachelineRanges(static_cast<const LeafMergeNode*>(node)->right_merge_p, ranges);
+          break;
+        case NodeType::InnerMergeType:
+          CollectRetiredCachelineRanges(static_cast<const InnerMergeNode*>(node)->right_merge_p, ranges);
+          break;
+        case NodeType::LeafRemoveType:
+          ranges.push_back({node, sizeof(LeafRemoveNode)}); return;
+        case NodeType::InnerRemoveType:
+          ranges.push_back({node, sizeof(InnerRemoveNode)}); return;
+        case NodeType::InnerAbortType:
+          ranges.push_back({node, sizeof(InnerAbortNode)}); return;
+        case NodeType::LeafInsertType:
+        case NodeType::LeafDeleteType:
+        case NodeType::LeafSplitType:
+        case NodeType::InnerInsertType:
+        case NodeType::InnerDeleteType:
+        case NodeType::InnerSplitType:
+          break;
+        default:
+          throw std::logic_error("Unknown retired BwTree node type");
+      }
+      node = static_cast<const DeltaNode*>(node)->child_node_p;
+    }
+  }
+#endif
+
   size_t EstimateGCNodeBytes(const BaseNode *node_p) const {
     if (node_p == nullptr) {
       return 0;
@@ -9154,12 +9207,19 @@ class BwTree : public BwTreeBase {
 #ifdef NO_CC
   using mapping_table_t = std::array<nt<const BaseNode *>, MAPPING_TABLE_SIZE>;
   mapping_table_t mapping_table;
+#if BWTREE_PROCESS_MAPPING_CACHE
+#ifdef OPT_IN_USE_FLAG
+  using LocalMappingCache = ProcessMappingCache<MAPPING_TABLE_SIZE, nt>;
+#else
+  // NOOPT still participates in cacheline invalidation, without allocating a
+  // software pointer cache. Both variants must ACK before storage can be reused.
+  using LocalMappingCache = ProcessMappingCache<0, nt>;
+#endif
+  typename LocalMappingCache::Channel mapping_cache_invalidations;
+#endif
   #ifdef OPT_IN_USE_FLAG
 #if BWTREE_PROCESS_MAPPING_CACHE
-    using LocalMappingCache = ProcessMappingCache<MAPPING_TABLE_SIZE, nt>;
     using cached_mapping_table_t = typename LocalMappingCache::Table;
-    // No private pointer or table is stored in this shared object.
-    typename LocalMappingCache::Channel mapping_cache_invalidations;
 #else
     // Bit 0 records leaf-chain membership; publish it with the pointer.
     using cached_mapping_table_t = std::array<std::atomic<uintptr_t>, MAPPING_TABLE_SIZE>;
@@ -9229,13 +9289,23 @@ class BwTree : public BwTreeBase {
 #endif
   }
 
-#ifdef OPT_IN_USE_FLAG
-  void PrepareLocalMappingCache() {
-#if BWTREE_PROCESS_MAPPING_CACHE
-    LocalMappingCache::prepare(this, mapping_cache_invalidations,
-                               SimThreadInfo::worker_machine_id);
-#endif
+#if defined(NO_CC) && BWTREE_PROCESS_MAPPING_CACHE
+  void AssignGCID(int id) {
+    PrepareLocalMappingCache();
+    BwTreeBase::AssignGCID(id);
   }
+  void PrepareLocalMappingCache() {
+    LocalMappingCache::prepare(this, mapping_cache_invalidations,
+        SimThreadInfo::worker_machine_id, [](CachelineInvalidation invalidation) {
+          for (size_t i = 0; i < invalidation.count; ++i) {
+            const auto& range = invalidation.ranges[i];
+            clflush(range.address, range.bytes); // Includes completion fence.
+          }
+        }, [this] { return GetGlobalEpoch(); },
+        [this](uint64_t cleared_epoch) { return SummarizeGCEpoch() > cleared_epoch; });
+  }
+#endif
+#ifdef OPT_IN_USE_FLAG
   inline cached_mapping_table_t& GetLocalCacheMappingTable() {
 #if BWTREE_PROCESS_MAPPING_CACHE
     return LocalMappingCache::table(this);
@@ -11034,46 +11104,49 @@ class BwTree : public BwTreeBase {
     GarbageNode *header_p = &GetGCMetaData(thread_id)->header;
     GarbageNode *first_p = header_p->next_p;
 
-#if defined(OPT_IN_USE_FLAG) && BWTREE_PROCESS_MAPPING_CACHE
-    // Each GC worker publishes to its own ring: no global lock or ordering
-    // between workers. Contiguous retired nodes share one batch ticket, one
-    // ACK check and one post-ACK epoch. Reader lifetime rules are unchanged.
-    constexpr size_t batch_size = LocalMappingCache::Channel::batch_size;
-    auto* node = first_p;
-    while (node != nullptr && node->delete_epoch < min_epoch) {
-      if (node->cache_clear_epoch != std::numeric_limits<uint64_t>::max()) {
-        node = node->next_p;
+#if defined(NO_CC) && BWTREE_PROCESS_MAPPING_CACHE
+    // One broadcast carries both node IDs and NC allocation-range descriptors.
+    // Each receiver clears mappings, waits out pre-clear readers, invalidates
+    // cachelines and then ACKs. GC never waits synchronously inside an operation.
+    auto* pending = first_p;
+    while (pending && pending->delete_epoch < min_epoch) {
+      if (pending->cache_invalidation.sequence) {
+        pending = pending->next_p;
         continue;
       }
-      std::array<GarbageNode*, batch_size> batch;
-      std::array<uint64_t, batch_size> ids;
+      constexpr size_t count_limit = LocalMappingCache::Channel::batch_size;
+      std::array<GarbageNode*, count_limit> batch;
+      std::array<uint64_t, count_limit> ids;
+      std::array<CachelineInvalidation, count_limit> invalidations;
       size_t count = 0;
-      auto ticket = node->cache_invalidation;
-      auto* next = node;
-      while (next != nullptr && next->delete_epoch < min_epoch && count < batch_size &&
-             next->cache_clear_epoch == std::numeric_limits<uint64_t>::max() &&
-             next->cache_invalidation.sequence == ticket.sequence &&
-             next->cache_invalidation.producer == ticket.producer) {
+      auto* next = pending;
+      while (next && next->delete_epoch < min_epoch && count < count_limit &&
+             !next->cache_invalidation.sequence) {
+        if (!next->cacheline_ranges.count) {
+          std::vector<CachelineRange> ranges;
+          CollectRetiredCachelineRanges(static_cast<const BaseNode*>(next->node_p), ranges);
+          if (ranges.empty()) throw std::logic_error("Empty retired BwTree allocation ranges");
+          auto* shared = static_cast<CachelineRange*>(
+              shared_atomic_memory(bwtree_memory()).malloc(ranges.size() * sizeof(CachelineRange)));
+          std::copy(ranges.begin(), ranges.end(), shared);
+          next->cacheline_ranges = {shared, ranges.size()};
+        }
         batch[count] = next;
-        ids[count++] = next->node_id;
+        ids[count] = next->node_id;
+        invalidations[count++] = next->cacheline_ranges;
         next = next->next_p;
       }
-      if (!ticket.sequence) {
-        ticket = mapping_cache_invalidations.try_publish_batch(thread_id, ids.data(), count);
-        if (!ticket.sequence) break;
-        for (size_t i = 0; i < count; ++i) batch[i]->cache_invalidation = ticket;
-      }
-      if (mapping_cache_invalidations.acknowledged(ticket)) {
-        const auto cleared_epoch = GetGlobalEpoch();
-        for (size_t i = 0; i < count; ++i) batch[i]->cache_clear_epoch = cleared_epoch;
-      }
-      node = next;
+      const auto ticket = mapping_cache_invalidations.try_publish_batch(
+          thread_id, ids.data(), count, invalidations.data());
+      if (!ticket.sequence) break; // Backpressure must not permit premature free.
+      for (size_t i = 0; i < count; ++i) batch[i]->cache_invalidation = ticket;
+      pending = next;
     }
 #endif
-    const auto reclaimable = [min_epoch](const GarbageNode *node) {
+    const auto reclaimable = [this, min_epoch](const GarbageNode *node) {
       if (node == nullptr || node->delete_epoch >= min_epoch) return false;
-#if defined(OPT_IN_USE_FLAG) && BWTREE_PROCESS_MAPPING_CACHE
-      return node->cache_clear_epoch < min_epoch;
+#if defined(NO_CC) && BWTREE_PROCESS_MAPPING_CACHE
+      return mapping_cache_invalidations.acknowledged(node->cache_invalidation);
 #else
       return true;
 #endif
@@ -11102,6 +11175,11 @@ class BwTree : public BwTreeBase {
 
       // Then free memory
       epoch_manager.FreeEpochDeltaChain((const BaseNode *)garbage_p->node_p);
+#if defined(NO_CC) && BWTREE_PROCESS_MAPPING_CACHE
+      // All recipients have finished reading this NC descriptor before ACK.
+      shared_atomic_memory(bwtree_memory()).free(
+          const_cast<CachelineRange*>(garbage_p->cacheline_ranges.ranges));
+#endif
       RecordReleasedGCBytes(garbage_p->estimated_bytes);
       assert(GetGCMetaData(thread_id)->pending_bytes >= garbage_p->estimated_bytes);
       GetGCMetaData(thread_id)->pending_bytes -= garbage_p->estimated_bytes;

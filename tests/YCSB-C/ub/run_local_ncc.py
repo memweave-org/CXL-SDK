@@ -100,7 +100,7 @@ def main():
             guard.check()
             log = (output/(role+'.log')).open('w'); logs.append(log)
             settings = SimpleNamespace(role=role, binary=str(binary), threads_a=1, threads_b=1,
-                db=args.db, suite=args.suite, rpc=0, a_writable=0, seed=args.seed,
+                db=args.db, suite=args.suite, rpc=0, a_writable=0, seed=args.seed, sherman_access='cache',
                 size_mb=args.size_mb, nc_size_mb=128, records=args.records, ops=args.ops, value_size=args.value_size,
                 cpu=cpu, timeout=args.timeout, spec=str(HERE/'workloadb_90read.spec'), ini=str(HERE/'config.ini'))
             worker = Worker(settings, 'local-ncc-'+str(os.getpid()), 'fixture', log)

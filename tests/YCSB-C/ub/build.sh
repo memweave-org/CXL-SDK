@@ -15,6 +15,7 @@ out=$(cd "$out" && pwd)
 if [[ ${YCSB_BACKEND:-ub} == cxl ]]; then
   variant=nocc
   [[ $OPT != 0 ]] || variant=nocc_no_opt
+  [[ ${YCSB_RPC_BUILD:-0} != 1 ]] || variant=cc_nocc_mq
   YCSB_CXL_TWO_PROCESS=1 SHM_UB_API=none YCSB_BUILD_DIR="$out/build" \
     YCSB_UPDATE_SYMLINKS=0 YCSB_INDEXES="$YCSB_INDEXES" JOBS="${JOBS:-2}" \
     bash ../build.sh "$variant"
@@ -54,7 +55,7 @@ cleanup() {
   docker image rm "$image" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
-docker build --build-arg "BUILD_IMAGE=$BUILD_IMAGE" --build-arg "OPT=$OPT" --build-arg "YCSB_INDEXES=$YCSB_INDEXES" --build-arg "JOBS=${JOBS:-2}" -t "$image" "$context" 2>&1 | tee "$out/build.log"
+docker build --build-arg "BUILD_IMAGE=$BUILD_IMAGE" --build-arg "OPT=$OPT" --build-arg "YCSB_RPC_BUILD=${YCSB_RPC_BUILD:-0}" --build-arg "YCSB_INDEXES=$YCSB_INDEXES" --build-arg "JOBS=${JOBS:-2}" -t "$image" "$context" 2>&1 | tee "$out/build.log"
 container=$(docker create "$image" /bin/true)
 docker cp "$container:/out/." "$out/"
 chmod +x "$out/ycsbc"

@@ -372,7 +372,33 @@ void run(bool owner,const std::string& mode,int in,int out) {
   props.SetProperty("readproportion","0.9");props.SetProperty("updateproportion","0.1");
   char ready=1;
   if(!owner) transfer(in,&ready,1,false);
+  if(rpc) {
+    cpu_set_t allowed; require(sched_getaffinity(0,sizeof(allowed),&allowed)==0,"MQ affinity");
+    std::vector<int> cpus;
+    for(int i=0;i<CPU_SETSIZE;++i) if(CPU_ISSET(i,&allowed)) cpus.push_back(i);
+    require(cpus.size()>=2*(1+clients),"MQ contract needs separate client/service CPUs");
+    const int count=owner?1:clients, start=owner?0:2;
+    auto list=[&](int offset) {
+      std::string text;
+      for(int i=0;i<count;++i) { if(i) text+=","; text+=std::to_string(cpus[start+offset+i]); }
+      return text;
+    };
+    setenv("YCSB_UB_CPU",std::to_string(cpus[start]).c_str(),1);
+    setenv("YCSB_UB_CPUS",list(0).c_str(),1);
+    setenv("YCSB_RPC_CPUS",list(count).c_str(),1);
+  }
   ycsbc_ub::prepare(props);
+  if(rpc && index=="bwtree") {
+    // Exercise the production RPC pool policy before creating the tree.
+    // Total allocation exceeds the 128 MiB pool; only one block is live.
+    constexpr size_t bytes=8*1024*1024;
+    for(int i=0;i<64;++i) {
+      void* block=cacheable.malloc(bytes);
+      require(block && ycsbc_ub::in_local_index(block,bytes),"RPC pool reuse escaped local DRAM");
+      std::memset(block,i,bytes);
+      cacheable.free(block);
+    }
+  }
   if(owner) transfer(out,&ready,1,true);
   VALUE_ADDR_SIZE=64;
   if(owner) generation_contract(props);

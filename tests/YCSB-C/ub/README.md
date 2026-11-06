@@ -1,8 +1,27 @@
-# 原 YCSB-C 框架的双机 UB 模式
+# 原 YCSB-C 框架的 CXL/UB 多进程模式
 
-## 八种模式 × 三档 worker：run_all
+## 八种模式：run_all
 
-两机拉取同一版本并配置 `ub/config.sh`，在 B 先执行、A 随后执行：
+CXL 在同一台机器运行独立 A/B 进程，全部八项均使用该模型：
+
+```sh
+cd /mnt/disk1/wfn/CXL-SDK/tests/YCSB-C
+bash run_all.sh --backend cxl --dry-run
+bash run_all.sh --backend cxl --thread-counts 24 --cxl-node 4
+```
+
+CXL 默认 A 整个进程绑定 NUMA0、B 绑定 NUMA1，可用 `CXL_CPU_NODE_A/B` 配置；
+共享内存节点仍由 `--cxl-node` / `CXL_NODE` 指定，默认 NUMA4。
+包含 RPC 的矩阵默认每端 24 个客户端，RPC 每端另外启动 24 个服务线程，
+分别占用所在 NUMA 节点的 48 个逻辑 CPU；仅运行非 RPC 项时默认每端 32 个客户端。
+A/B 客户端和服务 CPU 集合互不重叠；显式线程数超过本 NUMA 可用容量会在构建前报错，
+不会跨 NUMA 补充 CPU。默认保留 `config.sh` 的 48 GiB CACHE/每端 RPC 本地池、16 GiB 共享
+通信区（两端各占约一半），Sherman 两项使用 64 GiB 的单一共享 NC 区。
+CXL 的 `nc-direct` / `nc-memcpy` 使用与 UB 相同的 Sherman 节点和访问路径，但
+CXL 文件映射可缓存，原子访问走 queue 模拟；这里不声称真实 UB NC 硬件语义。
+ClevelHash 的层回收逻辑在两种多进程构建中都启用。
+
+UB 两机拉取同一版本并配置 `ub/config.sh`，在 B 先执行、A 随后执行：
 
 ```sh
 cd /mnt/disk1/wfn/CXL-SDK/tests/YCSB-C
@@ -14,10 +33,10 @@ bash run_all.sh
 | --- | --- | --- | --- | --- |
 | bwtree | NOOPT | 直接读 | 本地索引 | CACHE |
 | bwtree+opt | OPT | 直接读 | 本地索引 | CACHE |
-| bwtree+rpc | NOOPT | 本地分区直接读 / 远端 RPC 读 | 本地分区直接访问 / 远端 RPC 读写 | 两端本地 DRAM |
+| bwtree+rpc | 原 cc_nocc_mq | 本地 MQ / 远端 MQ 读 | 本地 MQ / 远端 MQ 读写 | 两端本地 DRAM |
 | clevelhash | NOOPT | 直接读 | 本地索引 | CACHE |
 | clevelhash+opt | OPT | 直接读 | 本地索引 | CACHE |
-| clevelhash+rpc | NOOPT | 本地分区直接读 / 远端 RPC 读 | 本地分区直接访问 / 远端 RPC 读写 | 两端本地 DRAM |
+| clevelhash+rpc | 原 cc_nocc_mq | 本地 MQ / 远端 MQ 读 | 本地 MQ / 远端 MQ 读写 | 两端本地 DRAM |
 | sherman+nc-direct | NOOPT | NC 字段直接 load | NC 字段直接 load/store | NC |
 | sherman+nc-memcpy | NOOPT | memcpy 到本地读取 | memcpy 到本地，修改后复制回 NC | NC |
 
@@ -25,7 +44,7 @@ bash run_all.sh
 update 替换已有 key 的 value。两端均使用 Zipfian 分布，每项新建共享对象，
 使用相同初始记录数、每端操作数、线程数和 `SEED`，并核对各端操作类型/key
 序列 hash 在相同 worker 数的八种模式间一致。B 的比例由随机抽样决定，小样本不保证恰好 90/10。
-每种模式依次测试每端 **32、64、128 个 worker**，共 24 轮，A/B 数量相同。
+UB 默认每种模式依次测试每端 **32、64、128 个 worker**，共 24 轮；CXL 完整矩阵默认每端 **24**，共 8 轮，A/B 数量相同。
 默认初始插入 10,000,000 个 key，每端每轮共 10,000,000 次操作（两端合计 20,000,000），由该端全部 worker 分摊。
 A 执行 10,000,000 次查询；B 约 9,000,000 次查询、1,000,000 次更新，查询和更新均针对初始 key 集合。
 可用 `--thread-counts 32 64` 或 `THREAD_COUNTS="32 64"` 选择档位；启动时检查
@@ -39,15 +58,21 @@ RECORDS=1000 OPS=1000 bash run_all.sh --thread-counts 32
 BwTree/ClevelHash 继续使用已有启动 CACHE 失效及发布修复，A CACHE 只读、B 可写。
 普通模式不分配 RPC 队列、不启动服务线程。`+rpc` 在 A/B 各建立一个本地 DRAM
 索引，按 `key % 2` 分区（0 属于 B，1 属于 A）；`RECORDS` 是两端合计的初始记录数。
-两端分别装载自己的记录，本机 key 直接访问，远端 key 通过双向共享队列请求所属机器。
+两端分别装载自己的记录。本机 key 进入原 ThreadPool 的本地 MQ，远端 key 通过双向共享 MQ 请求所属进程，统一由原 ThreadPool 的服务线程执行。
+BwTree RPC 的本地 memkind 固定池允许 epoch GC 释放并复用旧节点；不能开启
+`retain_until_exit`，否则 `free()` 会变成空操作，加载/更新时的累计分配会耗尽池。
+`SIZE_MB` 控制每端本地池容量，整机空闲内存不会自动扩展该池；默认仍为 48 GiB。
 A 的 workload 仍全读，B 的 workload 仍为 90% read / 10% update；B 更新 A 所属的 key 时，
 由 A 的服务线程更新 A 的本地索引。
 
-复用 `shm-lib/include/msg/mpmc_queue.h` 的 `MPMCQueue<uint32_t>`，每个方向一条队列，
+复用 `db/thread_pool.cc` 的工作线程循环、随机桶遍历和空队列 pause/yield，以及
+`shm-lib/include/msg/mpmc_queue.h` 的 MPMCQueue。每个方向按 client 分桶，跨进程只传 slot ID 和 value 字节，
 每个 client 最多一个在途请求。共享 NC 只保存队列、请求/回复 payload、启动描述及跨机同步；
 索引控制对象、原子元数据、节点、value 都在所属机器的 DRAM，RPC 模式不创建 CACHE 映射。
 读回复和更新请求传递完整 value 字节；对端不会解引用发送方的 DRAM 指针。
-每端都有一个额外服务线程，与该端第一个 worker 共用 CPU。
+每端服务线程数等于该端客户端数，两组分别绑定独立 CPU；CXL 同机运行的 A/B 四组也互不重叠。
+本地 lambda 和本地 MQ 的存储均留在本地 DRAM，不传送捕获的私有引用。
+因此每端 N 个客户端需要 2N 个逻辑 CPU；CXL 同机双进程需要 4N 个。
 所有两进程模式的 pthread 句柄、线程参数、Client DB 列表和 master 的计时/启动对象
 均在本地 DRAM；用于跨机分发的 trace 暂存、索引描述和 barrier 保留在共享 NC。
 结果核对本地/远端操作计数及 `A.rpc_sent == B.rpc_completed`、
@@ -61,16 +86,20 @@ NC 映射仍需可写以支持控制信息及 epoch 等元数据；这不允许 
 `nc-direct` 直接遍历 NC 节点字段，B 在锁和版本保护下原地修改、分裂节点；
 `nc-memcpy` 将完整节点复制到本地查询，B 在本地修改后复制修改部分回 NC。
 value 也分别使用直接访问或本地复制。两项都关闭本地内部节点缓存，保持相同节点布局；
-每个 1024 字节节点占一个 4 KiB 分配槽并带独立 NC 版本头，避免修改/分裂时版本锁别名。
+每个 1024 字节节点占一个 2 KiB 对齐的分配槽并带独立 NC 版本头，避免修改/分裂时版本锁别名。
+版本头按槽定位，因此同一个 4 KiB 系统页内的两个节点也使用独立版本计数器。
+这也避免 memkind 1.13 将 `posix_memalign(4096,4096)` 扩成 16 KiB usable 加额外页面的空间浪费。
+若仍发生分配失败，日志会报告请求大小、对齐、进程分配池大小及 allocated/active；
+`memkind_create_fixed` 失败则报告实际返回码和 `memkind_error_message`，共享分配禁止回退到堆。
 NC 模式不再分配旧的 4 MiB 哈希版本表；CACHE 模式仍使用它。独立版本头和哈希版本表
 都是适配层机制，与上游节点/叶子记录内嵌的 front/rear 版本字段不同。
-Sherman 的 NC 包含节点、value 和原框架的 trace/控制数据，默认 16384 MiB，
+Sherman 的 NC 包含节点、value 和原框架的 trace/控制数据，默认 65536 MiB（64 GiB），
 由 `SHERMAN_NC_SIZE_MB` 单独配置；耗尽即报错。
 这里的 NC 是 UB SDK 的 non-cacheable 映射，不是 cacheable 内存上的 streaming 指令。
 
-每端构建包含三种索引的 NOOPT/OPT 两份二进制，按 case 复用。镜像需包含 CityHash、
+每端构建包含三种索引的 NOOPT/OPT/RPC 三份二进制，按 case 复用。镜像需包含 CityHash、
 Boost coroutine/context 开发库；`Dockerfile.openEuler` 已配置这些依赖。
-构建仍在 Docker 内，worker 在物理机运行；Sherman 不需要 RDMA 或 memcached。
+UB 打包构建在 Docker 内，CXL 在本机编译；二者均调用原 `tests/YCSB-C/build.sh`，worker 在物理机运行；Sherman 不需要 RDMA 或 memcached。
 `--build-only --output /absolute/path/build-result` 只构建，后续用
 `--bundles /absolute/path/build-result/bundles` 复用。两端握手核对 case、访问模式、
 参数、workload 和二进制 SHA256，结果还检查实际 OPT 和 NC 模式，旧 bundle 不能冒充新模式。
@@ -88,10 +117,10 @@ YCSB_UB_SUITE=1 YCSB_UB_CASE=bwtree bash run.sh
 以上命令逐轮运行，等 A/B 均退出后再切换。未指定 case 的旧 `run.sh` 仍保留下面的默认行为。
 按配置中的 IP 自动识别角色，也可设置 `YCSB_UB_ROLE=A` / `B`。不设置 `YCSB_UB_FIXTURE`。
 
-结果位于 `ub/result-all-A-*` / `ub/result-all-B-*`，每轮使用
-`<case>/threads-32`、`threads-64` 或 `threads-128` 子目录，包含 worker/control 日志、
-配置和 `result.json`；`summary.json` / `summary.csv` 汇总 24 轮并记录两端 worker 数。
-NOOPT/OPT 各构建一次，全部轮次复用；每轮新建共享对象，清理完成后再进入下一轮。
+结果位于 `ub/result-all-A-*` / `ub/result-all-B-*`，CXL 位于 `ub/result-all-local-*`，每轮使用
+`<case>/threads-24`（CXL 默认）或 `threads-32/64/128`（UB 默认）子目录，包含 worker/control 日志、
+配置和 `result.json`；`summary.json` / `summary.csv` 汇总所有轮次并记录两端 worker 数。
+NOOPT/OPT/RPC 各构建一次，全部轮次复用；每轮新建共享对象，清理完成后再进入下一轮。
 两端握手核对完整模式列表、线程数列表和当前轮次。失败立即停止，失败目录写入
 `invalid.json`，失败样本不计入成功汇总。
 `run_all.sh` 和 `run.sh` 的线程扫描都不检测其他进程、CPU 负载或其他测试，不等待
@@ -114,7 +143,7 @@ NOOPT/OPT 各构建一次，全部轮次复用；每轮新建共享对象，清�
 远端更新的 value 独立副本，以及装载/扩容/读写期间 NC 分配量不增长。
 `queue` 额外用容量为 2 的原有 MPMC 队列核对重复复用和各 client 的回复。
 `bwtree+legacy` 覆盖未设置 suite 的默认入口。
-这不是无 CC 硬件模拟，也不输出吞吐或延迟；正式性能测试仍须等待独占资源。
+这不是无 CC 硬件模拟，也不输出吞吐或延迟；测试不要求独占资源。
 
 同一 `YCSB_BUILD_READONLY_RPC_CONTRACT=ON` 构建在启用 ClevelHash 时提供
 `ub_reuse_contract`。用 fixture SDK、独立 `UBSM_TEST_DIRECTORY` 运行 OPT/NOOPT
@@ -188,6 +217,8 @@ cpuset 允许的内存节点中，则选择允许范围内距离最近的有内�
 bash ./run.sh --backend ub --thread-counts 32
 # 本地 CXL：执行一次，自动启动 A/B 两个进程，各 32 个 worker。
 bash ./run.sh --backend cxl --thread-counts 32 --cxl-node 4
+# BwTree RPC：两端本地 DRAM 分区，双向 RPC 队列位于 CXL。
+YCSB_UB_CASE=bwtree+rpc bash ./run.sh --backend cxl --thread-counts 24 --cxl-node 4
 ```
 
 CXL 模式复用原 `CXLSystemMemoryMmapper`、memkind 和 `QUEUE_SIM_CAS`，
@@ -200,14 +231,23 @@ BwTree 不增加逐次读节点的 flush。编译时拒绝关闭 flush 或混用
 两个进程仍走同一个 `peer.py`、原操作生成器和事务控制器：
 A 100% 读，B 90% 读/10% update，默认 OPT、fresh-insert、无 RPC。
 每端 1,000 万次操作、1,000 万条初始记录，线程数是每个进程的 worker 数。
-本地 CPU 集合不重叠，因此 32 档需要 64 个可用逻辑 CPU；可用 `CPU_A`、`CPU_B`
-指定两组起始 CPU。CXL 默认只跑 32 档，可通过 `--thread-counts` 扩展。
+本地 CPU 集合不重叠，A 限定 NUMA0、B 限定 NUMA1；可用 `CPU_A`、`CPU_B`
+指定各自 NUMA 节点内的起始 CPU。CXL 普通模式默认 32 档，RPC 默认 24 档，
+可通过 `--thread-counts` 指定，但客户端和服务线程必须全部放得进各自的 NUMA 节点。
 
 CXL 在 `/dev/shm` 创建本轮独占的共享文件，将节点和元数据映射绑定到指定的
 CXL NUMA 节点，并在 READY 前核对实际页面所在节点。这里的元数据用 queue 模拟
 原子访问延迟，物理映射可缓存；A 的节点映射仍为只读。A 解除映射后 B 才删除文件。
 原 `run_shm_ds.sh -mode=cxl_two_process --thread-counts 32` 也转到这一入口。
-目前此 A/B CXL 入口支持 BwTree OPT/NOOPT（`OPT=1/0`），旧 CXL 测试模式继续可用。
+此 A/B CXL 入口支持 BwTree OPT/NOOPT（`OPT=1/0`）和 `YCSB_UB_CASE=bwtree+rpc`。
+RPC 构建原 `cc_nocc_mq`（`USE_MSG_QUEUE;USE_NO_CC_QUEUE`，不定义 `NO_CC`），
+按 `key % 2` 分区：本地操作进入本地 MQ，远端操作通过共享 MQ 传送请求和 value 字节。两端的树、原子元数据、节点及 value 均在本地
+DRAM 的 memkind 池中；CXL 只存放共享控制对象、队列和通信缓冲区，不创建共享节点文件。
+`SIZE_MB` 是每端本地索引池容量，`NC_SIZE_MB` 是 CXL 共享通信区域总容量；此处
+沿用 NC 配置名，但 CXL 映射可缓存，原子访问使用 queue 模拟。
+RPC 保持 A 100% 读、B 90% 读/10% update，更新已有 key（`replace-existing-key`），
+结果校验双向请求/完成数量、分区路由和本地索引存储。可添加 `--dry-run` 检查配置。
+旧 CXL 测试模式继续可用。
 
 两种后端都会明确显示构建或复用 bundle，并将编译、等待对端和运行日志同步显示到
 终端。CXL 默认原生编译，UB 默认 Docker 编译；每次扫描只构建一次。
@@ -283,13 +323,13 @@ CACHE 和 NC 的 SDK provider 默认都使用 B（82）的系统 hostname。
 TCP 控制端口默认 18982。
 
 默认 CACHE 49152 MiB（48 GiB）、NC 16384 MiB（16 GiB），均由 B（82）提供。
-Sherman 两项不创建 CACHE 对象，默认 NC 16384 MiB（16 GiB）；
+Sherman 两项不创建 CACHE 对象，默认分配一块 NC 65536 MiB（64 GiB）共享对象；
 其节点和 value 均在 NC，不能沿用其他索引的元数据预算。
 NC 分配区由 A/B 各占一半，B 预生成两端全部操作序列；默认每端 1000 万次操作的 trace 数组约 1.8 GiB，
 还需容纳索引元数据，以及 Sherman 模式的节点和 value。
 `SIZE_MB` 覆盖 CACHE 容量（RPC 中为每端本地索引的 DRAM 容量）；
 显式设置 `NC_SIZE_MB` 会覆盖所有 case，`SHERMAN_NC_SIZE_MB` 可进一步单独覆盖 Sherman。
-例如 `SIZE_MB=49152 NC_SIZE_MB=16384 SHERMAN_NC_SIZE_MB=16384 bash run_all.sh`。
+例如 `SIZE_MB=49152 NC_SIZE_MB=16384 SHERMAN_NC_SIZE_MB=65536 bash run_all.sh`。
 `--dry-run` 的 `memory_by_case` 和每轮结果记录实际共享容量；RPC 的 CACHE 为 0。
 更大负载可能仍需增加容量。耗尽即报错，不回退到私有堆。
 UB arena 按进程分区，`MemoryManager::free()` 将安全释放的块合并并供后续分配复用，
@@ -488,3 +528,33 @@ A 直接读取索引，不转发写请求；B 是唯一 CACHE 写进程。`--no-
 当前 bump allocator 不重用已释放地址；测试通过不证明地址复用、物理内存重新分配
 或大规模并发下的正确性。真实 UB 是否需要启动失效，还取决于 SDK 的 map/ownership
 缓存保证，以及真实机器的冷启动与失效对照结果。
+
+### 原 build.sh 入口和多进程 MQ 验证
+
+在 `tests/YCSB-C` 执行：
+
+```bash
+# CXL 多进程，生成 build_cc_nocc_mq_cxl/ycsbc_cc_nocc_mq
+YCSB_BACKEND=cxl YCSB_INDEXES=bwtree bash ./build.sh rpc
+
+# UB 多进程；使用目标平台的实际 SDK 头文件和动态库
+YCSB_BACKEND=ub YCSB_INDEXES=bwtree \
+  UBSM_INCLUDE_DIR=/usr/local/ubs_mem/include \
+  UBSM_LIBRARY=/usr/local/ubs_mem/lib/libubsm_sdk.so bash ./build.sh rpc
+```
+
+`ub/build.sh` 只负责打包和目标平台 Docker 构建，内部仍调用这个入口。`+rpc` 打包必须
+选择 `cc_nocc_mq`；批量脚本分别构建 `opt/`、`noopt/`、`rpc/` 三个 bundle。
+旧 NOOPT RPC bundle 会被构建模式或结果校验拒绝。未设置后端时，原有单进程构建保持兼容。
+
+`test_multiprocess_mq.py --backend cxl --bundle DIR --output DIR` 验证 1/1、2/2、3/2
+客户端组合。UB 本地测试加 `--backend ub --fixture`，要求 bundle 链接文件映射 SDK fixture。
+`YCSB_BUILD_READONLY_RPC_CONTRACT=1` 可通过原 build.sh 构建 `readonly_rpc_contract`；
+RPC contract 使用 `rpc` variant，验证完整 64 字节 value、远端更新后的独立副本、路由和
+索引活动不额外分配 NC。fixture 不代表真实 UB 硬件或缓存一致性验证。
+
+CXL 全矩阵每项保存 `A/`、`B/` 的 worker/control 日志和 `cxl.json` 映射信息。
+`--cases bwtree clevelhash+rpc` 可选择失败项重测，默认仍为全部八项。
+`--backend ub` 与 `--backend cxl` 共用 case 路由、索引实现、workload 生成、RPC
+ThreadPool/MPMCQueue、结果核验和清理握手。必要差异是映射/分配器、原子和 cacheline
+操作后端；两种模式不是相同二进制，CXL 测试不能替代真实 UB 硬件测试。

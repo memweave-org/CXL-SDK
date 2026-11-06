@@ -35,7 +35,7 @@ CLevelHashDB::CLevelHashDB(int thread_num)
   for (int i = 0; i < thread_num; ++i) {
     bits[i].store(false);
   }
-#ifdef USE_MSG_QUEUE
+#if defined(USE_MSG_QUEUE) && !defined(YCSB_UB_TWO_HOST)
   this->db_thread_id = this->ThreadInit();
   pool = new ThreadPool(
       thread_num - 1, 12, [this]() { return this->PoolThreadInit(); },
@@ -112,7 +112,7 @@ int CLevelHashDB::DeleteInternal(uint64_t key) {
 }
 
 void CLevelHashDB::Close() {
-#ifdef USE_MSG_QUEUE
+#if defined(USE_MSG_QUEUE) && !defined(YCSB_UB_TWO_HOST)
   if (pool) {
     pool->close();
   }
@@ -121,7 +121,7 @@ void CLevelHashDB::Close() {
 
 int CLevelHashDB::ThreadInit() {
   int thread_id = allocate();
-#ifdef USE_MSG_QUEUE
+#if defined(USE_MSG_QUEUE) && !defined(YCSB_UB_TWO_HOST)
   // Single dispatcher thread for this DB
   // SimThreadInfo::setup_dispatcher_nr(2);
   // SimThreadInfo::setup_dispatcher_id(0);
@@ -146,7 +146,7 @@ void CLevelHashDB::PoolThreadClose(int thread_id) {
 
 [[deprecated("Use ReadInternal instead.")]]
 int CLevelHashDB::Read(uint64_t key, uint64_t &value) {
-#ifdef USE_MSG_QUEUE
+#if defined(USE_MSG_QUEUE) && !defined(YCSB_UB_TWO_HOST)
   std::atomic<int> finish{false};
   auto task = [this, key, &value, &finish]() {
     int ret = this->ReadInternal(key, value);
@@ -177,7 +177,7 @@ int CLevelHashDB::Read(uint64_t key, uint64_t &value) {
 
 [[deprecated("Use UpdateInternal instead.")]]
 int CLevelHashDB::Update(uint64_t key, uint64_t value) {
-#ifdef USE_MSG_QUEUE
+#if defined(USE_MSG_QUEUE) && !defined(YCSB_UB_TWO_HOST)
   std::atomic<int> finish{false};
   auto task = [this, key, value, &finish]() {
     int ret = this->UpdateInternal(key, value);
@@ -208,7 +208,7 @@ int CLevelHashDB::Update(uint64_t key, uint64_t value) {
 
 [[deprecated("Use InsertInternal instead.")]]
 int CLevelHashDB::Insert(uint64_t key, uint64_t value) {
-#ifdef USE_MSG_QUEUE
+#if defined(USE_MSG_QUEUE) && !defined(YCSB_UB_TWO_HOST)
   std::atomic<int> finish{false};
   auto task = [this, key, value, &finish]() {
     int ret = this->InsertInternal(key, value);
@@ -239,7 +239,7 @@ int CLevelHashDB::Insert(uint64_t key, uint64_t value) {
 
 [[deprecated("Use DeleteInternal instead.")]]
 int CLevelHashDB::Delete(uint64_t key) {
-#ifdef USE_MSG_QUEUE
+#if defined(USE_MSG_QUEUE) && !defined(YCSB_UB_TWO_HOST)
   std::atomic<int> finish{false};
   auto task = [this, key, &finish]() {
     int ret = this->DeleteInternal(key);

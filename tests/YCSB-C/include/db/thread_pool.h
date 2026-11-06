@@ -18,7 +18,9 @@ class ThreadPool {
 
   ThreadPool(size_t num_threads, size_t num_bucket,
              std::function<int()> alloc_task,
-             std::function<void(int)> release_task);
+             std::function<void(int)> release_task,
+             std::function<bool(size_t)> remote_poll = {},
+             std::function<void(size_t)> worker_setup = {});
 
 #ifdef TIMING_LOAD_BALANCE
   void init_timing_load_balance();
@@ -54,6 +56,9 @@ class ThreadPool {
   std::vector<std::thread> threads;
   std::vector<MPMCQueue<std::function<void()>>> tasks;
 
+  std::function<bool(size_t)> remote_poll_;
+  std::function<void(size_t)> worker_setup_;
+  bool run_one(size_t bucket);
   std::atomic<bool> stop;
 
   size_t num_threads;

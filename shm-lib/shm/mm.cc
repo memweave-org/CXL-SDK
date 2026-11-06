@@ -181,14 +181,34 @@ MemoryManager::MemoryManager(SystemMemoryMmapper *allocator, void *b, size_t s)
   
   // get_mempool_base()/size() describe this process's allocation slice;
   // get_mmap_base() describes the whole region and must not replace that slice.
-  if (memkind_create_fixed(base, size, &memkind_pool) != 0) {
+  const int rc = memkind_create_fixed(base, size, &memkind_pool);
+  if (rc != 0) {
+    char message[MEMKIND_ERROR_MESSAGE_SIZE];
+    memkind_error_message(rc, message, sizeof(message));
     std::cerr << "[MemoryManager] ERROR: Failed to create memkind pool. base=" 
-              << base << ", size=" << size << std::endl;
-    std::cerr << "[MemoryManager] memkind error: " << strerror(errno) << std::endl;
+              << base << ", size=" << size << ", rc=" << rc
+              << ", error=" << message << std::endl;
     throw std::runtime_error("Failed to create memkind pool.");
   }
   
   std::cout << "[MemoryManager] Successfully created memkind pool at " << base << std::endl;
+}
+
+void MemoryManager::report_memkind_failure(const char *operation, size_t requested,
+                                           size_t alignment, int error) const {
+  std::cerr << "[MemoryManager::" << operation << "] memkind allocation failed: "
+            << "requested=" << requested << " alignment=" << alignment
+            << " error=" << error << " (" << std::strerror(error) << ")"
+            << " pool_base=" << base << " pool_bytes=" << size;
+  if (memkind_pool && memkind_update_cached_stats() == 0) {
+    size_t value;
+    if (memkind_get_stat(memkind_pool, MEMKIND_STAT_TYPE_ALLOCATED, &value) == 0)
+      std::cerr << " allocated=" << value;
+    if (memkind_get_stat(memkind_pool, MEMKIND_STAT_TYPE_ACTIVE, &value) == 0)
+      std::cerr << " active=" << value;
+  }
+  std::cerr << (strict_shared_ ? "; shared allocation required, no heap fallback"
+                               : "; falling back to heap") << std::endl;
 }
 
 MemoryManager::MemoryManager(MemoryManager &&other) noexcept
@@ -277,8 +297,7 @@ void *MemoryManager::malloc(size_t size) {
   }
   void* ptr = memkind_malloc(memkind_pool, size);
   if (ptr == nullptr) {
-    std::cerr << "[MemoryManager::malloc] ERROR: memkind_malloc returned nullptr; "
-              << "falling back to heap for " << size << " bytes" << std::endl;
+    report_memkind_failure("malloc", size, 0, errno);
     if (strict_shared_) throw std::bad_alloc();
     return ::malloc(size); // Fallback to heap
   }
@@ -346,12 +365,9 @@ int MemoryManager::posix_memalign(void **memptr, size_t alignment,
 #endif
       return 0;
     }
-    std::cerr << "[MemoryManager::posix_memalign] ERROR: memkind_posix_memalign "
-              << "failed with " << rc << "; falling back to heap for " << size
-              << " bytes" << std::endl;
+    report_memkind_failure("posix_memalign", size, alignment, rc);
   } else {
-    std::cerr << "[MemoryManager::posix_memalign] ERROR: memkind_pool is nullptr; "
-              << "falling back to heap for " << size << " bytes" << std::endl;
+    report_memkind_failure("posix_memalign (no pool)", size, alignment, ENOMEM);
   }
   if (strict_shared_) return ENOMEM;
   return ::posix_memalign(memptr, alignment, size);
@@ -391,12 +407,9 @@ int MemoryManager::clalign(void **memptr, size_t size) {
 #endif
       return 0;
     }
-    std::cerr << "[MemoryManager::clalign] ERROR: memkind_posix_memalign "
-              << "failed with " << rc << "; falling back to heap for " << size
-              << " bytes" << std::endl;
+    report_memkind_failure("clalign", size, CACHE_LINE_SIZE, rc);
   } else {
-    std::cerr << "[MemoryManager::clalign] ERROR: memkind_pool is nullptr; "
-              << "falling back to heap for " << size << " bytes" << std::endl;
+    report_memkind_failure("clalign (no pool)", size, CACHE_LINE_SIZE, ENOMEM);
   }
   if (strict_shared_) return ENOMEM;
   return ::posix_memalign(memptr, CACHE_LINE_SIZE, size);

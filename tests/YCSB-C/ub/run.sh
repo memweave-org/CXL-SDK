@@ -48,7 +48,7 @@ case "$db" in
   clevelhash) indexes=clevel-hash;;
   sherman) indexes=sherman;;
 esac
-BUILD_IMAGE="$BUILD_IMAGE" SDK_ROOT="$SDK_ROOT" SDK_LIBRARY="${SDK_LIBRARY:-}" OPT="$OPT" JOBS="${JOBS:-2}" YCSB_INDEXES="$indexes" bash ./build.sh "$out"
+YCSB_RPC_BUILD="$rpc" BUILD_IMAGE="$BUILD_IMAGE" SDK_ROOT="$SDK_ROOT" SDK_LIBRARY="${SDK_LIBRARY:-}" OPT="$OPT" JOBS="${JOBS:-2}" YCSB_INDEXES="$indexes" bash ./build.sh "$out"
 fi
 export LD_LIBRARY_PATH="$out/lib:$SDK_ROOT/lib:$SDK_ROOT/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 deps=$(ldd -r "$out/ycsbc" 2>&1) || { echo "$deps"; exit 1; }

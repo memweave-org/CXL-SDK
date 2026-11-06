@@ -18,6 +18,8 @@ def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--bundles',type=Path,required=True)
     p.add_argument('--output',type=Path)
+    p.add_argument('--size-mb',type=int,default=128)
+    p.add_argument('--nc-size-mb',type=int,default=128)
     args=p.parse_args()
     root=(args.output or Path(tempfile.mkdtemp(prefix='ub-run-all-fixture-'))).resolve()
     root.mkdir(parents=True,exist_ok=True)
@@ -25,7 +27,7 @@ def main():
         sock.bind(('127.0.0.1',0)); port=sock.getsockname()[1]
     env=dict(os.environ,UBSM_TEST_DIRECTORY=str(root/'objects'),B_IP='127.0.0.1',
              PORT=str(port),CPU_A=str(min(os.sched_getaffinity(0))),CPU_B=str(min(os.sched_getaffinity(0))),
-             THREAD_COUNTS='1',THREADS_A='1',THREADS_B='1',RECORDS='35',OPS='128',SIZE_MB='128',NC_SIZE_MB='128',A_WRITABLE='0')
+             THREAD_COUNTS='1',THREADS_A='1',THREADS_B='1',RECORDS='35',OPS='128',SIZE_MB=str(args.size_mb),NC_SIZE_MB=str(args.nc_size_mb),A_WRITABLE='0')
     children=[]; logs=[]
     try:
         for role in ('B','A'):
@@ -67,7 +69,7 @@ def main():
                 else: assert case['B']['rpc_completed']==0
                 if nc: assert 'shared_version_table_bytes=0' in text or role=='A'
         assert not list((root/'objects').iterdir()),'UB fixture objects leaked'
-        print('PASS: all eight cases, native two-process shell flow, one CPU; logs:',root)
+        print('PASS: all eight cases, native two-process shell flow, one client per process; logs:',root)
     finally:
         for child in children:
             if child.poll() is None: child.send_signal(signal.SIGINT)

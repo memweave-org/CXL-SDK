@@ -48,7 +48,7 @@ public:
 
 private:
   void InitDelegateClient(std::vector<int> &thread_ids) {
-#ifndef USE_MSG_QUEUE
+#if !defined(USE_MSG_QUEUE) || defined(YCSB_UB_TWO_HOST)
     thread_ids.reserve(dbs_->size());
     for (auto db : *dbs_) {
       thread_ids.push_back(db->ThreadInit());
@@ -58,7 +58,7 @@ private:
   }
 
   void CloseDelegateClient(const std::vector<int> &thread_ids) {
-#ifndef USE_MSG_QUEUE
+#if !defined(USE_MSG_QUEUE) || defined(YCSB_UB_TWO_HOST)
     for (size_t i = 0; i < dbs_->size(); i++) {
       (*dbs_)[i]->ThreadClose(thread_ids[i]);
       (*dbs_)[i]->Close();
@@ -68,7 +68,7 @@ private:
 
   int DelegateLoadWorker(const int num_ops, IDPair ids) {
     std::vector<int> thread_ids;
-#ifdef USE_MSG_QUEUE
+#if defined(USE_MSG_QUEUE) && !defined(YCSB_UB_TWO_HOST)
     SimThreadInfo::setup_dispatcher_id(ids.thread_id);
 #else
     SimThreadInfo::setup_worker_ids(ids.machine_id, ids.thread_id);

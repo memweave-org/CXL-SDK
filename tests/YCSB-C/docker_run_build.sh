@@ -51,6 +51,14 @@ docker run --rm --entrypoint /bin/bash "$IMAGE" -ec '
     gcc --version
 '
 RUN_ARGS=(--name "$CONTAINER" -v "$ROOT_DIR:$ROOT_DIR" -w "$SCRIPT_DIR")
+# Global backend configuration is forwarded into the build container.
+for name in SHM_UB_API UBSM_INCLUDE_DIR UBSM_LIBRARY UB_MEMLINK_LIBRARY; do
+    [[ ! -v "$name" ]] || RUN_ARGS+=(-e "$name")
+done
+if [[ -n "${UB_SDK_ROOT:-}" ]]; then
+    [[ -d "$UB_SDK_ROOT" ]] || { echo "UB_SDK_ROOT is not a directory" >&2; exit 2; }
+    RUN_ARGS+=(-v "$UB_SDK_ROOT:$UB_SDK_ROOT:ro")
+fi
 [[ "$RM" == false ]] || RUN_ARGS+=(--rm)
 if [[ "$DETACH" == true ]]; then
     RUN_ARGS+=(-d)

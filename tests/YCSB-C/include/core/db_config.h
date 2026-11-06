@@ -11,7 +11,7 @@
 
 // #define USE_MSG_QUEUE
 
-#ifdef USE_MSG_QUEUE
+#if defined(USE_MSG_QUEUE) && !defined(YCSB_UB_TWO_HOST)
   #define USE_MWAIT
   #define RETURN_SYNC
   // #define USE_NO_CC_QUEUE

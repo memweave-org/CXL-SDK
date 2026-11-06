@@ -56,7 +56,7 @@ class DB {
 
   template <typename Func, typename... Args>
   int SyncExecute(Func func, Args &&...args) {
-#ifdef USE_MSG_QUEUE
+#if defined(USE_MSG_QUEUE) && !defined(YCSB_UB_TWO_HOST)
     std::atomic<int> finish{false};
     int result = 0;
     auto task = [this, &finish, &result, func, &args...]() {

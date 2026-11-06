@@ -266,6 +266,12 @@ void* ub_arena_allocate(bool atomic, size_t size, size_t alignment) {
 void ub_arena_deallocate(bool atomic, void* pointer) { arenas[atomic].deallocate(pointer); }
 size_t ub_arena_used(bool atomic) { return arenas[atomic].used.load(); }
 size_t ub_arena_live(bool atomic) { return arenas[atomic].live_bytes(); }
+bool ub_arena_owns(bool atomic, const void* pointer) {
+  const auto& arena = arenas[atomic];
+  const auto address = reinterpret_cast<uintptr_t>(pointer);
+  const auto begin = reinterpret_cast<uintptr_t>(arena.base);
+  return arena.base && address >= begin && address - begin < arena.size;
+}
 bool ub_cache_needs_read_acquire(const void* p) {
   if (!cache_read_acquire.load(std::memory_order_relaxed)) return false;
   const auto address = uintptr_t(p);

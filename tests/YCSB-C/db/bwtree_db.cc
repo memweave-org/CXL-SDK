@@ -65,7 +65,7 @@ BwTreeDB::BwTreeDB(int thread_num)
     for (int i = 0; i < thread_num; ++i) {
       bits[i].store(false);
     }
-#ifdef USE_MSG_QUEUE
+#if defined(USE_MSG_QUEUE) && !defined(YCSB_UB_TWO_HOST)
     this->db_thread_id = this->ThreadInit();
     pool = new ThreadPool(
         thread_num - 1, SimThreadInfo::dispatcher_thread_count, [this]() { return this->PoolThreadInit(); },
@@ -75,7 +75,7 @@ BwTreeDB::BwTreeDB(int thread_num)
 }
 
 BwTreeDB::~BwTreeDB() {
-#ifdef USE_MSG_QUEUE
+#if defined(USE_MSG_QUEUE) && !defined(YCSB_UB_TWO_HOST)
   // Only the message-queue variant registers a DB-owned thread in the
   // constructor.  In direct-call variants db_thread_id is never initialized;
   // worker threads register and unregister themselves through ThreadInit() /
@@ -89,7 +89,7 @@ BwTreeDB::~BwTreeDB() {
 void BwTreeDB::Init() {}
 
 void BwTreeDB::Close() {
-#ifdef USE_MSG_QUEUE
+#if defined(USE_MSG_QUEUE) && !defined(YCSB_UB_TWO_HOST)
   pool->close();
 #endif
 }
@@ -139,7 +139,7 @@ int BwTreeDB::Read(const std::string& table, const std::string& key,
 #endif
     return ret;
   };
-#ifdef USE_MSG_QUEUE
+#if defined(USE_MSG_QUEUE) && !defined(YCSB_UB_TWO_HOST)
 #ifdef RETURN_SYNC
       pool->enqueue(utils::RandomValueNum(), task);
 #if defined(USE_MWAIT) && defined(__x86_64__) && defined(__WAITPKG__)
@@ -193,7 +193,7 @@ int BwTreeDB::ScanInternal(uint64_t key, int len,
 int BwTreeDB::Scan(const std::string& table, const std::string& key, int len,
                    const std::vector<std::string>* fields,
                    std::vector<std::vector<KVPair>>& result) {
-#ifdef USE_MSG_QUEUE
+#if defined(USE_MSG_QUEUE) && !defined(YCSB_UB_TWO_HOST)
   throw "Scan: function not implemented!";
 
 // #ifdef RETURN_SYNC
@@ -258,7 +258,7 @@ int BwTreeDB::Update(const std::string& table, const std::string& key,
     #endif
     return ret;
   };
-  #ifdef USE_MSG_QUEUE
+  #if defined(USE_MSG_QUEUE) && !defined(YCSB_UB_TWO_HOST)
     #ifdef RETURN_SYNC
     pool->enqueue(utils::RandomValueNum(), task);
       #if defined(USE_MWAIT) && defined(__x86_64__) && defined(__WAITPKG__)
@@ -311,7 +311,7 @@ int BwTreeDB::Insert(const std::string& table, const std::string& key,
     #endif
     return ret;
   };
-  #ifdef USE_MSG_QUEUE
+  #if defined(USE_MSG_QUEUE) && !defined(YCSB_UB_TWO_HOST)
     #ifdef RETURN_SYNC
     pool->enqueue(utils::RandomValueNum(), task);
       #if defined(USE_MWAIT) && defined(__x86_64__) && defined(__WAITPKG__)
@@ -351,7 +351,7 @@ int BwTreeDB::Delete(const std::string& table, const std::string& key) {
     #endif
     return ret;
   };
-  #ifdef USE_MSG_QUEUE
+  #if defined(USE_MSG_QUEUE) && !defined(YCSB_UB_TWO_HOST)
     #ifdef RETURN_SYNC
     pool->enqueue(utils::RandomValueNum(), task);
       #if defined(USE_MWAIT) && defined(__x86_64__) && defined(__WAITPKG__)

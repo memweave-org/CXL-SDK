@@ -141,8 +141,7 @@ class LocalDB final : public DB {
   const bool rpc_, sherman_, owner_;
   const unsigned machine_;
   UbReadQueue *incoming_=nullptr, *outgoing_=nullptr;
-  std::thread server_;
-  std::atomic<bool> stop_{false};
+  std::unique_ptr<ThreadPool> service_;
   std::atomic<uint64_t> completed_{0};
   // Each worker owns its counters; collect only after the clients have joined.
   // Counting local accesses must not add a contended atomic to the index path.
@@ -167,8 +166,18 @@ class LocalDB final : public DB {
       ++counts_.at(client).sent;
       return result;
     }
-    if(rpc_) ++counts_.at(SimThreadInfo::worker_thread_id-ycsbc_ub::first_thread(machine_)).local;
-    return execute(operation,key,value);
+    if(!rpc_) return execute(operation,key,value);
+    const int client=SimThreadInfo::worker_thread_id-ycsbc_ub::first_thread(machine_);
+    ++counts_.at(client).local;
+    // The original lambda task remains strictly within this process.
+    std::atomic<bool> finished{false};
+    int result=DB::kErrorNoData;
+    service_->enqueue(client,[&,operation,key] {
+      result=execute(operation,key,value);
+      finished.store(true,std::memory_order_release);
+    });
+    while(!finished.load(std::memory_order_acquire)) UbReadQueue::relax();
+    return result;
   }
 public:
   explicit LocalDB(UbDB& descriptor)
@@ -177,7 +186,7 @@ public:
         counts_(rpc_ ? ycsbc_ub::threads(machine_) : 0) {
     if(rpc_) {
       PrivateIndexMemoryScope scope(&cacheable);
-      target_=create_index(descriptor.kind,descriptor.threads);
+      target_=create_index(descriptor.kind,descriptor.threads+ycsbc_ub::threads(machine_));
       if(!ycsbc_ub::in_local_index(target_)) throw std::runtime_error("RPC index escaped local DRAM");
       incoming_=descriptor.inbound[machine_]; outgoing_=descriptor.inbound[1-machine_];
     } else if(sherman_) {
@@ -188,44 +197,40 @@ public:
 #endif
     } else target_=descriptor.shared_target;
     if(!rpc_) return;
-    std::promise<void> ready;
-    auto started=ready.get_future();
-    server_=std::thread([this,ready=std::move(ready)]() mutable {
-      try {
-        cpu_set_t cpus; CPU_ZERO(&cpus); CPU_SET(ycsbc_ub::cpu_start(),&cpus);
+    // Reuse the original MQ worker loop, bucket scheduling and local queues.
+    // Only the remote task representation differs: slot IDs and value bytes.
+    PrivateIndexMemoryScope scope(&cacheable);
+    const size_t workers=ycsbc_ub::threads(machine_);
+    const size_t buckets=std::max(workers,incoming_->buckets());
+    service_=std::make_unique<ThreadPool>(workers,buckets,
+      [this] { const int id=ThreadInit(); target_->Init(); return id; },
+      [this](int id) { ThreadClose(id); },
+      [this](size_t bucket) {
+        return incoming_->serve_bucket(bucket,[this](UbReadQueue::Operation operation,uint64_t key,uintptr_t& value) {
+          if(UbRpcOwner(key)!=machine_) throw std::runtime_error("RPC reached the wrong partition");
+          if(operation!=UbReadQueue::Operation::Read) {
+            if(machine_!=1) throw std::runtime_error("A sent an RPC mutation");
+            void* copy=cacheable.malloc(VALUE_ADDR_SIZE);
+            std::memcpy(copy,reinterpret_cast<const void*>(value),VALUE_ADDR_SIZE);
+            value=reinterpret_cast<uintptr_t>(copy);
+          }
+          const int result=execute(operation,key,value);
+          completed_.fetch_add(1,std::memory_order_relaxed);
+          return result;
+        });
+      },
+      [this](size_t worker) {
+        SimThreadInfo::setup_worker_ids(machine_,SimThreadInfo::worker_thread_count+worker);
+        cpu_set_t cpus; CPU_ZERO(&cpus); CPU_SET(ycsbc_ub::rpc_worker_cpu(worker),&cpus);
         if(pthread_setaffinity_np(pthread_self(),sizeof(cpus),&cpus))
-          throw std::runtime_error("Cannot bind UB RPC service CPU");
-        SimThreadInfo::setup_worker_ids(machine_,SimThreadInfo::worker_thread_count);
-        const int id=ThreadInit(); target_->Init();
-        ready.set_value();
-        while(!stop_.load(std::memory_order_acquire)) {
-          if(!incoming_->serve_request([this](UbReadQueue::Operation operation,uint64_t key,uintptr_t& value) {
-            if(UbRpcOwner(key)!=machine_) throw std::runtime_error("RPC reached the wrong partition");
-            // A's clients never send writes. A's server may apply B's updates
-            // to A's local partition; it never writes a shared CACHE mapping.
-            if(operation!=UbReadQueue::Operation::Read) {
-              if(machine_!=1) throw std::runtime_error("A sent an RPC mutation");
-              void* copy=cacheable.malloc(VALUE_ADDR_SIZE);
-              std::memcpy(copy,reinterpret_cast<const void*>(value),VALUE_ADDR_SIZE);
-              value=reinterpret_cast<uintptr_t>(copy);
-            }
-            const int result=execute(operation,key,value);
-            completed_.fetch_add(1,std::memory_order_relaxed);
-            return result;
-          })) std::this_thread::yield();
-        }
-        ThreadClose(id);
-      } catch(...) {
-        try { ready.set_exception(std::current_exception()); } catch(...) { std::terminate(); }
-      }
-    });
-    try { started.get(); } catch(...) { server_.join(); throw; }
+          throw std::runtime_error("Cannot bind original MQ service CPU");
+      });
     ycsbc_ub::stage(std::string("RPC_PARTITION role=")+(owner_?"B":"A")+
-                    " index=local-dram owner=key%2 transport=bidirectional-mpmc value_transport=bytes");
+      " index=local-dram owner=key%2 transport=original-mq-thread-pool value_transport=bytes workers="+
+      std::to_string(workers)+" buckets="+std::to_string(buckets));
   }
   ~LocalDB() override {
-    stop_.store(true,std::memory_order_release);
-    if(server_.joinable()) server_.join();
+    service_.reset();
     if(sherman_) delete target_;
     else if(rpc_ || owner_) {
       PrivateIndexMemoryScope scope(rpc_ ? &cacheable : nullptr);
@@ -286,7 +291,7 @@ uint64_t UbRpcLocal() {
 const void* UbLocalIndexAddress(DB* descriptor) {
   return static_cast<LocalDB*>(LocalUbDB(descriptor))->index_address();
 }
-const char* UbRpcTransport() { return ycsbc_ub::rpc_mode() ? "bidirectional-mpmc-shared-queue" : "none"; }
+const char* UbRpcTransport() { return ycsbc_ub::rpc_mode() ? "original-mq-thread-pool" : "none"; }
 DB* CreateUbDB(const std::string& name,int threads) {
   IndexKind kind;
   if(name=="bwtree") kind=IndexKind::BwTree;
@@ -294,6 +299,11 @@ DB* CreateUbDB(const std::string& name,int threads) {
   else if(name=="sherman") kind=IndexKind::Sherman;
   else throw std::runtime_error("UB index not built: "+name);
   const bool rpc=ycsbc_ub::rpc_mode();
+#ifndef USE_MSG_QUEUE
+  if(rpc) throw std::runtime_error("RPC requires build.sh rpc (cc_nocc_mq); rebuild the bundle");
+#else
+  if(!rpc) throw std::runtime_error("cc_nocc_mq requires RPC mode in a two-process run");
+#endif
   if(rpc && kind==IndexKind::Sherman) throw std::runtime_error("Sherman uses shared-node access");
   auto* descriptor=shared_new<UbDB>(kind,threads,rpc);
   if(rpc) {

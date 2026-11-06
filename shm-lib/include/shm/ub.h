@@ -25,6 +25,8 @@ void* ub_arena_allocate(bool atomic, size_t size, size_t alignment = 64);
 void ub_arena_deallocate(bool atomic, void* pointer);
 size_t ub_arena_used(bool atomic);
 size_t ub_arena_live(bool atomic);
+// Test allocation-slice ownership before returning a retired level.
+bool ub_arena_owns(bool atomic, const void* pointer);
 void ub_cache_maintenance(const void*, size_t, bool writeback, bool fence);
 void ub_assert_atomic_target(const void*);
 

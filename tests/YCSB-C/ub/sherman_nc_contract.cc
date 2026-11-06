@@ -29,6 +29,22 @@ void run(bool owner,bool direct,int in,int out,const char* name) {
   const size_t half=((bytes-4096)/2)&~size_t(4095);
   ub_configure_arena(true,region+4096+(owner?0:half),half);
   cxl_transport::configure_nc_nodes(true,direct);
+  // Adjacent 2 KiB nodes can share an OS page, but must never share a sequence.
+  // Hold one node's sequence while updating the other; a stale 4 KiB lookup
+  // would deadlock here (bounded by the process watchdog).
+  void* adjacent[3];
+  for(auto& p:adjacent) p=cxl_transport::allocate(kLeafPageSize);
+  int pair=(uintptr_t(adjacent[0])>>12)==(uintptr_t(adjacent[1])>>12)?0:1;
+  if((uintptr_t(adjacent[pair])>>12)!=(uintptr_t(adjacent[pair+1])>>12))
+    throw std::runtime_error("NC nodes do not fit two slots per OS page");
+  const uint64_t marker=0x123456789abcdef0;
+  cxl_transport::begin_inplace_write(adjacent[pair],sizeof(marker));
+  cxl_transport::write(adjacent[pair+1],&marker,sizeof(marker));
+  cxl_transport::end_inplace_write();
+  uint64_t observed=0;
+  cxl_transport::read(&observed,adjacent[pair+1],sizeof(observed));
+  if(observed!=marker) throw std::runtime_error("Adjacent node copy failed");
+  for(auto p:adjacent) cxl_transport::release(p);
   Handles handles{};
   if(owner) {
     handles.sequences=cxl_transport::allocate_atomic(cxl_transport::shared_sequences_bytes());

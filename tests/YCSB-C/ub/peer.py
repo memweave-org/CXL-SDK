@@ -117,9 +117,13 @@ class Worker:
                  '-server_threads', str(args.threads_a+args.threads_b),
                  '-dbnum', '1', '-valuesize', str(getattr(args, 'value_size', 8)), '-P', args.spec, '-C', args.ini]
         host_threads=args.threads_a if args.role=='A' else args.threads_b
-        cpus=select_cpus(host_threads,args.cpu,os.sched_getaffinity(0))
+        all_cpus=select_cpus(host_threads*(2 if getattr(args,'rpc',0) else 1),args.cpu,os.sched_getaffinity(0))
+        cpus=all_cpus[:host_threads]
+        if getattr(args,'rpc',0):
+            env['YCSB_RPC_CPUS']=','.join(map(str,all_cpus[host_threads:]))
+            print(f'[{args.role}] Original MQ service CPU IDs={all_cpus[host_threads:]}',flush=True)
         env['YCSB_UB_CPUS']=','.join(map(str,cpus))
-        command=['taskset','-c',env['YCSB_UB_CPUS']]+command
+        command=['taskset','-c',','.join(map(str,all_cpus))]+command
         print(f'[{args.role}] Worker threads={host_threads}; CPU IDs={cpus}',flush=True)
         # SDK output can interleave at byte boundaries. Never parse stdout for control.
         read_fd, write_fd = os.pipe()
@@ -265,7 +269,7 @@ def summary(a, b, seconds, ops, suite=False, rpc=0, a_writable=0):
                     raise RuntimeError('Partitioned RPC routing/completion/storage mismatch')
             elif local.get('rpc_completed')!=0:
                 raise RuntimeError('Unexpected RPC completion in direct mode')
-        transport='bidirectional-mpmc-shared-queue' if rpc else 'none'
+        transport='original-mq-thread-pool' if rpc else 'none'
         if any(r.get('rpc_transport')!=transport for r in (a,b)):
             raise RuntimeError('RPC transport mismatch; rebuild bundles')
     return {'framework': 'tests/YCSB-C/ycsbc', 'controller_seconds': control_seconds, 'pass': True, 'A': a, 'B': b, 'total_operations': 2*ops,
@@ -439,8 +443,10 @@ def main():
                           cache_provider=None if args.rpc or (args.db=='sherman' and args.sherman_access!='cache') else args.cache_provider,
                           nc_provider=args.nc_provider,
                           sherman_access=args.sherman_access if args.db=='sherman' else None)
-            if args.db=='bwtree' and not args.rpc:
+            if args.db=='bwtree':
                 report['reclamation']='epoch-gc-reuse; published-values-retained'
+            if args.rpc and args.backend=='cxl':
+                report['cache_policy']='local-DRAM partitions; CXL shared-queue transport'
             if args.db=='sherman' and args.sherman_access!='cache':
                 report['cache_policy']='NC-only; A reads, B reads/updates'
             worker.finish('close')

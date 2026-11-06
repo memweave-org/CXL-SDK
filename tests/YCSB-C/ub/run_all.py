@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
-"""Sequential, fail-fast UB comparison using the original two-host YCSB framework."""
+"""Sequential, fail-fast CXL/UB comparison using the original two-host YCSB framework."""
 import argparse
 import csv
+from contextlib import ExitStack
 import json
 import os
 from pathlib import Path
 import signal
+import socket
 import subprocess
 import tempfile
 import threading
 import time
 
-from cpu_affinity import select_cpus
+from cpu_affinity import select_cpus, cxl_cpu_nodes, select_cxl_role_cpus
 
 HERE=Path(__file__).resolve().parent
 CASES=('bwtree','bwtree+opt','bwtree+rpc',
@@ -60,19 +62,23 @@ def main(argv=None):
     signal.signal(signal.SIGTERM,interrupted)
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--dry-run',action='store_true',help='Print the case/worker matrix without building/running')
-    p.add_argument('--thread-counts',nargs='+',type=int,default=os.environ.get('THREAD_COUNTS','32 64 128').split())
+    p.add_argument('--backend', choices=('ub','cxl'), default=os.environ.get('YCSB_BACKEND','ub'))
+    p.add_argument('--cxl-node', type=int, default=int(os.environ.get('CXL_NODE','4')))
+    p.add_argument('--cases', nargs='+', choices=CASES, default=list(CASES))
+    p.add_argument('--thread-counts',nargs='+',type=int)
     p.add_argument('--output',type=Path)
-    p.add_argument('--bundles',type=Path,help='Reuse prepared opt/ and noopt/ directories, each with ycsbc and lib/')
+    p.add_argument('--bundles',type=Path,help='Reuse prepared opt/, noopt/ and rpc/ directories, each with ycsbc and lib/')
     p.add_argument('--build-only',action='store_true')
     p.add_argument('--fixture',action='store_true',help='Explicit local SDK fixture, never a hardware/performance result')
     args=p.parse_args(argv)
     try:
-        counts=[int(n) for n in args.thread_counts]
+        default_counts=('24' if any(c.endswith('+rpc') for c in args.cases) else '32') if args.backend=='cxl' else '32 64 128'
+        counts=[int(n) for n in (args.thread_counts or os.environ.get('THREAD_COUNTS',default_counts).split())]
         if not counts or any(n<1 or n>192 for n in counts) or len(set(counts))!=len(counts):
             raise ValueError('Thread counts must be distinct integers in 1..192')
     except ValueError as error:
         p.error(str(error))
-    rounds=[{'case':case,'threads_A':n,'threads_B':n} for case in CASES for n in counts]
+    rounds=[{'case':case,'threads_A':n,'threads_B':n} for case in args.cases for n in counts]
     if os.environ.get('A_WRITABLE','0')!='0': p.error('A is always read-only; A_WRITABLE must be 0')
     spec=Path(os.environ['SPEC'])
     if not spec.is_absolute(): spec=HERE/spec
@@ -81,51 +87,63 @@ def main(argv=None):
         'cache_mb':0 if case.startswith('sherman+nc-') or case.endswith('+rpc') else int(common['SIZE_MB']),
         'nc_mb':int(os.environ.get('SHERMAN_NC_SIZE_MB',common['NC_SIZE_MB'])
                     if case.startswith('sherman+nc-') else common['NC_SIZE_MB'])}
-        for case in CASES}
-    plan={'cases':list(CASES),'thread_counts':counts,'rounds':rounds,'common':common,'spec':str(spec),'workload':spec.read_text(),
+        for case in args.cases}
+    plan={'backend':args.backend,'process_model':'A/B independent processes','cases':args.cases,'thread_counts':counts,'rounds':rounds,'common':common,'spec':str(spec),'workload':spec.read_text(),
           'memory_by_case':memory_by_case,
+          'rpc_local_mb_per_process':int(common['SIZE_MB']),
           'providers':{'cache':os.environ.get('PROVIDER_CACHE') or os.environ.get('PROVIDER_B') or 'B hostname',
                        'nc':os.environ.get('PROVIDER_NC') or os.environ.get('PROVIDER_B') or 'B hostname'},
           'A_workload':'100% read','B_workload':'90% read / 10% update',
           'update_semantics':'replace-existing-key','fixture':args.fixture}
     plan['sherman']={'mapping':'NC only','writers':'B only, no RPC',
                      'modes':['in-place loads/stores','local memcpy and copy-back']}
+    if args.backend=='cxl':
+        plan.update(cpu_numa_nodes=cxl_cpu_nodes(os.environ),cxl_node=args.cxl_node)
     if args.dry_run:
         print(json.dumps(plan,indent=2)); return 0
     if args.fixture and (not args.bundles or not os.environ.get('UBSM_TEST_DIRECTORY')):
         p.error('--fixture requires --bundles and UBSM_TEST_DIRECTORY')
-    role=os.environ.get('YCSB_UB_ROLE')
+    if args.backend=='cxl' and args.fixture: p.error('CXL uses its native mapping backend; --fixture is UB only')
+    role='local' if args.backend=='cxl' else os.environ.get('YCSB_UB_ROLE')
     if not role and not args.build_only:
         interfaces=json.loads(subprocess.check_output(['ip','-j','-4','addr','show'],text=True))
         ips={a['local'] for i in interfaces for a in i.get('addr_info',[])}
         roles=[r for r in ('A','B') if os.environ[r+'_IP'] in ips]
         if len(roles)!=1: p.error('Cannot identify A/B from local IP; check config.sh')
         role=roles[0]
-    if role not in ('A','B',None): p.error('YCSB_UB_ROLE must be A or B')
+    if role not in ('A','B','local',None): p.error('YCSB_UB_ROLE must be A or B')
     if not args.build_only:
         try:
             allowed=os.sched_getaffinity(0)
-            cpu=int(os.environ.get('CPU_'+role) or min(allowed))
-            cpus=select_cpus(max(counts),cpu,allowed)
-            plan.update(role=role,cpu_start=cpu,worker_cpus=cpus)
+            service_factor=2 if any(c.endswith('+rpc') for c in args.cases) else 1
+            needed=service_factor*max(counts)
+            if args.backend=='cxl':
+                if args.cxl_node<0 or not Path(f'/sys/devices/system/node/node{args.cxl_node}').exists():
+                    raise ValueError('Requested CXL NUMA node does not exist')
+                role_cpus=select_cxl_role_cpus(needed,allowed,os.environ)
+                cpu=role_cpus['B'][0]; cpus=role_cpus
+            else:
+                cpu=int(os.environ.get('CPU_'+role) or min(allowed))
+                cpus=select_cpus(needed,cpu,allowed)
+            plan.update(role=role,cpu_start=cpu,worker_and_service_cpus=cpus)
         except ValueError as error:
             p.error(str(error))
     out=(args.output or Path(tempfile.mkdtemp(prefix=f'result-all-{role or "build"}-',dir=HERE))).resolve()
     out.mkdir(parents=True,exist_ok=True)
     if (out/'manifest.json').exists(): p.error('Output already contains a run; use a new directory')
     (out/'manifest.json').write_text(json.dumps(plan,indent=2))
-    print(f'UB run_all role={role}; results: {out}',flush=True)
-    reports=[]; report={'pass':False,'cases':reports,'thread_counts':counts,'fixture':args.fixture}
+    print(f'{args.backend.upper()} run_all role={role}; results: {out}',flush=True)
+    reports=[]; report={'pass':False,'cases':reports,'thread_counts':counts,'fixture':args.fixture,'backend':args.backend}
     stage='build'
     directory=None
     try:
         bundles=(args.bundles or out/'bundles').resolve()
         if not args.bundles:
-            for mode,opt in [('noopt','0'),('opt','1')]:
-                env=dict(os.environ,OPT=opt,YCSB_INDEXES='bwtree;clevel-hash;sherman')
+            for mode,opt in [('noopt','0'),('opt','1'),('rpc','0')]:
+                env=dict(os.environ,YCSB_BACKEND=args.backend,OPT=opt,YCSB_RPC_BUILD=str(int(mode=='rpc')),YCSB_INDEXES='bwtree;clevel-hash;sherman')
                 with (out/f'build-{mode}.log').open('w') as log:
                     run_command(['bash','build.sh',str(bundles/mode)],env,log)
-        for mode in ('noopt','opt'):
+        for mode in ('noopt','opt','rpc'):
             if not (bundles/mode/'ycsbc').is_file() or not (bundles/mode/'lib').is_dir():
                 raise RuntimeError(f'Incomplete bundle: {bundles/mode}')
         if not args.build_only:
@@ -134,18 +152,39 @@ def main(argv=None):
                 case=round_['case']; n=round_['threads_A']
                 stage=f'{case}/threads-{n}'
                 directory=out/stage; directory.mkdir(parents=True)
-                mode='opt' if case.endswith('+opt') else 'noopt'
-                env=dict(os.environ,YCSB_UB_ROLE=role,YCSB_UB_CASE=case,YCSB_UB_OUTPUT=str(directory),
+                mode='rpc' if case.endswith('+rpc') else 'opt' if case.endswith('+opt') else 'noopt'
+                env=dict(os.environ,YCSB_BACKEND=args.backend,YCSB_UB_ROLE=role,YCSB_UB_CASE=case,YCSB_UB_OUTPUT=str(directory),
                          NC_SIZE_MB=str(memory_by_case[case]['nc_mb']),
                          YCSB_UB_SUITE='1',THREADS_A=str(n),THREADS_B=str(n),
-                         YCSB_UB_THREAD_SWEEP=json.dumps({'runner':'run_all','cases':list(CASES),
+                         YCSB_UB_THREAD_SWEEP=json.dumps({'runner':'run_all','cases':args.cases,
                              'counts':counts,'case':case,'threads':n}),
                          YCSB_UB_BUNDLE=str(bundles/mode),YCSB_UB_FIXTURE=str(int(args.fixture)))
                 env['CPU_'+role]=str(cpu)
                 print(f'[{role}] running {case}, {n} workers per host',flush=True)
-                with (directory/'launcher.log').open('w') as log:
-                    run_command(['bash','run.sh'],env,log)
-                result=json.loads((directory/'result.json').read_text())
+                if args.backend=='cxl':
+                    backing=Path(tempfile.mkdtemp(prefix='ycsb-cxl-all-',dir='/dev/shm'))
+                    with socket.socket() as sock:
+                        sock.bind(('127.0.0.1',0)); port=sock.getsockname()[1]
+                    (directory/'cxl.json').write_text(json.dumps({'backing_directory':str(backing),
+                        'numa_node':args.cxl_node,'cpu_numa_nodes':plan['cpu_numa_nodes'],'cpu_sets':role_cpus},indent=2))
+                    with ExitStack() as stack:
+                        commands=[]
+                        for r in ('B','A'):
+                            local=directory/r; local.mkdir()
+                            local_env=dict(env,YCSB_UB_ROLE=r,YCSB_UB_OUTPUT=str(local),
+                                B_IP='127.0.0.1',PORT=str(port),PROVIDER_B='local-cxl',
+                                YCSB_CXL_DIRECTORY=str(backing),YCSB_CXL_NODE=str(args.cxl_node))
+                            local_env['CPU_'+r]=str(role_cpus[r][0])
+                            log=stack.enter_context((local/'launcher.log').open('w'))
+                            commands.append((['taskset','-c',','.join(map(str,role_cpus[r])),
+                                              'bash','run.sh'],local_env,log))
+                        run_commands(commands)
+                    result=json.loads((directory/'A/result.json').read_text())
+                    backing.rmdir() # B deletes its objects only after A unmaps.
+                else:
+                    with (directory/'launcher.log').open('w') as log:
+                        run_command(['bash','run.sh'],env,log)
+                    result=json.loads((directory/'result.json').read_text())
                 if not result.get('pass'): raise RuntimeError(f'{stage} failed')
                 hashes=[result[host]['trace_hash'] for host in ('A','B')]
                 if n in baselines and hashes!=baselines[n]:

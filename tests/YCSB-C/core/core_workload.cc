@@ -260,7 +260,7 @@ void *CoreWorkload::BuildPrefillValue() {
   }
   assert(value_size != 0);
 #ifdef YCSB_UB_TWO_HOST
-  void *value = cacheable.malloc(value_size);
+  void *value = (ycsbc_ub::nc_data() ? shared_atomic_memory() : cacheable).malloc(value_size);
 #else
   void *value = malloc(value_size);
 #endif
@@ -275,7 +275,7 @@ void *CoreWorkload::BuildTransactionValue() {
     value_size = 8;
   }
 #ifdef YCSB_UB_TWO_HOST
-  void *value = cacheable.malloc(value_size);
+  void *value = (ycsbc_ub::nc_data() ? shared_atomic_memory() : cacheable).malloc(value_size);
 #else
   void *value = malloc(value_size);
 #endif

@@ -28,11 +28,68 @@ EXPECTED={
 
 
 class RoutingTests(unittest.TestCase):
+    def test_cxl_plan_uses_same_cases_workload_and_memory_as_ub(self):
+        env={k:v for k,v in os.environ.items() if k not in ('THREAD_COUNTS','YCSB_BACKEND')}
+        plans={}
+        for backend in ('cxl','ub'):
+            result=subprocess.run(['bash',str(HERE/'run_all.sh'),'--backend',backend,
+                                   '--thread-counts','32','--dry-run'],
+                                  env=env,capture_output=True,text=True,check=True)
+            plans[backend]=json.loads(result.stdout)
+        for key in ('cases','rounds','common','memory_by_case','workload','update_semantics'):
+            self.assertEqual(plans['cxl'][key],plans['ub'][key])
+        self.assertEqual(plans['cxl']['process_model'],'A/B independent processes')
+
+    def test_cxl_runs_all_cases_as_two_processes_and_reuses_bundles(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary); out=root/'results'; bundles=root/'bundles'
+            for mode in ('noopt','opt','rpc'):
+                (bundles/mode/'lib').mkdir(parents=True)
+                (bundles/mode/'ycsbc').touch()
+            calls=[]
+            role_cpus={'A':list(range(24))+list(range(96,120)),
+                       'B':list(range(24,48))+list(range(120,144))}
+            def pair(commands):
+                self.assertEqual(len(commands),2)
+                for command,env,_ in commands:
+                    self.assertEqual(command,['taskset','-c',','.join(map(str,role_cpus[env['YCSB_UB_ROLE']])),
+                                              'bash','run.sh'])
+                envs={env['YCSB_UB_ROLE']:env for _,env,_ in commands}
+                a,b=envs['A'],envs['B']; case=a['YCSB_UB_CASE']
+                self.assertEqual(a['YCSB_BACKEND'],'cxl')
+                self.assertEqual(a['CPU_A'],'0'); self.assertEqual(b['CPU_B'],'24')
+                self.assertEqual(a['YCSB_CXL_DIRECTORY'],b['YCSB_CXL_DIRECTORY'])
+                self.assertEqual(a['THREADS_A'],'24'); self.assertEqual(b['THREADS_B'],'24')
+                self.assertEqual(a['SIZE_MB'],'49152'); self.assertEqual(a['NC_SIZE_MB'],'16384')
+                self.assertEqual(Path(a['YCSB_UB_BUNDLE']).name,
+                    'rpc' if case.endswith('+rpc') else 'opt' if case.endswith('+opt') else 'noopt')
+                result={'pass':True,'case':case,'bwtree_opt':case.endswith('+opt'),
+                        'cache_policy':'test','common_seconds':1,'total_mops':0.0002,
+                        'A':{'reads':100,'writes':0,'trace_hash':'A'},
+                        'B':{'reads':90,'writes':10,'trace_hash':'B','rpc_completed':0}}
+                (Path(a['YCSB_UB_OUTPUT'])/'result.json').write_text(json.dumps(result))
+                calls.append(case)
+            # Each completed round removes its empty backing directory.
+            def make_backing(**kwargs):
+                directory=root/'backing'; directory.mkdir(); return str(directory)
+            env={'SPEC':str(HERE/'workloadb_90read.spec'),'A_IP':'unused','B_IP':'unused',
+                 'RECORDS':'100','OPS':'100','SIZE_MB':'49152','NC_SIZE_MB':'16384',
+                 'SEED':'1','A_WRITABLE':'0'}
+            with patch.dict(os.environ,env,clear=True),patch.object(run_all,'run_commands',pair), \
+                 patch.object(run_all,'select_cxl_role_cpus',return_value=role_cpus), \
+                 patch.object(run_all.os,'sched_getaffinity',return_value=set(range(192))), \
+                 patch.object(run_all.tempfile,'mkdtemp',side_effect=make_backing),redirect_stdout(io.StringIO()):
+                self.assertEqual(run_all.main(['--backend','cxl','--cxl-node','0','--bundles',str(bundles),
+                                               '--output',str(out)]),0)
+            self.assertEqual(calls,list(EXPECTED))
+            self.assertTrue(json.loads((out/'summary.json').read_text())['pass'])
+            self.assertFalse((root/'backing').exists())
+
     def test_memory_defaults_and_overrides(self):
         base={k:v for k,v in os.environ.items() if k not in
               ('SIZE_MB','NC_SIZE_MB','SHERMAN_NC_SIZE_MB','YCSB_UB_CONFIG','A_WRITABLE')}
         for override,cache,nc,sherman_nc in (
-            ({},49152,16384,16384),
+            ({},49152,16384,65536),
             ({'NC_SIZE_MB':'128'},49152,128,128),
             ({'SIZE_MB':'256','SHERMAN_NC_SIZE_MB':'512'},256,16384,512),
             ({'NC_SIZE_MB':'128','SHERMAN_NC_SIZE_MB':'512'},49152,128,512),
@@ -85,7 +142,7 @@ class RoutingTests(unittest.TestCase):
                 out=Path(temporary)/'results'; calls=[]
                 def run_command(command,env,log):
                     if command[1]=='build.sh':
-                        calls.append(('build',env['OPT']))
+                        calls.append(('build',env['OPT'],env['YCSB_RPC_BUILD']))
                         bundle=Path(command[2]);(bundle/'lib').mkdir(parents=True);(bundle/'ycsbc').touch()
                         return
                     case=env['YCSB_UB_CASE'];n=int(env['THREADS_A']);calls.append((case,n))
@@ -95,7 +152,7 @@ class RoutingTests(unittest.TestCase):
                     self.assertEqual(env['OPS'],'100')
                     self.assertEqual(env['SIZE_MB'],'128')
                     self.assertEqual(env['NC_SIZE_MB'],'512' if case.startswith('sherman+') else '128')
-                    self.assertEqual(Path(env['YCSB_UB_BUNDLE']).name,'opt' if case.endswith('+opt') else 'noopt')
+                    self.assertEqual(Path(env['YCSB_UB_BUNDLE']).name,'rpc' if case.endswith('+rpc') else 'opt' if case.endswith('+opt') else 'noopt')
                     schedule=json.loads(env['YCSB_UB_THREAD_SWEEP'])
                     self.assertEqual(schedule,{'runner':'run_all','cases':list(EXPECTED),
                         'counts':[32,64,128],'case':case,'threads':n})
@@ -113,14 +170,14 @@ class RoutingTests(unittest.TestCase):
                      'A_IP':'unused','B_IP':'unused','RECORDS':'100','OPS':'100','SIZE_MB':'128',
                      'NC_SIZE_MB':'128','SHERMAN_NC_SIZE_MB':'512','SEED':'1','A_WRITABLE':'0','THREADS_A':'7','THREADS_B':'9'}
                 with patch.dict(os.environ,env,clear=True), patch.object(run_all,'run_command',run_command), \
-                     patch.object(run_all.os,'sched_getaffinity',return_value=set(range(128))), \
+                     patch.object(run_all.os,'sched_getaffinity',return_value=set(range(256))), \
                      patch.object(run_all.os,'getloadavg',side_effect=AssertionError('load detection forbidden')), \
                      patch.object(Path,'glob',side_effect=AssertionError('process scanning forbidden')),redirect_stdout(io.StringIO()):
                     code=run_all.main(['--output',str(out)])
                 report=json.loads((out/'summary.json').read_text())
-                self.assertEqual(calls[:2],[('build','0'),('build','1')])
+                self.assertEqual(calls[:3],[('build','0','0'),('build','1','0'),('build','0','1')])
                 if fault is None:
-                    self.assertEqual(code,0);self.assertTrue(report['pass']);self.assertEqual(calls[2:],expected)
+                    self.assertEqual(code,0);self.assertTrue(report['pass']);self.assertEqual(calls[3:],expected)
                     self.assertEqual([(r['case'],r['threads_A']) for r in report['cases']],expected)
                     with (out/'summary.csv').open() as stream:rows=list(csv.DictReader(stream))
                     self.assertEqual(len(rows),24)
@@ -134,7 +191,7 @@ class RoutingTests(unittest.TestCase):
                 else:
                     stop=('bwtree',64) if fault=='command' else ('bwtree+opt',64)
                     completed=expected.index(stop)
-                    self.assertEqual(code,1);self.assertEqual(calls[2:],expected[:completed+1])
+                    self.assertEqual(code,1);self.assertEqual(calls[3:],expected[:completed+1])
                     self.assertEqual(len(report['cases']),completed)
                     self.assertTrue((out/stop[0]/f'threads-{stop[1]}'/'invalid.json').is_file())
                     self.assertFalse((out/stop[0]/'threads-128').exists())
@@ -178,7 +235,7 @@ class RoutingTests(unittest.TestCase):
 set -eu
 mkdir -p "$1/lib"
 touch "$1/ycsbc"
-printf '%s %s' "$OPT" "$YCSB_INDEXES" > "$1/build-routing"
+printf '%s %s %s' "$OPT" "$YCSB_INDEXES" "$YCSB_RPC_BUILD" > "$1/build-routing"
 ''')
             (tools/'ldd').write_text('#!/bin/sh\nexit 0\n')
             (tools/'python3').write_text('#!'+sys.executable+'\n'+
@@ -199,12 +256,12 @@ printf '%s %s' "$OPT" "$YCSB_INDEXES" > "$1/build-routing"
                     subprocess.run(['bash',str(root/'run.sh')],env=env,check=True,capture_output=True)
                     db,opt,rpc,access,writable=expected
                     index='clevel-hash' if db=='clevelhash' else db
-                    self.assertEqual((out/'build-routing').read_text(),f'{opt} {index}')
+                    self.assertEqual((out/'build-routing').read_text(),f'{opt} {index} {rpc}')
                     args=json.loads((out/'peer-args.json').read_text())
                     def value(flag): return args[args.index(flag)+1]
                     self.assertEqual(value('--expected-opt'),str(opt))
                     self.assertEqual(value('--size-mb'),'49152')
-                    self.assertEqual(value('--nc-size-mb'),'16384')
+                    self.assertEqual(value('--nc-size-mb'),'65536' if case.startswith('sherman+nc-') else '16384')
                     self.assertEqual(value('--cache-provider'),'provider-82')
                     self.assertEqual(value('--nc-provider'),'provider-81')
                     self.assertEqual('--suite' in args,case!='legacy')

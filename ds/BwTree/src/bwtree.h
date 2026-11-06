@@ -2198,7 +2198,7 @@ class BwTree : public BwTreeBase {
 
       // This substracts size from tail, and assigns
       // the value to local variable in one atomic step
-#ifdef NO_CC
+#if defined(NO_CC) || defined(SHM_UB_SPLIT)
       char *new_tail = tail.fetch_sub((char*)size) - size;
 #else
       char *new_tail = tail.fetch_sub(size) - size;

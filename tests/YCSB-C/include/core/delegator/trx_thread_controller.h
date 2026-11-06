@@ -262,7 +262,7 @@ private:
     ThreadArgsDeleTrans *arg = (ThreadArgsDeleTrans *)context;
     std::vector<int> thread_ids;
     // auto thread_args = reinterpret_cast<ThreadArgsDeleTrans *>(arg);
-#ifdef USE_MSG_QUEUE
+#if defined(USE_MSG_QUEUE) && !defined(YCSB_UB_TWO_HOST)
     SimThreadInfo::setup_dispatcher_id(arg->sim_thread_id);
 #else
     SimThreadInfo::setup_worker_ids(arg->sim_machine_id, arg->sim_thread_id);
@@ -374,7 +374,7 @@ private:
   }
 
   void InitDelegateClient(std::vector<int> &thread_ids) {
-#ifndef USE_MSG_QUEUE
+#if !defined(USE_MSG_QUEUE) || defined(YCSB_UB_TWO_HOST)
     thread_ids.reserve(dbs_->size());
     for (auto db : *dbs_) {
       thread_ids.push_back(db->ThreadInit());
@@ -383,7 +383,7 @@ private:
   }
 
   void CloseDelegateClient(std::vector<int> &thread_ids) {
-#ifndef USE_MSG_QUEUE
+#if !defined(USE_MSG_QUEUE) || defined(YCSB_UB_TWO_HOST)
     for (size_t i = 0; i < dbs_->size(); i++) {
       (*dbs_)[i]->ThreadClose(thread_ids[i]);
     }

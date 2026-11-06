@@ -44,7 +44,7 @@ public:
     local_index_base=mmap_base;
   }
 };
-std::vector<int> worker_cpus;
+std::vector<int> worker_cpus, rpc_worker_cpus;
 const char* env(const char* key,const char* fallback=nullptr) {
   const char* value=std::getenv(key);
   if((!value || !*value) && fallback) value=std::getenv(fallback);
@@ -85,13 +85,12 @@ void create_cxl_region(bool metadata,size_t bytes) {
   if(rc) throw std::runtime_error("Cannot size CXL backing file: "+path);
 }
 void prepare_cxl() {
-  if(all_nc) throw std::runtime_error("CXL comparison currently supports CACHE-node indexes only");
   cxl_directory=env("YCSB_CXL_DIRECTORY");
   cxl_node=std::stoi(env("YCSB_CXL_NODE"));
   if(numa_available()<0 || cxl_node<0 || cxl_node>numa_max_node() ||
       !numa_bitmask_isbitset(numa_all_nodes_ptr,cxl_node))
     throw std::runtime_error("Requested CXL NUMA node is unavailable");
-  if(owner) { if(!all_nc) create_cxl_region(false,data_size); create_cxl_region(true,nc_size); }
+  if(owner) { if(!rpc && !all_nc) create_cxl_region(false,data_size); create_cxl_region(true,nc_size); }
   ub_atomic_memory=MemoryManager(new CxlSessionMapper(cxl_path(true).c_str(),true),
                                 reinterpret_cast<void*>(nc_base),nc_size);
   // B owns the shared index and reclaims its allocations after the existing
@@ -99,7 +98,7 @@ void prepare_cxl() {
   // allow memkind to reuse memory instead of retaining every obsolete node.
   ub_atomic_memory.require_shared_allocations();
   nc=reinterpret_cast<void*>(nc_base);
-  if(!all_nc) {
+  if(!rpc && !all_nc) {
     if(owner) {
       cacheable=MemoryManager(new CxlSessionMapper(cxl_path(false).c_str(),false),
                              reinterpret_cast<void*>(data_base),data_size);
@@ -115,7 +114,7 @@ void prepare_cxl() {
     data=reinterpret_cast<void*>(data_base);
   }
   std::cerr<<"CXL_MAPPING role="<<(owner?"B":"A")<<" node="<<cxl_node
-           <<" allocator=memkind atomic_backend=queue cache_maintenance=native CACHE="<<(owner?"RW":"READ")
+           <<" allocator=memkind atomic_backend=queue cache_maintenance=native CACHE="<<((rpc||all_nc)?"NONE":owner?"RW":"READ")
            <<" metadata=RW"<<std::endl;
 }
 void check_cxl_placement() {
@@ -251,6 +250,7 @@ int threads(int machine) {
 int first_thread(int machine) { return machine==0?0:threads(0); }
 int worker_cpu(unsigned local_index) { return worker_cpus.at(local_index); }
 int cpu_start() { return worker_cpu(0); }
+int rpc_worker_cpu(unsigned i) { return rpc_worker_cpus.at(i); }
 bool nc_data() { return all_nc; }
 bool nc_direct_data() { return direct_nc; }
 bool rpc_mode() { return rpc; }
@@ -275,8 +275,14 @@ void prepare(utils::Properties& props) {
     throw std::runtime_error("A is always read-only; YCSB_UB_A_WRITABLE must be 0");
   owner=SimThreadInfo::is_master();
   rpc=std::getenv("YCSB_UB_RPC") && std::string(std::getenv("YCSB_UB_RPC"))=="1";
+#if defined(USE_MSG_QUEUE)
+  if(!rpc) throw std::runtime_error("build.sh rpc requires YCSB_UB_RPC=1");
+#else
+  if(rpc) throw std::runtime_error("RPC requires build.sh rpc; rebuild the bundle");
+#endif
   worker_cpus=parse_worker_cpus(std::getenv("YCSB_UB_CPUS"),threads(owner?0:1),
                                 std::stoi(env("YCSB_UB_CPU")));
+  if(rpc) rpc_worker_cpus=parse_worker_cpus(env("YCSB_RPC_CPUS"),threads(owner?0:1),0);
   cpu_set_t allowed;
   if(sched_getaffinity(0,sizeof(allowed),&allowed))
     throw std::runtime_error("Cannot read UB worker CPU affinity");
@@ -302,7 +308,6 @@ void prepare(utils::Properties& props) {
   for(const char* key:{"insertproportion","scanproportion","readmodifywriteproportion"})
     if(std::stod(props.GetProperty(key,"0"))!=0) throw std::runtime_error("Only read/update are supported");
 #ifdef YCSB_CXL_TWO_PROCESS
-  if(rpc) throw std::runtime_error("RPC requires the UB two-host bundle");
   prepare_cxl();
 #else
   if(owner) {
@@ -313,21 +318,25 @@ void prepare(utils::Properties& props) {
   if(!all_nc && !rpc) data=map_ub_memory(name.c_str(),reinterpret_cast<void*>(data_base),data_size,UbMappingMode::Cacheable,!owner);
   size_t half=((nc_size-4096)/2)&~size_t(all_nc ? 4095 : 63);
   ub_configure_arena(true,static_cast<char*>(nc)+4096+(owner?0:half),half);
-  // A never allocates data. Leaving its CACHE allocator unconfigured catches violations.
+  if(!rpc) {
+    if(!all_nc && owner) ub_configure_arena(false,data,data_size);
+    cacheable=MemoryManager(all_nc);
+  }
+#endif
+  // RPC partitions use local DRAM with either shared transport backend.
+  // A never allocates shared CACHE data in direct mode.
   // BwTree returns retired CACHE nodes through its epoch GC (and, for OPT,
   // mapping-cache invalidation ACKs plus a second reader grace period).
   // The arena must recycle those safely retired allocations.
   if(rpc) {
     cacheable=MemoryManager(new LocalIndexMapper,nullptr,data_size);
-    cacheable.require_shared_allocations(props["dbname"]=="bwtree");
+    // This index is private to this process. Honour frees after its epoch GC;
+    // retaining them until exit exhausts the fixed pool during load/updates.
+    cacheable.require_shared_allocations();
     std::cerr<<"RPC_INDEX_STORAGE role="<<(owner?"B":"A")<<" storage=local-dram base="<<local_index_base
              <<" bytes="<<data_size<<" node="<<local_memory_node()
              <<" cpu_node="<<numa_node_of_cpu(sched_getcpu())<<std::endl;
-  } else {
-    if(!all_nc && owner) ub_configure_arena(false,data,data_size);
-    cacheable=MemoryManager(all_nc);
   }
-#endif
   stage(std::string(backend)+" mappings ready; allocators configured");
   std::cerr<<"YCSB framework "<<backend<<" role="<<(owner?"B":"A")<<" CACHE="<<((all_nc||rpc)?"NONE":owner?"RW":"READ")<<" metadata=RW"<<std::endl;
 }
@@ -350,11 +359,12 @@ void finish() {
 #endif
 #ifdef YCSB_CXL_TWO_PROCESS
   cacheable=MemoryManager();
+  local_index_base=nullptr;
   delete readonly_data_mapper; readonly_data_mapper=nullptr;
   ub_atomic_memory=MemoryManager(true);
   data=nullptr; nc=nullptr;
   if(owner) {
-    if(unlink(cxl_path(false).c_str()) || unlink(cxl_path(true).c_str()))
+    if((!rpc && !all_nc && unlink(cxl_path(false).c_str())) || unlink(cxl_path(true).c_str()))
       throw std::runtime_error("Cannot remove this round's CXL backing files");
   }
 #else

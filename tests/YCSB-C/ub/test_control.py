@@ -196,9 +196,9 @@ os.write(fd,b'CLOSED\n')
             summary(a,{**b,'rpc_completed':10},3,100,suite=True)
         with self.assertRaisesRegex(RuntimeError,'RPC routing'):
             summary(a,b,3,100,suite=True,rpc=1)
-        rpc_a={**a,'rpc_transport':'bidirectional-mpmc-shared-queue','index_storage':'local-dram',
+        rpc_a={**a,'rpc_transport':'original-mq-thread-pool','index_storage':'local-dram',
                'rpc_sent':43,'rpc_completed':57,'rpc_local':57,'rpc_expected_remote':43}
-        rpc_b={**b,'rpc_transport':'bidirectional-mpmc-shared-queue','index_storage':'local-dram',
+        rpc_b={**b,'rpc_transport':'original-mq-thread-pool','index_storage':'local-dram',
                'rpc_sent':57,'rpc_completed':43,'rpc_local':43,'rpc_expected_remote':57}
         self.assertTrue(summary(rpc_a,rpc_b,3,100,suite=True,rpc=1)['pass'])
         with self.assertRaisesRegex(RuntimeError,'RPC transport'):

@@ -9,17 +9,20 @@ SDK_ROOT=${SDK_ROOT:-/usr/local/ubs_mem}
 PORT=${PORT:-18982}
 THREADS_A=${THREADS_A:-1}
 THREADS_B=${THREADS_B:-1}
-RECORDS=${RECORDS:-10000000}
+RECORDS=${RECORDS:-10000000} # UB/CXL: 10 million key/value pairs total across A/B
 OPS=${OPS:-10000000} # Per host, shared across its workers
 # CACHE-node indexes and the two hosts' shared traces.
 SIZE_MB=${SIZE_MB:-49152}
 # An explicit NC_SIZE_MB overrides every case unless Sherman has its own override.
 # Resolve this before NC_SIZE_MB's default so repeated sourcing preserves the choice.
-SHERMAN_NC_SIZE_MB=${SHERMAN_NC_SIZE_MB:-${NC_SIZE_MB:-16384}}
+SHERMAN_NC_SIZE_MB=${SHERMAN_NC_SIZE_MB:-${NC_SIZE_MB:-65536}}
 NC_SIZE_MB=${NC_SIZE_MB:-16384}
 SPEC=${SPEC:-workloadb_90read.spec}
 OPT=${OPT:-1} # Legacy run.sh: 1 OPT, 0 NOOPT
 SEED=${SEED:-20261104}
 A_WRITABLE=${A_WRITABLE:-0} # Compatibility only: A is always read-only; 1 is rejected.
 # CPU_A / CPU_B: start at this allowed CPU ID, skipping unavailable IDs.
-# Each worker uses a distinct allowed logical CPU; RPC shares B's first selected CPU.
+# Each client uses a distinct CPU; RPC reserves an equally sized disjoint service CPU set.
+# CXL process CPU placement; CXL_NODE independently selects shared memory placement.
+CXL_CPU_NODE_A=${CXL_CPU_NODE_A:-0}
+CXL_CPU_NODE_B=${CXL_CPU_NODE_B:-1}

@@ -290,7 +290,7 @@ int main(const int argc, const char *argv[]) {
   int machine_nr = stoi(props.GetProperty("machinenum", "1"));
   SimThreadInfo::setup_worker_machine_count(machine_nr);
 
-#ifdef USE_MSG_QUEUE
+#if defined(USE_MSG_QUEUE) && !defined(YCSB_UB_TWO_HOST)
   int dispatcher_nr = stoi(props.GetProperty("client_thread_count", "1"));
   int worker_nr = stoi(props.GetProperty("server_thread_count", "1"));
 #else

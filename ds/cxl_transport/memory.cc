@@ -36,14 +36,31 @@ struct alignas(64) CopySequence {
   std::atomic<uint64_t> value{0};
 #endif
 };
+// Keep one sequence per node, with a power-of-two slot so a field address
+// identifies its header. A 1 KiB Sherman page plus its header fits in 2 KiB.
+// Page-aligned 4 KiB allocations take the large-allocation path in memkind's
+// jemalloc (16 KiB usable plus a padding page), wasting most of a fixed pool.
+constexpr size_t nc_slot_size() {
+#ifdef SHERMAN_PAGE_SIZE
+  size_t bytes = sizeof(CopySequence) + SHERMAN_PAGE_SIZE;
+#else
+  size_t bytes = 4096;
+#endif
+  size_t slot = 1;
+  while (slot < bytes) slot <<= 1;
+  return slot;
+}
+constexpr size_t nc_node_slot_bytes = nc_slot_size();
 CopySequence local_copy_sequences[65536];
 CopySequence* copy_sequences = local_copy_sequences;
 std::vector<CopySequence*> copy_slots(const void* p, size_t n) {
   std::vector<CopySequence*> slots;
   if (!n) return slots;
-  auto first=uintptr_t(p)>>12, last=(uintptr_t(p)+n-1)>>12;
-  for(auto page=first;page<=last;++page)
-    slots.push_back(nc_nodes ? reinterpret_cast<CopySequence*>(page<<12) : &copy_sequences[page%65536]);
+  const size_t stride = nc_nodes ? nc_node_slot_bytes : 4096;
+  const auto mask = ~uintptr_t(stride - 1);
+  auto first=uintptr_t(p)&mask, last=(uintptr_t(p)+n-1)&mask;
+  for(auto slot=first;slot<=last;slot+=stride)
+    slots.push_back(nc_nodes ? reinterpret_cast<CopySequence*>(slot) : &copy_sequences[(slot>>12)%65536]);
   std::sort(slots.begin(),slots.end());
   slots.erase(std::unique(slots.begin(),slots.end()),slots.end());
   return slots;
@@ -133,8 +150,8 @@ void* allocate(size_t n) {
   if (nc_nodes) {
     // Each node owns its sequence header. Unlike hashed counters, independent
     // nodes (including a private split sibling) can never alias a held guard.
-    if(n>4096-sizeof(CopySequence)) throw std::runtime_error("NC Sherman node exceeds its 4 KiB slot");
-    if(shared_atomic_memory().posix_memalign(&p,4096,4096) || !p) throw std::bad_alloc();
+    if(n>nc_node_slot_bytes-sizeof(CopySequence)) throw std::runtime_error("NC Sherman node exceeds its configured slot");
+    if(shared_atomic_memory().posix_memalign(&p,nc_node_slot_bytes,nc_node_slot_bytes) || !p) throw std::bad_alloc();
     new(p) CopySequence;
     return static_cast<char*>(p)+sizeof(CopySequence);
   }

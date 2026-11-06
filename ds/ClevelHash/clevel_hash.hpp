@@ -38,6 +38,12 @@ inline MemoryManager& clevel_memory() { return cacheable; }
 template<class T> using clevel_vector = cxl_vector<T>;
 #endif
 
+#if defined(SHM_UB_SPLIT) && (defined(SHM_LIB_WITH_UBSM) || defined(YCSB_CXL_TWO_PROCESS)) && !defined(CLEVEL_RPC_ADAPTER)
+#define CLEVEL_UB_LEVEL_GC
+#include "level_epoch.h"
+#include <memory>
+#endif
+
 // #define OPT_NO_META
 // #define OPT_BATCH_FLUSH
 
@@ -323,6 +329,11 @@ public:
     struct bucket *buckets;
     uint64_t capacity;
     atomic_type<level_ptr_t> up;
+#ifdef CLEVEL_UB_LEVEL_GC
+    // Intrusive retired-level list: no per-KV or per-root retirement records.
+    level_bucket* retired_next = nullptr;
+    uint64_t retired_epoch = 0;
+#endif
     // std::atomic<level_ptr_t> up;
 
     level_bucket() : buckets(nullptr), capacity(0), up(nullptr) {}
@@ -424,6 +435,80 @@ public:
     }
 #endif
   };
+
+#ifdef CLEVEL_UB_LEVEL_GC
+  aligned_nt<uint64_t> level_epoch{1};
+  mutable clevel_vector<ClevelLevelEpochSlot> level_epochs;
+  atomic_type<bool> level_epochs_ready{false};
+  atomic_type<bool> retired_levels_lock{false};
+  level_bucket* retired_levels = nullptr;
+  // Creator-only handle. Attachments keep a separate process-local handle.
+  std::unique_ptr<ClevelLevelGcWorker> level_gc_worker;
+
+  ClevelLevelEpochSlot& worker_level_epoch(size_type thread_id) const {
+    const size_t stride = thread_num.load();
+    const size_t slot = size_t(SimThreadInfo::worker_machine_id) * stride + thread_id;
+    if (thread_id >= stride || slot + 1 >= level_epochs.size()) throw std::out_of_range("ClevelHash epoch worker slot");
+    return level_epochs[slot];
+  }
+  void retire_level(level_bucket* level) {
+    bool expected = false;
+    while (!retired_levels_lock.compare_exchange_strong(expected, true)) {
+      expected = false; std::this_thread::yield();
+    }
+    level->retired_next = retired_levels;
+    retired_levels = level;
+    retired_levels_lock.store(false);
+  }
+  // Metadata is deliberately retained. Check current roots before assigning a
+  // retirement epoch: OPT may still be propagating a new root to replicas.
+  bool root_references_level(level_meta* root, level_bucket* level) const {
+    if (!root) return false;
+    auto* current = root->last_level;
+    while (current) {
+      if (current == level) return true;
+      if (current == root->first_level) break;
+      current = current->up.load();
+    }
+    return false;
+  }
+  void collect_old_levels() {
+    bool expected = false;
+    if (!retired_levels_lock.compare_exchange_strong(expected, true)) return;
+    for (auto* level = retired_levels; level; level = level->retired_next) {
+      if (level->retired_epoch) continue;
+#ifdef OPT_CLEVEL_ROOT_READ
+      bool reachable = root_references_level(LockedPointer<level_meta>::clear_lock(meta.load()), level);
+      for (size_t i = 0; i < meta_replicas.size() && !reachable; ++i)
+        reachable = root_references_level(LockedPointer<level_meta>::clear_lock(meta_replicas[i].load()), level);
+#else
+      bool reachable = root_references_level(meta.load(), level);
+#endif
+      if (!reachable) level->retired_epoch = level_epoch.fetch_add(1);
+    }
+    uint64_t oldest = level_epoch.load();
+    for (auto& slot : level_epochs) {
+      const auto announced = slot.epoch.load();
+      if (announced && announced < oldest) oldest = announced;
+    }
+    auto** link = &retired_levels;
+    while (*link) {
+      auto* level = *link;
+      if (level->retired_epoch && level->retired_epoch < oldest &&
+          (private_index_memory || ub_arena_owns(true, level))) {
+        *link = level->retired_next;
+        level->clear();
+        level->~level_bucket();
+        shared_atomic_memory(clevel_memory()).free(level);
+      } else link = &level->retired_next;
+    }
+    retired_levels_lock.store(false);
+  }
+  std::unique_ptr<ClevelLevelGcWorker> start_level_gc() {
+    return std::make_unique<ClevelLevelGcWorker>([this] { collect_old_levels(); });
+  }
+  void stop_level_gc() { level_gc_worker.reset(); }
+#endif
 
   static partial_t get_partial(hv_type hv) {
     constexpr static size_type shift_bits =
@@ -571,6 +656,9 @@ public:
   ~clevel_hash() {
     run_expand_thread.store(false);
     if (expand_thread.joinable()) expand_thread.join();
+#ifdef CLEVEL_UB_LEVEL_GC
+    stop_level_gc();
+#endif
 #ifdef CLEVEL_RPC_ADAPTER
     if (rpc_gc) stop_rpc_background();
 #endif
@@ -605,10 +693,17 @@ public:
     std::cout << "sizeof(meta) = " << sizeof(meta) << std::endl;
   }
 
-  uint64_t capacity() const { return capacity(meta.load()); }
+  uint64_t capacity() const {
+#ifdef CLEVEL_UB_LEVEL_GC
+    ClevelLevelEpochGuard guard(this, level_epoch, worker_level_epoch(SimThreadInfo::worker_thread_id));
+#endif
+    return capacity(meta.load());
+  }
 
   /**
    * Get the total capacity (#buckets * assoc_num) of given context.
+   * UB callers retaining a raw metadata snapshot must hold a level epoch guard
+   * from before loading it, through their last level/bucket access.
    */
   uint64_t capacity(level_meta_ptr_t m_copy) const {
     level_meta *m = m_copy;
@@ -667,6 +762,14 @@ public:
       meta_replicas[i].store(meta.load());
     }
     help_update = new (shared_atomic_memory(clevel_memory()).malloc(sizeof(HelpUpdate<level_meta>))) HelpUpdate<level_meta>(meta, meta_replicas, thread_num);
+#endif
+#ifdef CLEVEL_UB_LEVEL_GC
+    if (!level_epochs_ready.load()) {
+      const size_t machines = std::max(size_t(1), size_t(SimThreadInfo::worker_machine_count));
+      level_epochs.resize(machines * thread_num.load() + 1);
+      level_epochs_ready.store(true);
+      level_gc_worker = start_level_gc();
+    }
 #endif
   }
 
@@ -748,6 +851,9 @@ template <typename Key, typename T, typename Hash, typename KeyEqual,
 typename clevel_hash<Key, T, Hash, KeyEqual, HashPower>::ret
 clevel_hash<Key, T, Hash, KeyEqual, HashPower>::search(
     const key_type &key) const {
+#ifdef CLEVEL_UB_LEVEL_GC
+  ClevelLevelEpochGuard guard(this, level_epoch, worker_level_epoch(SimThreadInfo::worker_thread_id));
+#endif
   hv_type hv = hasher{}(key);
   partial_t partial = get_partial(hv);
 
@@ -1196,6 +1302,9 @@ clevel_hash<Key, T, Hash, KeyEqual, HashPower>::generic_insert(
     const key_type &key, const void *param,
     void (*allocate_KV)(value_type *&, const void *), size_type thread_id,
     size_type id) {
+#ifdef CLEVEL_UB_LEVEL_GC
+  ClevelLevelEpochGuard guard(this, level_epoch, worker_level_epoch(thread_id));
+#endif
   hv_type hv = hasher{}(key);
   partial_t partial = get_partial(hv);
 
@@ -1300,6 +1409,9 @@ template <typename Key, typename T, typename Hash, typename KeyEqual,
 typename clevel_hash<Key, T, Hash, KeyEqual, HashPower>::ret
 clevel_hash<Key, T, Hash, KeyEqual, HashPower>::erase(const key_type &key,
                                                       size_type thread_id) {
+#ifdef CLEVEL_UB_LEVEL_GC
+  ClevelLevelEpochGuard guard(this, level_epoch, worker_level_epoch(thread_id));
+#endif
   hv_type hv = hasher{}(key);
   partial_t partial = get_partial(hv);
   bool succ_deletion = false;
@@ -1430,6 +1542,9 @@ typename clevel_hash<Key, T, Hash, KeyEqual, HashPower>::ret
 clevel_hash<Key, T, Hash, KeyEqual, HashPower>::generic_update(
     const key_type &key, const void *param,
     void (*allocate_KV)(value_type *&, const void *), size_type thread_id) {
+#ifdef CLEVEL_UB_LEVEL_GC
+  ClevelLevelEpochGuard guard(this, level_epoch, worker_level_epoch(thread_id));
+#endif
   hv_type hv = hasher{}(key);
   partial_t partial = get_partial(hv);
 
@@ -1514,6 +1629,9 @@ template <typename Key, typename T, typename Hash, typename KeyEqual,
           size_t HashPower>
 void clevel_hash<Key, T, Hash, KeyEqual, HashPower>::expand(
     size_type thread_id, level_meta *m_copy) {
+#ifdef CLEVEL_UB_LEVEL_GC
+  ClevelLevelEpochGuard guard(this, level_epoch, worker_level_epoch(thread_id));
+#endif
 #ifdef SHM_UB_SPLIT
   struct AllocationGuard {
     atomic_type<bool>& flag;
@@ -1709,6 +1827,10 @@ void clevel_hash<Key, T, Hash, KeyEqual, HashPower>::resize() {
   difference_type expand_bucket = 0;
 
   while (run_expand_thread.load()) {
+#ifdef CLEVEL_UB_LEVEL_GC
+    if (!level_epochs_ready.load()) { usleep(1000); continue; }
+    ClevelLevelEpochGuard guard(this, level_epoch, level_epochs.back());
+#endif
 #ifdef CLEVEL_RPC_ADAPTER
     // One bucket per iteration. Readers remain concurrent and use epochs;
     // writers can run together but cannot race pointer migration.
@@ -1827,6 +1949,9 @@ void clevel_hash<Key, T, Hash, KeyEqual, HashPower>::resize() {
           if (help_update != nullptr && help_update->cas_ptr(m, tmp_meta[t_id])) {
 #else
           if (meta.compare_exchange_strong(m, tmp_meta[t_id])) {
+#endif
+#ifdef CLEVEL_UB_LEVEL_GC
+            retire_level(bl);
 #endif
 #ifdef CLEVEL_DEBUG
             std::cout << "Expand thread updates "

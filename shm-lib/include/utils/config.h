@@ -89,7 +89,7 @@
 #if defined(SHM_NT_UB) || defined(NT_SIM) || !defined(QUEUE_SIM_CAS)
 #error "CXL A/B requires QUEUE_SIM_CAS without UB or NT_SIM"
 #endif
-#if defined(NO_CLFLUSH) || defined(NO_CC_WO_FLUSH_NODE) || !defined(NO_CC)
+#if defined(NO_CLFLUSH) || defined(NO_CC_WO_FLUSH_NODE) || (!defined(NO_CC) && !defined(USE_MSG_QUEUE))
 #error "CXL A/B requires NO_CC with native cacheline maintenance enabled"
 #endif
 #endif

@@ -103,6 +103,8 @@ private:
   bool strict_shared_ = false;
   bool retain_shared_ = false;
   bool owns_memkind_pointer(const void *ptr) const;
+  void report_memkind_failure(const char *operation, size_t requested,
+                              size_t alignment, int error) const;
 
   CacheableAllocatorBackend backend_;
   void *base;

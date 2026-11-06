@@ -8,6 +8,9 @@
 #include "db/ub_read_queue.h"
 #include "shm/ub.h"
 #include "utils/sim_id.h"
+#ifdef ENABLE_CLEVEL_HASH_DB
+#include "clevel_hash.hpp"
+#endif
 #if defined(ENABLE_BWTREE_DB) && defined(OPT_IN_USE_FLAG) && BWTREE_PROCESS_MAPPING_CACHE
 #include "bwtree.h"
 #endif
@@ -345,6 +348,110 @@ void partitioned_rpc_contract(bool owner,const std::string& index,int in,int out
 }
 
 struct Handles { ycsbc::DB* db; uintptr_t old_values,new_values; };
+#ifdef ENABLE_CLEVEL_HASH_DB
+// Run exactly the same index operations and placement assertions with either
+// independent CACHE replicas or the native CXL mapper/queue implementation.
+void clevel_metadata_contract(bool owner,int in,int out,bool drop_writeback) {
+  using Table=clevel_hash<uint64_t,uint64_t,std::hash<uint64_t>,std::equal_to<uint64_t>,4>;
+  Table* table=nullptr;
+  auto in_cache=[](const void* p) {
+    const auto address=reinterpret_cast<uintptr_t>(p);
+    return address>=0x300000000000ul && address<0x300008000000ul;
+  };
+  auto in_nc=[](const void* p) {
+    const auto address=reinterpret_cast<uintptr_t>(p);
+    return address>=0x400000000000ul && address<0x400008000000ul;
+  };
+  auto stop_resize=[&] {
+    table->run_expand_thread.store(false);
+    if(table->expand_thread.joinable()) table->expand_thread.join();
+  };
+  auto root=[&] {
+#ifdef OPT_CLEVEL_ROOT_READ
+    return table->help_update->load_ptr(SimThreadInfo::worker_thread_id);
+#else
+    return table->meta.load();
+#endif
+  };
+  if(owner) {
+    table=new(shared_atomic_memory().malloc(sizeof(Table))) Table;
+    table->set_thread_num(1+clients);
+    stop_resize(); table->stop_level_gc();
+    for(uint64_t key=1;key<=16;++key) table->insert({key,key+100},0,key);
+  }
+  transfer(owner?out:in,&table,sizeof(table),owner);
+  Table::level_meta* previous=nullptr;
+  auto check=[&](size_t expected_levels,bool resizing) {
+    ClevelLevelEpochGuard guard(table,table->level_epoch,
+                               table->worker_level_epoch(SimThreadInfo::worker_thread_id));
+    require(in_nc(table) && in_nc(&table->meta),"table/global pointer escaped NC");
+    auto* m=root();
+    require(m && m!=previous,"root publication did not advance"); previous=m;
+#ifdef OPT_CLEVEL_ROOT_READ
+    require(in_nc(table->meta_replicas.data()),"replica pointer words escaped NC");
+    require(in_cache(table->help_update),"helper descriptor is not in shared CACHE");
+    require(in_cache(m),"OPT level_meta is not in shared CACHE");
+    require(size_t(m->level_count)==expected_levels,"stale flat level count");
+#else
+    require(in_nc(m),"NOOPT level_meta placement changed");
+#endif
+    require(bool(m->is_resizing)==resizing,"stale resize state");
+    size_t count=0,slots=0;
+    for(auto* level=m->last_level;;level=level->up.load()) {
+      require(level && in_nc(level) && in_nc(level->buckets),"level/buckets escaped NC");
+#ifdef OPT_CLEVEL_ROOT_READ
+      require(count<MAX_LEVEL && m->levels[count]==level,"stale flat level pointer");
+#endif
+      ++count; slots+=level->capacity*Table::assoc_num;
+      require(count<=expected_levels,"unexpected level chain");
+      if(level==m->first_level) break;
+    }
+    require(count==expected_levels && table->capacity(m)==slots,"incorrect published capacity");
+    for(uint64_t key=1;key<=16;++key) {
+      auto found=table->search(key);
+      require(found.found && found.value->second==key+100,"published root lost a key/value");
+    }
+  };
+  check(2,false); barrier(in,out);
+  for(int round=0;round<5;++round) {
+    if(owner) {
+#ifdef SHM_LOCAL_NCC
+      // In this phase only the new immutable metadata resides in CACHE.
+      // NC level/bucket publication is unaffected by dropping writebacks.
+      if(drop_writeback && round==0) setenv("LOCAL_NCC_DROP","writeback",1);
+#else
+      require(!drop_writeback,"missing-writeback control requires LOCAL_NCC");
+#endif
+      ClevelLevelEpochGuard guard(table,table->level_epoch,table->worker_level_epoch(0));
+      table->expand(0,root());
+#ifdef SHM_LOCAL_NCC
+      unsetenv("LOCAL_NCC_DROP");
+#endif
+    }
+    barrier(in,out); check(3,true); barrier(in,out);
+    if(owner) {
+      table->run_expand_thread.store(true);
+      table->expand_thread=std::thread([&] {
+        SimThreadInfo::setup_worker_ids(0,SimThreadInfo::worker_thread_count-1);
+        table->resize();
+      });
+      bool migrated=false;
+      for(int attempt=0;attempt<3000;++attempt) {
+        ClevelLevelEpochGuard guard(table,table->level_epoch,table->worker_level_epoch(0));
+        if(!root()->is_resizing) { migrated=true;break; }
+        usleep(1000);
+      }
+      stop_resize(); require(migrated,"level migration did not complete");
+    }
+    barrier(in,out); check(2,false); barrier(in,out);
+  }
+  if(owner) {
+    table->~Table(); shared_atomic_memory().free(table);
+    std::cout<<"CLEVEL_METADATA_PASS roots=11 growth_rounds=5 placement=shared no_private_snapshot=1\n";
+  }
+}
+#endif
+
 void index_contract(bool owner,bool rpc,const std::string& index,int in,int out) {
   Handles handles{};
   if(owner) {
@@ -462,7 +569,12 @@ void run(bool owner,const std::string& mode,int in,int out) {
 #else
     throw std::runtime_error("mapping cache GC contract requires BwTree OPT");
 #endif
-  } else if(queue) queue_contract(owner,in,out);
+  }
+#ifdef ENABLE_CLEVEL_HASH_DB
+  else if(mode=="clevelhash+metadata" || mode=="clevelhash+metadata-no-writeback")
+    clevel_metadata_contract(owner,in,out,mode=="clevelhash+metadata-no-writeback");
+#endif
+  else if(queue) queue_contract(owner,in,out);
   else if(rpc) partitioned_rpc_contract(owner,index,in,out);
   else index_contract(owner,rpc,index,in,out);
   barrier(in,out);

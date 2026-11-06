@@ -517,7 +517,16 @@ public:
   }
 
 #ifdef USE_CXL
-  clevel_hash() : meta(new (shared_atomic_memory(clevel_memory()).malloc(sizeof(level_meta))) level_meta()), thread_num(0) {
+  static MemoryManager& level_meta_memory() {
+#if defined(OPT_CLEVEL_ROOT_READ) && defined(SHM_UB_SPLIT)
+    // Published metadata is immutable. Only meta and meta_replicas contain
+    // atomic pointer words; their targets can live in shared CACHE memory.
+    return private_index_memory ? *private_index_memory : clevel_memory();
+#else
+    return shared_atomic_memory(clevel_memory());
+#endif
+  }
+  clevel_hash() : meta(new (level_meta_memory().malloc(sizeof(level_meta))) level_meta()), thread_num(0) {
 #else
   clevel_hash() : meta(new level_meta()), thread_num(0) {
 #endif
@@ -562,6 +571,13 @@ public:
     m->last_level = tmp;
 
     m->is_resizing = false;
+
+#if defined(OPT_CLEVEL_ROOT_READ) && defined(SHM_UB_SPLIT)
+    // Finish and publish the initial immutable image before replicas/readers
+    // can observe it, just as expand()/resize() publish replacement images.
+    m->set_levels();
+    clwb(m, sizeof(level_meta));
+#endif
 
     run_expand_thread.store(true);
 #ifndef CLEVEL_RPC_ADAPTER
@@ -763,14 +779,14 @@ public:
     }
     // Only the global/replica pointer words need NC atomics. The helper's
     // addresses and replica count are immutable, ordinary cacheable reads.
-#if defined(SHM_UB_SPLIT) && (defined(SHM_LIB_WITH_UBSM) || defined(SHM_LIB_WITH_UB))
+#ifdef SHM_UB_SPLIT
     auto& helper_memory = private_index_memory ? *private_index_memory : clevel_memory();
 #else
     auto& helper_memory = shared_atomic_memory(clevel_memory());
 #endif
     auto* helper = new (helper_memory.malloc(sizeof(HelpUpdate<level_meta>)))
         HelpUpdate<level_meta>(meta, meta_replicas, thread_num);
-#if defined(SHM_UB_SPLIT) && (defined(SHM_LIB_WITH_UBSM) || defined(SHM_LIB_WITH_UB))
+#ifdef SHM_UB_SPLIT
     clwb(helper, sizeof(*helper));
 #endif
     help_update = helper;
@@ -1710,7 +1726,7 @@ void clevel_hash<Key, T, Hash, KeyEqual, HashPower>::expand(
         // Help updating meta
 #ifdef USE_CXL
         tmp_meta[t_id] =
-            new (shared_atomic_memory(clevel_memory()).malloc(sizeof(level_meta))) level_meta(m_copy->first_level, m_copy->last_level, true);
+            new (level_meta_memory().malloc(sizeof(level_meta))) level_meta(m_copy->first_level, m_copy->last_level, true);
 #else
         tmp_meta[t_id] = new level_meta(m_copy->first_level, m_copy->last_level, true);
 #endif
@@ -1718,7 +1734,7 @@ void clevel_hash<Key, T, Hash, KeyEqual, HashPower>::expand(
 #ifdef USE_CXL
         assert(cl->up.load() != nullptr);
         tmp_meta[t_id] =
-            new (shared_atomic_memory(clevel_memory()).malloc(sizeof(level_meta))) level_meta(cl->up.load(), m_copy->last_level, true);
+            new (level_meta_memory().malloc(sizeof(level_meta))) level_meta(cl->up.load(), m_copy->last_level, true);
 #else
         tmp_meta[t_id] = new level_meta(cl->up.load(), m_copy->last_level, true);
 #endif
@@ -1741,7 +1757,7 @@ void clevel_hash<Key, T, Hash, KeyEqual, HashPower>::expand(
         break;
       } else {
 #ifdef USE_CXL
-        shared_atomic_memory(clevel_memory()).free(tmp_meta[t_id]);
+        level_meta_memory().free(tmp_meta[t_id]);
 #else
         delete tmp_meta[t_id];
 #endif
@@ -1775,14 +1791,14 @@ void clevel_hash<Key, T, Hash, KeyEqual, HashPower>::expand(
         if (cl->capacity >= new_capacity) {
 #ifdef USE_CXL  
           tmp_meta[t_id] =
-              new (shared_atomic_memory(clevel_memory()).malloc(sizeof(level_meta))) level_meta(m_copy->first_level, m_copy->last_level, true);
+              new (level_meta_memory().malloc(sizeof(level_meta))) level_meta(m_copy->first_level, m_copy->last_level, true);
 #else
         tmp_meta[t_id] = new level_meta(m_copy->first_level, m_copy->last_level, true);
 #endif
         } else {
           assert(cl->up != nullptr);
 #ifdef USE_CXL
-          tmp_meta[t_id] = new (shared_atomic_memory(clevel_memory()).malloc(sizeof(level_meta))) level_meta(cl->up, m_copy->last_level, true);
+          tmp_meta[t_id] = new (level_meta_memory().malloc(sizeof(level_meta))) level_meta(cl->up, m_copy->last_level, true);
 #else
           tmp_meta[t_id] = new level_meta(cl->up, m_copy->last_level, true);
 #endif
@@ -1803,7 +1819,7 @@ void clevel_hash<Key, T, Hash, KeyEqual, HashPower>::expand(
           break;
         } else {
 #ifdef USE_CXL
-          shared_atomic_memory(clevel_memory()).free(tmp_meta[t_id]);
+          level_meta_memory().free(tmp_meta[t_id]);
 #else
           delete tmp_meta[t_id];
 #endif
@@ -1948,7 +1964,7 @@ void clevel_hash<Key, T, Hash, KeyEqual, HashPower>::resize() {
             li = li->up;
           }
 #ifdef USE_CXL
-          tmp_meta[t_id] = new (shared_atomic_memory(clevel_memory()).malloc(sizeof(level_meta))) level_meta(m->first_level, bl->up, levels_left != 2);
+          tmp_meta[t_id] = new (level_meta_memory().malloc(sizeof(level_meta))) level_meta(m->first_level, bl->up, levels_left != 2);
 #else
           tmp_meta[t_id] = new level_meta(m->first_level, bl->up, levels_left != 2);
 #endif
@@ -1976,7 +1992,7 @@ void clevel_hash<Key, T, Hash, KeyEqual, HashPower>::resize() {
             break;
           } else {
 #ifdef USE_CXL
-            shared_atomic_memory(clevel_memory()).free(tmp_meta[t_id]);
+            level_meta_memory().free(tmp_meta[t_id]);
 #else
             delete tmp_meta[t_id];
 #endif

@@ -310,14 +310,20 @@ bash ./run.sh
 
 | 对象 | 相同 VA | A | B | 内容 |
 | --- | --- | --- | --- | --- |
-| CACHE | `0x300000000000` | READ | RW | BwTree 节点、delta、value |
-| NONCACHE + WR_DELAY_COMP | `0x400000000000` | RW | RW | DB/树对象、映射表、epoch、OPT 元数据、线程控制及原框架共享数组 |
+| CACHE | `0x300000000000` | READ | RW | BwTree 节点、delta、value；ClevelHash OPT 的不可变 `level_meta` 和 helper 描述符 |
+| NONCACHE + WR_DELAY_COMP | `0x400000000000` | RW | RW | DB/树对象、映射表、epoch、原子根指针及副本槽、线程控制及原框架共享数组 |
 
 使用 `SHM_UB_SPLIT` 和独立的 UB NT backend：`UB_API=ubsm`（或 Memlink）
 在编译时为 `nt`、`aligned_nt`、`nt_pointer` 选择 `atomic_ub_*`，直接对对象所在的
 mmap 地址执行 CPU 原子 load/store/CAS/fetch 操作。共享原子对象由 NC arena 分配；
 栈上/进程内临时对象仍可使用。对象本身不保存模拟副本、queue 或计时状态。
 NC 的 `flush()` 只执行内存屏障，CACHE 节点仍走原有显式 cache maintenance。
+
+ClevelHash OPT 的 `level_meta` 直接分配在共享 CACHE 区，初始化、扩容及迁移产生的
+每个版本在发布前完整写回；查询直接读取该共享对象，不创建进程私有 DRAM 快照。
+`meta` 和 `meta_replicas` 的原子指针字、层描述符及 bucket 槽仍在 NC。
+NOOPT 的 `level_meta` 保持原 NC 分配。失败发布的元数据从对应分配器释放，
+已发布版本继续保留到共享对象退出；两端需同步重新构建后运行。
 BwTree 读侧仅在映射启动时整区失效一次，后续节点和 value 直接读取，不执行
 逐节点/逐对象的首次读取 flush；写端发布新节点前仍执行原有写回。
 UB 构建不编译 queue 模拟源文件；`UB_API=none` 的 NO_CC 模式继续使用原 queue backend。

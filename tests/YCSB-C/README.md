@@ -134,3 +134,27 @@ You can bypass the launcher and invoke the selected binary directly:
 ```
 
 Run `./ycsbc` without arguments to see all supported options.
+
+## Results
+
+case	32 线程	64 线程	128 线程	128/32
+clevelhash	5.496 Mops/s	5.803	5.644	1.03×
+clevelhash+opt	4.100	4.298	4.198	1.02×
+sherman+nc-direct	0.873	1.561	2.018	2.31×
+sherman+nc-memcpy	0.547	0.971	1.129	2.07×
+bwtree+rpc	0.919	1.115
+clevelhash+rpc	1.105	0.916
+
+case	workers	秒	总 Mops/s
+clevelhash	32	4.628	4.322
+clevelhash	64	4.341	4.607
+clevelhash	128	4.027	4.966
+clevelhash+opt	32	4.402	4.544
+clevelhash+opt	64	3.852	5.192
+clevelhash+opt	128	3.807	5.253
+
+用例	A/B 线程	总吞吐	总耗时	B 侧完成 RPC	B 侧 RPC 速率
+bwtree+rpc	32/32	1.115 Mops	17.94 s	4,795,278	267.3 K/s
+bwtree+rpc	64/64	0.919 Mops	21.77 s	4,795,278	220.3 K/s
+clevelhash+rpc	32/32	1.105 Mops	18.10 s	4,795,278	264.9 K/s
+clevelhash+rpc	64/64	0.916 Mops	21.83 s	4,795,278	219.6 K/s

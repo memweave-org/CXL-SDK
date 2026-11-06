@@ -141,6 +141,7 @@ class LocalDB final : public DB {
   const bool rpc_, sherman_, owner_;
   const unsigned machine_;
   UbReadQueue *incoming_=nullptr, *outgoing_=nullptr;
+  std::unique_ptr<RpcQueueRouter> outgoing_router_;
   std::unique_ptr<ThreadPool> service_;
   std::atomic<uint64_t> completed_{0};
   // Each worker owns its counters; collect only after the clients have joined.
@@ -162,7 +163,7 @@ class LocalDB final : public DB {
       throw std::runtime_error("A workload is read-only: mutation is forbidden");
     if(rpc_ && UbRpcOwner(key)!=machine_) {
       const int client=SimThreadInfo::worker_thread_id-ycsbc_ub::first_thread(machine_);
-      const int result=outgoing_->request(client,operation,key,value);
+      const int result=outgoing_->request(client,operation,key,value,*outgoing_router_);
       ++counts_.at(client).sent;
       return result;
     }
@@ -189,6 +190,7 @@ public:
       target_=create_index(descriptor.kind,descriptor.threads+ycsbc_ub::threads(machine_));
       if(!ycsbc_ub::in_local_index(target_)) throw std::runtime_error("RPC index escaped local DRAM");
       incoming_=descriptor.inbound[machine_]; outgoing_=descriptor.inbound[1-machine_];
+      outgoing_router_=std::make_unique<RpcQueueRouter>(outgoing_->buckets(),outgoing_->policy());
     } else if(sherman_) {
 #ifdef ENABLE_SHERMAN_DB
       target_=new ShermanDB(descriptor.sherman,owner_);
@@ -227,7 +229,10 @@ public:
       });
     ycsbc_ub::stage(std::string("RPC_PARTITION role=")+(owner_?"B":"A")+
       " index=local-dram owner=key%2 transport=original-mq-thread-pool value_transport=bytes workers="+
-      std::to_string(workers)+" buckets="+std::to_string(buckets));
+      std::to_string(workers)+" buckets="+std::to_string(buckets)+
+      " queue_policy="+RpcQueueRouter::name(outgoing_->policy())+
+      " outgoing_buckets="+std::to_string(outgoing_->buckets())+
+      " outstanding_scope=sender-process outstanding_storage=local-dram max_inflight_per_client=1");
   }
   ~LocalDB() override {
     service_.reset();
@@ -307,8 +312,12 @@ DB* CreateUbDB(const std::string& name,int threads) {
   if(rpc && kind==IndexKind::Sherman) throw std::runtime_error("Sherman uses shared-node access");
   auto* descriptor=shared_new<UbDB>(kind,threads,rpc);
   if(rpc) {
-    for(unsigned receiver=0;receiver<2;++receiver)
-      descriptor->inbound[receiver]=shared_new<UbReadQueue>(ycsbc_ub::threads(1-receiver),256,VALUE_ADDR_SIZE);
+    const auto policy=RpcQueueRouter::configured_policy();
+    for(unsigned receiver=0;receiver<2;++receiver) {
+      const auto clients=ycsbc_ub::threads(1-receiver);
+      const auto buckets=policy==RpcQueueRouter::Policy::Fixed ? clients : ycsbc_ub::threads(receiver);
+      descriptor->inbound[receiver]=shared_new<UbReadQueue>(clients,256,VALUE_ADDR_SIZE,buckets,policy);
+    }
   } else if(kind!=IndexKind::Sherman) descriptor->shared_target=create_index(kind,threads);
   LocalUbDB(descriptor);
   return descriptor;

@@ -66,7 +66,9 @@ void generation_contract(utils::Properties props) {
 void queue_contract(bool owner,int in,int out) {
   ycsbc::UbReadQueue* queue=nullptr;
   if(owner) {
-    queue=new(shared_atomic_memory().malloc(sizeof(*queue))) ycsbc::UbReadQueue(clients,2);
+    const auto policy=ycsbc::RpcQueueRouter::configured_policy();
+    const size_t buckets=policy==ycsbc::RpcQueueRouter::Policy::Fixed ? clients : 2;
+    queue=new(shared_atomic_memory().malloc(sizeof(*queue))) ycsbc::UbReadQueue(clients,2,0,buckets,policy);
     for(const void* p:{static_cast<const void*>(queue),queue->request_storage(),queue->message_storage()})
       require(reinterpret_cast<uintptr_t>(p)>=0x400000000000ul && reinterpret_cast<uintptr_t>(p)<0x400008000000ul,"RPC storage is not in shared NC");
   }
@@ -79,19 +81,22 @@ void queue_contract(bool owner,int in,int out) {
     }
     require(!queue->serve_one([](uint64_t,uintptr_t&){return -1;}),"queue contains a duplicate");
   } else {
+    ycsbc::RpcQueueRouter router(queue->buckets(),queue->policy());
     for(int bad:{-1,clients}) {
       bool rejected=false;uintptr_t value=0;
-      try { queue->read(bad,0,value); } catch(const std::runtime_error&) { rejected=true; }
+      try { queue->read(bad,0,value,router); } catch(const std::runtime_error&) { rejected=true; }
       require(rejected,"invalid client accepted");
     }
     std::vector<std::thread> threads;
-    for(int c=0;c<clients;++c) threads.emplace_back([queue,c] {
+    for(int c=0;c<clients;++c) threads.emplace_back([queue,c,&router] {
       for(int i=0;i<queue_rounds;++i) {
         uint64_t key=uint64_t(c*queue_rounds+i);uintptr_t value=0;
-        require(queue->read(c,key,value)==int(key%3) && value==(key^0x12345678),"stale/cross-client RPC response");
+        require(queue->read(c,key,value,router)==int(key%3) && value==(key^0x12345678),"stale/cross-client RPC response");
       }
     });
     for(auto& thread:threads) thread.join();
+    for(size_t bucket=0;bucket<router.buckets();++bucket)
+      require(router.outstanding(bucket)==0,"RPC outstanding count leaked");
   }
   barrier(in,out);
   if(owner) queue->~UbReadQueue();
@@ -358,7 +363,12 @@ void index_contract(bool owner,bool rpc,const std::string& index,int in,int out)
   }
 }
 void run(bool owner,const std::string& mode,int in,int out) {
-  const bool queue=mode=="queue",rpc=mode.find("+rpc")!=std::string::npos;
+  const bool queue=mode=="queue";
+  const bool rpc=mode.find("+rpc")!=std::string::npos
+#ifdef USE_MSG_QUEUE
+      || queue // Queue-only assertions also need the RPC session/CPU setup.
+#endif
+      ;
   const std::string index=queue?"bwtree":mode.substr(0,mode.find('+'));
   const std::string access=index=="sherman"?mode.substr(mode.find('+')+1):"cache";
   setenv("YCSB_UB_SUITE","1",1);setenv("YCSB_UB_RPC",rpc?"1":"0",1);

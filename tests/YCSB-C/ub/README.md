@@ -66,7 +66,8 @@ A 的 workload 仍全读，B 的 workload 仍为 90% read / 10% update；B 更�
 由 A 的服务线程更新 A 的本地索引。
 
 复用 `db/thread_pool.cc` 的工作线程循环、随机桶遍历和空队列 pause/yield，以及
-`shm-lib/include/msg/mpmc_queue.h` 的 MPMCQueue。每个方向按 client 分桶，跨进程只传 slot ID 和 value 字节，
+`shm-lib/include/msg/mpmc_queue.h` 的 MPMCQueue。每个方向默认按接收端服务线程数分桶，
+按未完成 RPC 数选择队列（`RPC_QUEUE_POLICY=fixed` 恢复按 client 分桶），跨进程只传 slot ID 和 value 字节，
 每个 client 最多一个在途请求。共享 NC 只保存队列、请求/回复 payload、启动描述及跨机同步；
 索引控制对象、原子元数据、节点、value 都在所属机器的 DRAM，RPC 模式不创建 CACHE 映射。
 读回复和更新请求传递完整 value 字节；对端不会解引用发送方的 DRAM 指针。
@@ -552,6 +553,20 @@ YCSB_BACKEND=ub YCSB_INDEXES=bwtree \
 `YCSB_BUILD_READONLY_RPC_CONTRACT=1` 可通过原 build.sh 构建 `readonly_rpc_contract`；
 RPC contract 使用 `rpc` variant，验证完整 64 字节 value、远端更新后的独立副本、路由和
 索引活动不额外分配 NC。fixture 不代表真实 UB 硬件或缓存一致性验证。
+
+多进程 RPC 默认使用 `RPC_QUEUE_POLICY=least-outstanding`：每个接收端按服务线程数
+建立远端请求队列，发送端选择未完成请求最少的队列，随机起点打散相同负载的选择；
+队列满或竞争失败时尝试同一接收端的其他队列。响应槽仍按客户端独占，路由不会改变
+key 的所属分区。`RPC_QUEUE_POLICY=random` 保留随机选队列及失败重试，便于比较；
+`RPC_QUEUE_POLICY=fixed` 恢复原先每客户端一个队列的固定路由。由 B 在创建共享队列时
+确定策略，A 按共享配置执行；`RPC_PARTITION` 日志记录实际策略和发送目标队列数。
+
+Outstanding 统计的是远端队列中已提交但尚未消费响应的 RPC，覆盖排队、执行及返回等待。
+每组队列只有一个对端发送进程，因此计数由该发送进程的所有客户端线程共享，放在本地
+DRAM，避免新增 UB/NC 原子访问；它不包括接收端线程池的本地任务，也不是服务端总负载。
+目前仍是每客户端线程最多一条在途请求，尚未接入协程窗口或自适应限流。
+同一选项构建的 `rpc_queue_router_contract` 验证慢队列避让、失败提交回滚和并发计数；
+`readonly_rpc_contract queue` 验证多客户端共享较少队列时的跨进程响应隔离。
 
 CXL 全矩阵每项保存 `A/`、`B/` 的 worker/control 日志和 `cxl.json` 映射信息。
 `--cases bwtree clevelhash+rpc` 可选择失败项重测，默认仍为全部八项。

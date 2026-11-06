@@ -4,6 +4,7 @@
 #endif
 
 #include "msg/mpmc_queue.h"
+#include "db/rpc_queue_router.h"
 #include "shm/mm.h"
 #include <stdexcept>
 #include <thread>
@@ -27,16 +28,21 @@ private:
   MPMCQueue<uint32_t>* requests_;
   Message* messages_;
   const int clients_;
+  const size_t buckets_;
+  const RpcQueueRouter::Policy policy_;
   const size_t value_bytes_, payload_stride_;
   char* payloads_=nullptr;
 
  public:
-  explicit UbReadQueue(int clients, size_t capacity=256, size_t value_bytes=0)
-      : clients_(clients), value_bytes_(value_bytes),
+  explicit UbReadQueue(int clients, size_t capacity=256, size_t value_bytes=0,
+                      size_t buckets=0,
+                      RpcQueueRouter::Policy policy=RpcQueueRouter::Policy::LeastOutstanding)
+      : clients_(clients), buckets_(buckets ? buckets : size_t(clients)), policy_(policy), value_bytes_(value_bytes),
         payload_stride_((value_bytes+63)&~size_t(63)) {
     if(clients<1 || clients>192) throw std::runtime_error("Invalid UB RPC client count");
-    requests_=static_cast<MPMCQueue<uint32_t>*>(shared_atomic_memory().malloc(sizeof(*requests_)*clients));
-    for(int i=0;i<clients;++i) new(requests_+i) MPMCQueue<uint32_t>(capacity);
+    if(!buckets_ || buckets_>192) throw std::runtime_error("Invalid UB RPC bucket count");
+    requests_=static_cast<MPMCQueue<uint32_t>*>(shared_atomic_memory().malloc(sizeof(*requests_)*buckets_));
+    for(size_t i=0;i<buckets_;++i) new(requests_+i) MPMCQueue<uint32_t>(capacity);
     messages_=static_cast<Message*>(shared_atomic_memory().malloc(sizeof(Message)*clients));
     for(int i=0;i<clients;++i) new(messages_+i) Message;
     if(value_bytes_) payloads_=static_cast<char*>(shared_atomic_memory().malloc(payload_stride_*clients));
@@ -46,16 +52,18 @@ private:
   ~UbReadQueue() {
     for(int i=0;i<clients_;++i) messages_[i].~Message();
     shared_atomic_memory().free(messages_);
-    for(int i=0;i<clients_;++i) requests_[i].~MPMCQueue<uint32_t>();
+    for(size_t i=0;i<buckets_;++i) requests_[i].~MPMCQueue<uint32_t>();
     shared_atomic_memory().free(requests_);
     if(payloads_) shared_atomic_memory().free(payloads_);
     // The existing queue's slot storage belongs to the session's NC arena.
   }
-  int read(int client,uint64_t key,uintptr_t& value) {
-    return request(client,Operation::Read,key,value);
+  int read(int client,uint64_t key,uintptr_t& value,RpcQueueRouter& router) {
+    return request(client,Operation::Read,key,value,router);
   }
-  int request(int client,Operation operation,uint64_t key,uintptr_t& value) {
+  int request(int client,Operation operation,uint64_t key,uintptr_t& value,RpcQueueRouter& router) {
     if(client<0 || client>=clients_) throw std::runtime_error("Invalid UB RPC client slot");
+    if(router.buckets()!=buckets_ || router.policy()!=policy_)
+      throw std::runtime_error("RPC router does not match destination queues");
     auto& message=messages_[client];
     message.key=key;
     message.operation=operation;
@@ -64,8 +72,15 @@ private:
       std::memcpy(payloads_+client*payload_stride_,reinterpret_cast<const void*>(value),value_bytes_);
     }
     const uint64_t sequence=++message.sequence;
+    // Per-client PRNG state needs no shared atomic or allocation on this path.
+    thread_local uint64_t random=uint64_t(client)+0x9e3779b97f4a7c15ULL;
+    random^=random>>12; random^=random<<25; random^=random>>27;
+    const size_t start=(random*0x2545f4914f6cdd1dULL)%buckets_;
     // Queue release/acquire publishes the NC request fields to the server.
-    while(!requests_[client].try_enqueue(uint32_t(client))) relax();
+    size_t destination;
+    while((destination=router.try_submit(client,start,[&](size_t bucket) {
+      return requests_[bucket].try_enqueue(uint32_t(client));
+    }))==RpcQueueRouter::no_bucket) relax();
     while(message.response_sequence.load(std::memory_order_acquire)!=sequence)
       relax();
     if(operation==Operation::Read && value_bytes_ && message.result==0) {
@@ -75,6 +90,7 @@ private:
       std::memcpy(response.data(),payloads_+client*payload_stride_,value_bytes_);
       value=reinterpret_cast<uintptr_t>(response.data());
     } else value=message.value;
+    router.complete(destination);
     return message.result;
   }
   template<class Read> bool serve_one(Read&& read) {
@@ -90,13 +106,14 @@ private:
     asm volatile("yield" ::: "memory");
 #endif
   }
-  size_t buckets() const { return clients_; }
+  size_t buckets() const { return buckets_; }
+  RpcQueueRouter::Policy policy() const { return policy_; }
   template<class Execute> bool serve_request(Execute&& execute) {
-    for(int i=0;i<clients_;++i) if(serve_bucket(i,execute)) return true;
+    for(size_t i=0;i<buckets_;++i) if(serve_bucket(i,execute)) return true;
     return false;
   }
   template<class Execute> bool serve_bucket(size_t bucket, Execute&& execute) {
-    if(bucket>=size_t(clients_)) return false;
+    if(bucket>=buckets_) return false;
     uint32_t client;
     if(!requests_[bucket].try_dequeue(client)) return false;
     if(client>=unsigned(clients_)) throw std::runtime_error("Invalid queued UB RPC client");

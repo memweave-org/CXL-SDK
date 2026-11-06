@@ -23,6 +23,8 @@ def main():
     parser.add_argument('--fixture', action='store_true')
     parser.add_argument('--cxl-node', default='4')
     parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--queue-policy', choices=('least-outstanding', 'random', 'fixed'),
+                        default='least-outstanding')
     args = parser.parse_args()
     if args.backend == 'ub' and not args.fixture:
         parser.error('Local UB test requires --fixture and a file-backed SDK')
@@ -44,6 +46,7 @@ def main():
         cxl_objects = Path(tempfile.mkdtemp(prefix='ycsb-mq-contract-', dir='/dev/shm')) if args.backend == 'cxl' else objects
         env = dict(os.environ, YCSB_BACKEND=args.backend, YCSB_UB_CASE='bwtree+rpc',
                    YCSB_UB_BUNDLE=str(args.bundle.resolve()), B_IP='127.0.0.1',
+                   RPC_QUEUE_POLICY=args.queue_policy,
                    PORT=str(port), THREADS_A=str(a), THREADS_B=str(b),
                    CPU_B=str(cpus[0]), CPU_A=str(cpus[2*b]), RECORDS='1024', OPS='2000',
                    SIZE_MB='1024', NC_SIZE_MB='256', YCSB_UB_FIXTURE=str(int(args.fixture)),
@@ -70,6 +73,9 @@ def main():
                 assert result['rpc_sent'] == report[peer]['rpc_completed']
                 text = (directory/role/'worker.log').read_text()
                 assert 'transport=original-mq-thread-pool' in text
+                assert f'queue_policy={args.queue_policy} ' in text
+                buckets = (a if role == 'A' else b) if args.queue_policy == 'fixed' else (b if role == 'A' else a)
+                assert f'outgoing_buckets={buckets} ' in text
             reports.append({'threads_A': a, 'threads_B': b, 'result': report})
             print(f'PASS {args.backend}: A={a}, B={b}, original MQ, 4000 operations', flush=True)
         finally:
@@ -87,6 +93,7 @@ def main():
                 shutil.rmtree(cxl_objects)
     (out/'verification.json').write_text(json.dumps({
         'pass': True, 'backend': args.backend, 'fixture': args.fixture,
+        'queue_policy': args.queue_policy,
         'implementation': 'cc_nocc_mq / original ThreadPool / original MPMCQueue',
         'rounds': reports}, indent=2)+'\n')
 

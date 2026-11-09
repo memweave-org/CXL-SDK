@@ -579,6 +579,11 @@ void index_contract(bool owner,bool rpc,const std::string& index,int in,int out)
         require(db->ReadInternal(k+1,value)==ycsbc::DB::kOK,"read failed");
         const bool old=value==handles.old_values+k*64, fresh=value==handles.new_values+k*64;
         require((phase==0 || !replace_existing)?old:phase==2?fresh:(old||fresh),"wrong index value");
+        if (index == "bwtree" && !rpc) {
+          uintptr_t missing = 0;
+          require(db->ReadInternal(keys + 100, missing) == ycsbc::DB::kErrorNoData,
+                  "missing read reused a previous query's result");
+        }
       }
       db->ThreadClose(tid);
     });

@@ -170,7 +170,10 @@ int BwTreeDB::ReadInternal(uint64_t key, uintptr_t &value) {
 #ifdef TRX_TYPE_STAT
   read_cnt.fetch_add(1);
 #endif
-  std::vector<long> val;
+  // Default allocator uses local DRAM. Retain capacity across synchronous
+  // queries on this thread; no result buffer is published to another worker.
+  thread_local std::vector<long> val;
+  val.clear();
   tree->GetValue(key, val);
   if (val.size() == 0) {
     return DB::kErrorNoData;

@@ -742,17 +742,11 @@ public:
   }
 
   void set_thread_num(size_type num) {
-    if (thread_num.load() > 0) {
-      // Reclaim the memory in persistent buffers allocated in previous
-      // round of set_thread_num.
-      tmp_meta.clear();
-      tmp_level.clear();
-      tmp_entry.clear();
-
 #ifdef OPT_CLEVEL_ROOT_READ
+    if (thread_num.load() > 0) {
       meta_replicas.clear();
-#endif
     }
+#endif
 
     thread_num = num + 1;
 
@@ -767,10 +761,6 @@ public:
     }
 #endif
 
-    // Setup persistent buffers according to the thread_num.
-    tmp_meta.resize(thread_num);
-    tmp_level.resize(thread_num);
-    tmp_entry.resize(thread_num);
 #ifdef OPT_CLEVEL_ROOT_READ
     meta_replicas.resize(thread_num);
     // replica_ptrs has fixed size, no need to resize
@@ -857,11 +847,6 @@ public:
   // every losing writer can allocate a full new bucket array simultaneously.
   atomic_type<bool> expansion_allocating{false};
 #endif
-  // Array for each thread
-  clevel_vector<level_meta *> tmp_meta;
-  clevel_vector<level_bucket *> tmp_level;
-  clevel_vector<value_type *> tmp_entry;
-
   std::thread expand_thread;
 
 #ifdef CLEVEL_DOUBLE_READ_COUNT
@@ -918,9 +903,11 @@ clevel_hash<Key, T, Hash, KeyEqual, HashPower>::search(
       // Flush two buckets simultaneously to reduce the overhead.
       for (size_type j = 0; j < assoc_num; j++) {
         KV_entry_ptr_s slot = f_b.slots[j];
-        if (slot.partial() == partial && slot.addr() != nullptr) {
-          if (key_equal{}(slot.addr()->first, key)) {
-            return ret(i, f_idx, j, slot.addr());
+        if (slot.partial() == partial) {
+          // Acquire this immutable KV once, then reuse the same snapshot.
+          auto* value = slot.addr();
+          if (value && key_equal{}(value->first, key)) {
+            return ret(i, f_idx, j, value);
           }
         }
       }
@@ -930,9 +917,11 @@ clevel_hash<Key, T, Hash, KeyEqual, HashPower>::search(
 #endif
       for (size_type j = 0; j < assoc_num; j++) {
         KV_entry_ptr_s slot = s_b.slots[j];
-        if (slot.partial() == partial && slot.addr() != nullptr) {
-          if (key_equal{}(slot.addr()->first, key)) {
-            return ret(i, s_idx, j, slot.addr());
+        if (slot.partial() == partial) {
+          // Acquire this immutable KV once, then reuse the same snapshot.
+          auto* value = slot.addr();
+          if (value && key_equal{}(value->first, key)) {
+            return ret(i, s_idx, j, value);
           }
         }
       }
@@ -1336,9 +1325,10 @@ clevel_hash<Key, T, Hash, KeyEqual, HashPower>::generic_insert(
   hv_type hv = hasher{}(key);
   partial_t partial = get_partial(hv);
 
-  difference_type t_id = static_cast<difference_type>(thread_id);
-  allocate_KV(tmp_entry[t_id], param);
-  KV_entry_ptr_s created(tmp_entry[t_id]);
+  // The candidate pointer is operation-local; the allocated KV stays shared.
+  value_type* candidate_entry = nullptr;
+  allocate_KV(candidate_entry, param);
+  KV_entry_ptr_s created(candidate_entry);
   created.set_partial(partial);
 
   bool expanded_flag = false;
@@ -1392,7 +1382,7 @@ clevel_hash<Key, T, Hash, KeyEqual, HashPower>::generic_insert(
     }
 
     if (result == FOUND_IN_LEFT || result == FOUND_IN_RIGHT) {
-      destroy_shared_value(tmp_entry[t_id]);
+      destroy_shared_value(candidate_entry);
       return ret(level_num, 0, 0);
     } else if ((result == VACANCY_IN_LEFT || result == VACANCY_IN_RIGHT) &&
                (level_num > 0 || !m->is_resizing)) {
@@ -1576,9 +1566,10 @@ clevel_hash<Key, T, Hash, KeyEqual, HashPower>::generic_update(
   hv_type hv = hasher{}(key);
   partial_t partial = get_partial(hv);
 
-  difference_type t_id = static_cast<difference_type>(thread_id);
-  allocate_KV(tmp_entry[t_id], param);
-  KV_entry_ptr_s created(tmp_entry[t_id]);
+  // The candidate pointer is operation-local; the allocated KV stays shared.
+  value_type* candidate_entry = nullptr;
+  allocate_KV(candidate_entry, param);
+  KV_entry_ptr_s created(candidate_entry);
   created.set_partial(partial);
 
 #ifdef NO_CC
@@ -1644,7 +1635,7 @@ clevel_hash<Key, T, Hash, KeyEqual, HashPower>::generic_update(
       }
     } else {
       if (!succ_update) {
-        destroy_shared_value(tmp_entry[t_id]);
+        destroy_shared_value(candidate_entry);
       }
       // Even the updated item is deleted by other threads, our update
       // succeeds anyway.
@@ -1679,18 +1670,20 @@ void clevel_hash<Key, T, Hash, KeyEqual, HashPower>::expand(
   if (meta.load() != m_copy) return;
 #endif
 #endif
-  difference_type t_id = static_cast<difference_type>(thread_id);
+  // Scratch pointers stay on this thread's stack, outside shared arenas.
+  level_bucket* candidate_level = nullptr;
+  level_meta* candidate_meta = nullptr;
   level_bucket *cl = m_copy->first_level;
 
   if (cl->up.load() == nullptr) {
 #ifdef USE_CXL
-    tmp_level[t_id] = new (shared_atomic_memory(clevel_memory()).malloc(sizeof(struct level_bucket))) level_bucket();
-    if (tmp_level[t_id] == nullptr) {
+    candidate_level = new (shared_atomic_memory(clevel_memory()).malloc(sizeof(struct level_bucket))) level_bucket();
+    if (candidate_level == nullptr) {
       printf("Thread-%lu: Failed to allocate memory for level_bucket\n", thread_id);
       exit(1);
     }
 #else
-    tmp_level[t_id] = new level_bucket();
+    candidate_level = new level_bucket();
 #endif
     size_type new_capacity = cl->capacity * 2;
 #ifdef CLEVEL_DEBUG
@@ -1699,24 +1692,24 @@ void clevel_hash<Key, T, Hash, KeyEqual, HashPower>::expand(
 #endif
 
     /* delay malloc until the CAS succeeds */
-    tmp_level[t_id]->allocate(new_capacity);
-    tmp_level[t_id]->capacity = new_capacity;
-    tmp_level[t_id]->up = nullptr;
+    candidate_level->allocate(new_capacity);
+    candidate_level->capacity = new_capacity;
+    candidate_level->up = nullptr;
 
     // Append a new level.
     level_bucket *expected = nullptr;
 #ifdef NO_CC
-    clwb(tmp_level[t_id], sizeof(level_bucket));
+    clwb(candidate_level, sizeof(level_bucket));
 #endif
-    bool rc = cl->up.compare_exchange_strong(expected, tmp_level[t_id]);
+    bool rc = cl->up.compare_exchange_strong(expected, candidate_level);
 
     if (rc == false) {
       // Ohter threads finished expanding
-      tmp_level[t_id]->clear();
+      candidate_level->clear();
 #ifdef USE_CXL
-      shared_atomic_memory(clevel_memory()).free(tmp_level[t_id]);
+      shared_atomic_memory(clevel_memory()).free(candidate_level);
 #else
-      delete tmp_level[t_id];
+      delete candidate_level;
 #endif
     }
 
@@ -1725,29 +1718,29 @@ void clevel_hash<Key, T, Hash, KeyEqual, HashPower>::expand(
       if (cl->capacity >= new_capacity) {
         // Help updating meta
 #ifdef USE_CXL
-        tmp_meta[t_id] =
+        candidate_meta =
             new (level_meta_memory().malloc(sizeof(level_meta))) level_meta(m_copy->first_level, m_copy->last_level, true);
 #else
-        tmp_meta[t_id] = new level_meta(m_copy->first_level, m_copy->last_level, true);
+        candidate_meta = new level_meta(m_copy->first_level, m_copy->last_level, true);
 #endif
       } else {
 #ifdef USE_CXL
         assert(cl->up.load() != nullptr);
-        tmp_meta[t_id] =
+        candidate_meta =
             new (level_meta_memory().malloc(sizeof(level_meta))) level_meta(cl->up.load(), m_copy->last_level, true);
 #else
-        tmp_meta[t_id] = new level_meta(cl->up.load(), m_copy->last_level, true);
+        candidate_meta = new level_meta(cl->up.load(), m_copy->last_level, true);
 #endif
       }
 
 #ifdef NO_CC
-      clwb(tmp_meta[t_id], sizeof(level_meta));
+      clwb(candidate_meta, sizeof(level_meta));
 #endif
 
 #ifdef OPT_CLEVEL_ROOT_READ
-      if (help_update->cas_ptr(m_copy, tmp_meta[t_id])) {
+      if (help_update->cas_ptr(m_copy, candidate_meta)) {
 #else
-      if (meta.compare_exchange_strong(m_copy, tmp_meta[t_id])) {
+      if (meta.compare_exchange_strong(m_copy, candidate_meta)) {
 #endif
 // #ifdef CLEVEL_DEBUG
         std::cout << "Thread-" << thread_id
@@ -1757,12 +1750,12 @@ void clevel_hash<Key, T, Hash, KeyEqual, HashPower>::expand(
         break;
       } else {
 #ifdef USE_CXL
-        level_meta_memory().free(tmp_meta[t_id]);
+        level_meta_memory().free(candidate_meta);
 #else
-        delete tmp_meta[t_id];
+        delete candidate_meta;
 #endif
 #ifdef OPT_CLEVEL_ROOT_READ
-        m_copy = help_update->load_ptr(t_id);
+        m_copy = help_update->load_ptr(thread_id);
 #else
         m_copy = meta.load();
 #endif
@@ -1790,26 +1783,26 @@ void clevel_hash<Key, T, Hash, KeyEqual, HashPower>::expand(
         // Help updating meta
         if (cl->capacity >= new_capacity) {
 #ifdef USE_CXL  
-          tmp_meta[t_id] =
+          candidate_meta =
               new (level_meta_memory().malloc(sizeof(level_meta))) level_meta(m_copy->first_level, m_copy->last_level, true);
 #else
-        tmp_meta[t_id] = new level_meta(m_copy->first_level, m_copy->last_level, true);
+        candidate_meta = new level_meta(m_copy->first_level, m_copy->last_level, true);
 #endif
         } else {
           assert(cl->up != nullptr);
 #ifdef USE_CXL
-          tmp_meta[t_id] = new (level_meta_memory().malloc(sizeof(level_meta))) level_meta(cl->up, m_copy->last_level, true);
+          candidate_meta = new (level_meta_memory().malloc(sizeof(level_meta))) level_meta(cl->up, m_copy->last_level, true);
 #else
-          tmp_meta[t_id] = new level_meta(cl->up, m_copy->last_level, true);
+          candidate_meta = new level_meta(cl->up, m_copy->last_level, true);
 #endif
         }
 #ifdef NO_CC
-    clwb(tmp_meta[t_id], sizeof(level_meta));
+    clwb(candidate_meta, sizeof(level_meta));
 #endif
 #ifdef OPT_CLEVEL_ROOT_READ
-        if (help_update->cas_ptr(m_copy, tmp_meta[t_id])) {
+        if (help_update->cas_ptr(m_copy, candidate_meta)) {
 #else
-        if (meta.compare_exchange_strong(m_copy, tmp_meta[t_id])) {
+        if (meta.compare_exchange_strong(m_copy, candidate_meta)) {
 #endif
 #ifdef CLEVEL_DEBUG
           std::cout << "Thread-" << thread_id
@@ -1819,9 +1812,9 @@ void clevel_hash<Key, T, Hash, KeyEqual, HashPower>::expand(
           break;
         } else {
 #ifdef USE_CXL
-          level_meta_memory().free(tmp_meta[t_id]);
+          level_meta_memory().free(candidate_meta);
 #else
-          delete tmp_meta[t_id];
+          delete candidate_meta;
 #endif
 #ifdef OPT_CLEVEL_ROOT_READ
           m_copy = help_update->load_ptr(thread_id);
@@ -1851,7 +1844,7 @@ void clevel_hash<Key, T, Hash, KeyEqual, HashPower>::resize() {
 #else
   size_type thread_id = SimThreadInfo::worker_thread_count - 1;
 #endif
-  difference_type t_id = static_cast<difference_type>(thread_id);
+  level_meta* candidate_meta = nullptr;
   difference_type expand_bucket = 0;
 
   while (run_expand_thread.load()) {
@@ -1964,19 +1957,19 @@ void clevel_hash<Key, T, Hash, KeyEqual, HashPower>::resize() {
             li = li->up;
           }
 #ifdef USE_CXL
-          tmp_meta[t_id] = new (level_meta_memory().malloc(sizeof(level_meta))) level_meta(m->first_level, bl->up, levels_left != 2);
+          candidate_meta = new (level_meta_memory().malloc(sizeof(level_meta))) level_meta(m->first_level, bl->up, levels_left != 2);
 #else
-          tmp_meta[t_id] = new level_meta(m->first_level, bl->up, levels_left != 2);
+          candidate_meta = new level_meta(m->first_level, bl->up, levels_left != 2);
 #endif
 
 #ifdef NO_CC
-    clwb(tmp_meta[t_id], sizeof(level_meta));
+    clwb(candidate_meta, sizeof(level_meta));
 #endif
 
 #ifdef OPT_CLEVEL_ROOT_READ
-          if (help_update != nullptr && help_update->cas_ptr(m, tmp_meta[t_id])) {
+          if (help_update != nullptr && help_update->cas_ptr(m, candidate_meta)) {
 #else
-          if (meta.compare_exchange_strong(m, tmp_meta[t_id])) {
+          if (meta.compare_exchange_strong(m, candidate_meta)) {
 #endif
 #ifdef CLEVEL_UB_LEVEL_GC
             retire_level(bl);
@@ -1992,9 +1985,9 @@ void clevel_hash<Key, T, Hash, KeyEqual, HashPower>::resize() {
             break;
           } else {
 #ifdef USE_CXL
-            level_meta_memory().free(tmp_meta[t_id]);
+            level_meta_memory().free(candidate_meta);
 #else
-            delete tmp_meta[t_id];
+            delete candidate_meta;
 #endif
 #ifdef OPT_CLEVEL_ROOT_READ
             m = help_update->load_ptr(SimThreadInfo::worker_thread_id);

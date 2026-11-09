@@ -12,6 +12,7 @@
 #include <thread>
 #include <type_traits>
 #include <unordered_map>
+#include <vector>
 #include <unistd.h>
 #include "dram_mapping_cache.h"
 
@@ -69,7 +70,7 @@ struct MappingInvalidationTicket {
   size_t producer = 0;
 };
 
-// The producer enumerates allocation ranges into shared NC memory. Receivers
+// The producer publishes allocation ranges in CACHE memory. Receivers
 // must never traverse a retired CACHE node: its own replica may already be stale.
 struct CachelineRange {
   const void* address;
@@ -82,11 +83,17 @@ struct CachelineInvalidation {
 
 // One single-writer broadcast ring per GC worker. Producers do not share a
 // tail, reservation CAS or lock, and there is no ordering between their rings.
-// Capacity counts batches; payload lives in NC, ordered by published/ACK.
+// Capacity counts batches; payload is published/acquired before use, and
+// remains immutable until ACK. Only the control counters require NC atomics.
 // Producer IDs are the stable GC thread IDs, never shared concurrently.
 // 512 covers the coordinated runner's maximum of 192 workers on each host.
+struct CoherentChannelMaintenance {
+  static void publish(const void*, size_t) {}
+  static void acquire(const void*, size_t) {}
+};
 template <template<class> class Atomic, size_t Capacity = 16, size_t Processes = 16,
-          size_t Producers = 512, size_t BatchSize = 64>
+          size_t Producers = 512, size_t BatchSize = 64,
+          class Maintenance = CoherentChannelMaintenance>
 class MappingInvalidationChannel {
   static_assert(Capacity > 0 && Processes > 0 && Processes <= 64 &&
                 Producers > 0 && BatchSize > 0, "channel bounds");
@@ -118,6 +125,17 @@ class MappingInvalidationChannel {
 public:
   static constexpr size_t batch_size = BatchSize;
   static constexpr size_t producer_limit = Producers;
+
+  // Untimed layout validation can inspect every control word and payload.
+  template<class Control, class Payload> void visit_storage(Control control, Payload payload) const {
+    control(active_); control(producer_count_);
+    for (const auto& word : registered_) control(word);
+    for (const auto& lane : lanes_) {
+      control(lane.published.value);
+      for (const auto& ack : lane.consumers) control(ack.value);
+      payload(lane.batches.data(), sizeof(lane.batches));
+    }
+  }
 
   // The cache is empty, and local readers start only after attach returns.
   // New readers cannot hold nodes retired before their registration. Start
@@ -166,6 +184,7 @@ public:
       batch.nodes[i] = ids[i];
       batch.invalidations[i] = invalidations ? invalidations[i] : CachelineInvalidation{};
     }
+    Maintenance::publish(&batch, sizeof(batch));
     lane.published.value.store(head + 1, std::memory_order_release);
     return {head + 1, recipients, producer};
   }
@@ -186,6 +205,7 @@ public:
     if (ack == end) return false;
     while (ack < end) {
       const auto& batch = lane.batches[ack % Capacity];
+      Maintenance::acquire(&batch, sizeof(batch));
       if (!clear_batch(batch.nodes.data(), batch.invalidations.data(), batch.count)) break;
       ++ack;
     }
@@ -231,6 +251,31 @@ public:
 };
 
 namespace bwtree_process_cache {
+// Process-private only. Attaching a new tree invalidates old lifetime stamps.
+inline std::atomic<uint64_t>& acquisition_generation() {
+  static std::atomic<uint64_t> generation{1};
+  return generation;
+}
+// Retirements invalidate only the pages containing retired allocations. Hash
+// collisions conservatively invalidate extra acquisitions, never preserve one.
+// These are native DRAM atomics, not shared NC index metadata.
+inline auto& acquisition_versions() {
+  static std::array<std::atomic<uint64_t>, 1 << 18> versions{};
+  return versions;
+}
+inline uint64_t acquisition_version(const void* address) {
+  const auto page = reinterpret_cast<uintptr_t>(address) >> 12;
+  auto& versions = acquisition_versions();
+  return versions[page % versions.size()].load(std::memory_order_acquire);
+}
+inline void invalidate_acquisitions(const void* address, size_t bytes) {
+  if (!bytes) return;
+  const auto first = reinterpret_cast<uintptr_t>(address) >> 12;
+  const auto last = (reinterpret_cast<uintptr_t>(address) + bytes - 1) >> 12;
+  auto& versions = acquisition_versions();
+  for (auto page = first; page <= last; ++page)
+    versions[page % versions.size()].fetch_add(1, std::memory_order_release);
+}
 struct Service {
   std::atomic<bool> live{false};
   virtual void stop() = 0;
@@ -254,13 +299,20 @@ inline void shutdown() {
 
 // One table per process and tree, shared by its local worker threads. Owning
 // pointers, receiver thread and registry all live outside the shared tree.
-template <size_t Entries, template<class> class Atomic> class ProcessMappingCache {
+template <size_t Entries, template<class> class Atomic,
+          class Maintenance = CoherentChannelMaintenance> class ProcessMappingCache {
 public:
   using Table = std::array<MessageMappingCacheSlot, Entries>;
-  using Channel = MappingInvalidationChannel<Atomic>;
+  using Channel = MappingInvalidationChannel<Atomic, 16, 16, 512, 64, Maintenance>;
+  // Per-worker bookkeeping belongs to this process, never to shared NC memory.
+  struct alignas(64) EpochPublication {
+    uint64_t published_epoch = std::numeric_limits<uint64_t>::max();
+    unsigned operations_until_refresh = 0;
+  };
 private:
   struct State : bwtree_process_cache::Service {
     const void* owner;
+    std::vector<EpochPublication> epoch_publications;
     Channel& channel;
     size_t process;
     std::unique_ptr<DramMappingCache<Table, 1>> table;
@@ -273,12 +325,13 @@ private:
     std::thread receiver;
     State(const void* key, Channel& shared, size_t id,
           std::function<void(CachelineInvalidation)> invalidator,
-          std::function<uint64_t()> begin, std::function<bool(uint64_t)> complete)
-        : owner(key), channel(shared), process(id), invalidate_lines(std::move(invalidator)),
+          std::function<uint64_t()> begin, std::function<bool(uint64_t)> complete, size_t epoch_workers)
+        : owner(key), epoch_publications(epoch_workers), channel(shared), process(id), invalidate_lines(std::move(invalidator)),
           begin_grace(std::move(begin)), grace_complete(std::move(complete)) {
       if (bool(begin_grace) != bool(grace_complete))
         throw std::logic_error("BwTree invalidation requires both grace callbacks");
       if constexpr (Entries != 0) table = std::make_unique<DramMappingCache<Table, 1>>();
+      bwtree_process_cache::acquisition_generation().fetch_add(1, std::memory_order_release);
       channel.attach(process);
       try {
         receiver = std::thread([this] {
@@ -352,12 +405,36 @@ public:
   static void prepare(const void* owner, Channel& channel, size_t process,
                       std::function<void(CachelineInvalidation)> invalidator = {},
                       std::function<uint64_t()> begin_grace = {},
-                      std::function<bool(uint64_t)> grace_complete = {}) {
+                      std::function<bool(uint64_t)> grace_complete = {},
+                      size_t epoch_workers = Channel::producer_limit) {
     auto& all = bwtree_process_cache::registry();
     std::lock_guard<std::mutex> guard(all.mutex);
     if (!all.states.count(owner))
       all.states.emplace(owner, std::make_shared<State>(owner, channel, process, std::move(invalidator),
-          std::move(begin_grace), std::move(grace_complete)));
+          std::move(begin_grace), std::move(grace_complete), epoch_workers));
+    else {
+      auto state = std::dynamic_pointer_cast<State>(all.states.at(owner));
+      if (!state) throw std::logic_error("BwTree epoch cache type mismatch");
+      // Thread-count changes already require quiescent workers.
+      if (state->epoch_publications.size() < epoch_workers)
+        state->epoch_publications.resize(epoch_workers);
+    }
+  }
+  static EpochPublication& epoch_publication(const void* owner, size_t worker) {
+    return bound(owner).epoch_publications.at(worker);
+  }
+  // Called after the worker stops accessing the tree. The destructor can also
+  // unregister slots after their process-local service has already detached.
+  static void reset_epoch_publication(const void* owner, size_t worker) {
+    auto& all = bwtree_process_cache::registry();
+    std::lock_guard<std::mutex> guard(all.mutex);
+    auto found = all.states.find(owner);
+    if (found != all.states.end()) {
+      auto state = std::dynamic_pointer_cast<State>(found->second);
+      if (!state) throw std::logic_error("BwTree epoch cache type mismatch");
+      if (worker < state->epoch_publications.size())
+        state->epoch_publications[worker] = EpochPublication{};
+    }
   }
   static Table& table(const void* owner) {
     static_assert(Entries != 0, "NOOPT has no software mapping table");

@@ -62,6 +62,12 @@ BwTree/ClevelHash 继续使用已有启动 CACHE 失效及发布修复，A CACHE
 BwTree RPC 的本地 memkind 固定池允许 epoch GC 释放并复用旧节点；不能开启
 `retain_until_exit`，否则 `free()` 会变成空操作，加载/更新时的累计分配会耗尽池。
 `SIZE_MB` 控制每端本地池容量，整机空闲内存不会自动扩展该池；默认仍为 48 GiB。
+RPC 构建显式启用 `BWTREE_LOCAL_ONLY=1`：BwTree 节点、映射表、分配元数据和 epoch/GC
+描述符均使用本地 DRAM；原子字段采用原生 `std::atomic`。不创建跨机器失效通道或根副本，
+不转发远端 GC，不执行节点 cacheline 写回/失效，也不启动 GC flush 线程
+（包括设置 `BWTREE_GC_FLUSH_THREAD=1` 时）。回收只等待本地读者的 epoch。
+该开关只作用于树；双向 RPC 队列和会话同步仍使用原共享 NC 协议。
+`readonly_rpc_contract bwtree+rpc` 额外检查无分配器 TLS 覆盖时的本地放置及无对端 ACK 的回收。
 A 的 workload 仍全读，B 的 workload 仍为 90% read / 10% update；B 更新 A 所属的 key 时，
 由 A 的服务线程更新 A 的本地索引。
 
@@ -206,8 +212,18 @@ worker 队列、NOOPT 接收端退出。用显式屏障
 读端退出宽限期后，通过测试专用链接包装验证 CACHE 对象释放及旧地址复用，A 再次读取
 同一地址时必须看到新 header 和变长节点尾部内容。启用 `YCSB_UB_LOCAL_NCC=ON` 时该
 contract 也进行普通读写插桩，可用独立 CACHE 副本验证实际缓存行失效。
+`bwtree+cache-gc-pressure` 用 1,100 个退休节点填满 16×64 的通知队列，
+确认尾部仍未发布，再释放读者，检查重复 GC 调用最终回收全部节点。
 模拟构建的 `bwtree+cache-gc-no-invalidate` 是预期失败的负对照：仅在 A 完成启动失效后
 屏蔽后续失效，复用地址后必须报旧读或新内容校验失败，不能算作通过。
+epoch 的发布缓存和批次计数存放在每进程的 DRAM 状态中，每个注册 worker 独占一项。
+每 64 次 point operation 在入口刷新 epoch；批次期间保留旧 announcement，可能延后回收，
+不会绕过 epoch 或远端失效 ACK。注销会清空本地状态并发布 quiescence。
+`readonly_rpc_contract bwtree+epoch` 检查旧读者保护、批次推进和注销后的同 epoch 重入。
+`bwtree+cache-gc` 还检查同一 epoch 内注销后重新注册，确保活跃读者不会被误认为已经退出。
+`readonly_rpc_contract bwtree+growth` 使用 8 个 B 端写线程插入 16,384 个键，
+A 在写入期间读取已提交键，完成后检查所有值和不存在的键，覆盖并发分裂及跨进程读取。
+
 运行这些用例前仍须完成测试资源互斥检查；性能结论还需独占环境下的 OPT/NOOPT 对比。
 
 ## BwTree 线程数扫描与单项入口
@@ -242,7 +258,7 @@ CXL 模式复用原 `CXLSystemMemoryMmapper`、memkind 和 `QUEUE_SIM_CAS`，
 load/store/CAS 继续走原 `AtomicRequestQueue`；显式本地访问仍沿用原绕过逻辑。
 `clwb`/`clflush` 直接执行本机 cacheline 指令（x86 默认 CLWB/CLFLUSHOPT），
 不会因共享地址分区而转到 UB 的地址登记分支。节点发布仍在原来的位置写回，
-BwTree 不增加逐次读节点的 flush。编译时拒绝关闭 flush 或混用 UB 原子后端；
+BwTree 使用与 UB 相同的发布后节点获取和回收协议。编译时拒绝关闭 flush 或混用 UB 原子后端；
 启动日志显示 `atomic_backend=queue cache_maintenance=native`。
 两个进程仍走同一个 `peer.py`、原操作生成器和事务控制器：
 A 100% 读，B 90% 读/10% update，默认 OPT、fresh-insert、无 RPC。
@@ -310,8 +326,8 @@ bash ./run.sh
 
 | 对象 | 相同 VA | A | B | 内容 |
 | --- | --- | --- | --- | --- |
-| CACHE | `0x300000000000` | READ | RW | BwTree 节点、delta、value；ClevelHash OPT 的不可变 `level_meta` 和 helper 描述符 |
-| NONCACHE + WR_DELAY_COMP | `0x400000000000` | RW | RW | DB/树对象、映射表、epoch、原子根指针及副本槽、线程控制及原框架共享数组 |
+| CACHE | `0x300000000000` | READ | RW | BwTree 树/DB 对象、普通 GC 状态、B 本机原子、失效批次/范围描述符、节点、delta、value；ClevelHash OPT 的不可变 `level_meta` 和 helper 描述符 |
+| NONCACHE + WR_DELAY_COMP | `0x400000000000` | RW | RW | BwTree 显式 `nt` 映射表、根/副本槽、epoch 发布字和失效队列控制字；其他索引及原框架共享控制数组沿用其布局 |
 
 使用 `SHM_UB_SPLIT` 和独立的 UB NT backend：`UB_API=ubsm`（或 Memlink）
 在编译时为 `nt`、`aligned_nt`、`nt_pointer` 选择 `atomic_ub_*`，直接对对象所在的
@@ -324,12 +340,15 @@ ClevelHash OPT 的 `level_meta` 直接分配在共享 CACHE 区，初始化、�
 `meta` 和 `meta_replicas` 的原子指针字、层描述符及 bucket 槽仍在 NC。
 NOOPT 的 `level_meta` 保持原 NC 分配。失败发布的元数据从对应分配器释放，
 已发布版本继续保留到共享对象退出；两端需同步重新构建后运行。
-BwTree 读侧仅在映射启动时整区失效一次，后续节点和 value 直接读取，不执行
-逐节点/逐对象的首次读取 flush；写端发布新节点前仍执行原有写回。
+BwTree 的 UB/CXL 使用相同拆分：普通状态留在 CACHE，只有显式 `nt` 字段分配到 NC。
+`AllocationMeta::next` 和 OPT 的本机 epoch 保持 `std::atomic`，不进入 NC；A 通过独立
+NC epoch 发布字观察 B 的进度。失效批次及范围描述符在 CACHE 写回后发布，A 获取后读取。
+节点发布后首次获取会失效完整节点及边界键，防止预取带来的旧缓存；获取记录位于进程私有
+DRAM，在回收 ACK 前按内存页版本作废，不能跨地址复用沿用。写端保留发布前写回。
 UB 构建不编译 queue 模拟源文件；`UB_API=none` 的 NO_CC 模式继续使用原 queue backend。
 兼容参数 `nt=false` 不会绕过 UB 原子操作或 CACHE 地址检查。
 `run.sh` 自动设置 `UB_API=ubsm` 并重新编译，更新后仍用相同入口，无需额外 backend 参数。
-A 正常登记/注销 epoch，可写 NC 中的 OPT 元数据；没有额外改写 `GetType()`。
+A 正常登记/注销 epoch，只修改 NC 发布字和本进程 DRAM；不写 B 的 CACHE 对象。
 value 从 CACHE 分配并在发布前写回，避免把 B 的进程私有 malloc 指针传给 A。
 NC 的分配空间分成互不重叠的两半，分配偏移位于各进程本地。
 
@@ -457,10 +476,16 @@ A 首次读取 EMPTY 行时获取已写回的内容 → 后续复用缓存。
 单独 fence 不复制数据。已完整写回并发布的新 CoW 节点，在地址未提前进入缓存时
 可以直接读取；如果地址被预取或曾被读取，仍需相应失效协议。
 
-使用 Clang/LLVM 15 的编译插桩，覆盖优化后的普通 load/store、内存复制/清零、
-`memcmp/bcmp` 和显式 `__builtin_prefetch`。CACHE 中的原子操作会被拒绝，
-原子元数据必须在共享 NC 区。BwTree 不增加按对象首次使用刷新；ClevelHash 原有的
-KV pair 读取失效仍然执行，BwTree 则保留其 CoW 读路径。
+使用 Clang/LLVM 15 的编译插桩，覆盖优化后的普通 load/store、masked load/store、
+gather/scatter 的有效 lane、内存复制/清零、`memcmp/bcmp` 和显式 `__builtin_prefetch`。
+被 mask 关闭的 lane 不解引用；暂不支持的 scalable/packed masked 访存会在构建时拒绝。B 可用 CACHE 中的原生原子同步本机线程，
+这些访问仍标记脏行；A 对 CACHE 的原生原子访问会被拒绝，跨主机同步必须使用 NC 原子。
+BwTree 的布局 contract 另检查树/GC/分配链接和控制字的实际地址，拒绝把原生原子放入 NC。
+UB/CXL 的 chunk `tail`、NodeID 分配计数和 GC minimum 保持 NC `nt` 共享语义，
+不能因某次 workload 只有 B 写入而改成本机原子。进程 mapping cache 不分配旧的节点
+`status_flag`，OPT 根复制也不再分配未使用的 `root_id`。布局 contract 检查每个 chunk
+仅新增一个 NC tail；`bwtree+shared-metadata` 检查两端分配 ID、预留 chunk 空间及读取 GC minimum。
+ClevelHash 原有的 KV pair 读取失效仍然执行。
 模拟器本身不插桩，非 CACHE 地址快速跳过。
 
 `--read-ahead-lines N` 在每次读取或写入取行时，额外预取后续最多 N 行（0..64，
@@ -469,13 +494,17 @@ KV pair 读取失效仍然执行，BwTree 则保留其 CoW 读路径。
 这是确定性的 next-line 策略，不声称重现某款 CPU 的全部预取行为。
 它是额外的预取压力场景，和启动时提前失效 cacheline 是两种操作。
 
-BwTree 保留原来的 CoW 读路径：每端映射 CACHE 后，在开始访问前整区失效一次；
-之后从 NC 元数据取得已发布节点指针，节点和 value 都直接读取并复用缓存。
-`GetType()`、high/low key、depth、item count 等访问器不执行读前 flush，
-也不查询首次访问地址集合。写端发布新节点前原有的 `FlushNode()` 写回仍保留。
-GC 复用节点地址前则执行上面的批量通知、读者宽限期及各端 cacheline 失效协议。
-已移除 BwTree 的 `PrepareRead()` 和 `--cow-acquire` 实验入口；设置
-`SHM_UB_COW_ACQUIRE=1` 也不会改变 BwTree 的节点或 value 读取路径。
+BwTree 在启动失效之外，还在节点获取时执行必要的读取失效。`GetType()`、边界键、
+depth 和 item count 等访问器共享有界的线程私有获取缓存；后台接收者在失效完成、ACK
+发出之前推进对应内存页的版本，使旧获取记录不能用于复用后的地址；无关页不必重新获取。此协议在 UB/CXL
+均启用，不依赖 `SHM_UB_COW_ACQUIRE` 开关。value 是独立分配的不可变内容，A 在取得
+value 指针后另行失效完整 payload，防止发布前预取的旧字节残留；UB/CXL 使用同一读路径。
+节点获取缓存使用完整地址散列，减少分配步长造成的槽位冲突。未命中时先获取节点头，
+依据头部的不可变 item count 计算 base node 的分配范围，再批量失效剩余行和外部边界键；
+最后一次维护完成后才允许读取这些字节，已覆盖的节点头和内部边界键不重复失效。
+`bwtree+cache-gc` 会在 ACK 之后、地址复用之前显式预取旧节点头和变长尾部，
+检查复用后的新 header 和尾部内容，避免漏刷尾部却因冷缓存取新值而误通过。
+`bwtree+native-cache-atomic` 是负例：A 对 B 的 CACHE 原生原子执行读取，必须被模拟器拒绝。
 
 默认还会对 A 实际读取的字节执行只观察的后备内存比较：不一致就报
 `LOCAL_NCC_STALE_READ` 并失败，不修复数据。它能捕获错误非零值和 payload，

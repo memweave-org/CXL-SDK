@@ -61,7 +61,23 @@
 #ifndef BWTREE_PROCESS_MAPPING_CACHE
 #define BWTREE_PROCESS_MAPPING_CACHE 0
 #endif
+#if defined(SHM_UB_SPLIT) && defined(NO_CC) && !BWTREE_LOCAL_ONLY
+#define BWTREE_SPLIT_ATOMICS 1
+template<class T> using BwTreeSharedNT = BwTreeNCStorage<nt<T>>;
+#else
+#define BWTREE_SPLIT_ATOMICS 0
+template<class T> using BwTreeSharedNT = nt<T>;
+#endif
+#if BWTREE_LOCAL_ONLY && (defined(NO_CC) || BWTREE_PROCESS_MAPPING_CACHE || defined(OPT_ROOT_READ) || defined(OPT_IN_USE_FLAG) || defined(OPT_GC))
+#error "Local BwTree must not enable shared-memory coherence protocols"
+#endif
 #if defined(NO_CC) && BWTREE_PROCESS_MAPPING_CACHE
+struct BwTreeChannelMaintenance {
+  static void publish(const void* p, size_t bytes) { clwb(p, bytes); }
+  static void acquire(const void* p, size_t bytes) {
+    if (SimThreadInfo::is_follower()) clflush(p, bytes);
+  }
+};
 #include "process_mapping_cache.h"
 #endif
 #if defined(NO_CC) && defined(OPT_IN_USE_FLAG) && !defined(NT_SIM) && BWTREE_MAPPING_CACHE_DRAM
@@ -277,14 +293,14 @@ class BwTreeBase {
   static constexpr size_t CACHE_LINE_MASK = ~(cl_size - 1);
 
 #ifdef OPT_ROOT_READ
-  nt<uint64_t> global_root_id;
+  BwTreeSharedNT<uint64_t> global_root_id;
 #endif
 
 protected:
   class MetaData {
     public:
 #ifdef OPT_ROOT_READ
-    nt<uint64_t> cached_root_id;
+    BwTreeSharedNT<uint64_t> cached_root_id;
     MetaData() : cached_root_id{0UL} {}
 #endif
   };
@@ -354,14 +370,15 @@ protected:
     // be used as the global epoch value to decide whether a garbage node could
     // be recycled
 #ifdef NO_CC
-    nt<uint64_t> last_active_epoch;
+    BwTreeSharedNT<uint64_t> last_active_epoch;
 #else
     std::atomic<uint64_t> last_active_epoch;
 #endif
 
 #if defined(NO_CC) && defined(OPT_GC)
-    // This is the minimum epoch when the value is updated
-    nt<uint64_t> minimun_epoch;
+    // Publish the global minimum to reclaimers, including remote machines.
+    // A read-only benchmark role does not make this tree state host-private.
+    BwTreeSharedNT<uint64_t> minimun_epoch;
 #endif
 
     // We only need a pointer
@@ -379,6 +396,9 @@ protected:
     // We use this as a threshold to trigger GC
     uint64_t node_count;
     uint64_t pending_bytes;
+#if defined(NO_CC) && BWTREE_PROCESS_MAPPING_CACHE
+    GarbageNode* first_unpublished = nullptr;
+#endif
 
     /*
      * Default constructor
@@ -390,7 +410,7 @@ protected:
           node_count{0UL}, pending_bytes{0UL} {}
   };
 
-  // GC metadata includes the combined invalidation ticket and NC range list.
+  // GC metadata includes the invalidation ticket and published CACHE range list.
 
   /*
    * class PaddedData - Padded data to the length of a cache line
@@ -460,8 +480,12 @@ protected:
 #ifdef NO_CC
 #if defined(NO_CC) && defined(OPT_GC)
   std::atomic<uint64_t> epoch;
+#if BWTREE_SPLIT_ATOMICS
+  // OPT's native epoch is owner-local. Publish a separate NC word for A.
+  BwTreeSharedNT<uint64_t> published_epoch{0};
+#endif
 #else
-  nt<uint64_t> epoch;
+  BwTreeSharedNT<uint64_t> epoch;
 #endif
 #else
   std::atomic<uint64_t> epoch;
@@ -493,8 +517,21 @@ protected:
       (gc_metadata_p + i)->~PaddedGCMetadata();
     }
 
-    // Free memory using original pointer rather than adjusted pointer
-    // bwtree_memory().free(original_p);
+    // Both readers of this array (epoch updater and local cache receiver) must
+    // have stopped before destruction. Ordinary metadata is CACHE, not NC.
+#ifdef USE_CXL
+    bwtree_metadata_memory().free(original_p);
+#else
+    free(original_p);
+#endif
+#ifdef OPT_ROOT_READ
+    for (size_t i = 0; i < thread_num; ++i) (metadata_p + i)->~PaddedMetadata();
+#ifdef USE_CXL
+    bwtree_metadata_memory().free(original_p2);
+#else
+    free(original_p2);
+#endif
+#endif
 
     return;
   }
@@ -511,13 +548,10 @@ protected:
     // We allocate one more element than requested as the buffer
     // for doing alignment
     {
-#ifndef NT_SIM
-      size_t malloc_size = cl_size * 2 * (thread_num + 1);
-#else
-      size_t malloc_size = cl_size * 3 * (thread_num + 1);
-#endif
+      // GCMetaData can grow independently of the ordinary per-thread metadata.
+      size_t malloc_size = sizeof(PaddedGCMetadata) * thread_num + cl_size - 1;
 #ifdef USE_CXL
-      original_p = static_cast<unsigned char *>(shared_atomic_memory(bwtree_memory()).malloc(malloc_size));
+      original_p = static_cast<unsigned char *>(bwtree_metadata_memory().malloc(malloc_size));
 #else
       original_p = static_cast<unsigned char *>(malloc(malloc_size));
 #endif
@@ -532,8 +566,8 @@ protected:
     assert(((size_t)gc_metadata_p % cl_size) == 0);
 
     // Make sure we do not overflow the chunk of memory
-    assert(((size_t)gc_metadata_p + thread_num * cl_size) <=
-           ((size_t)original_p + (thread_num + 1) * cl_size));
+    assert(((size_t)gc_metadata_p + thread_num * sizeof(PaddedGCMetadata)) <=
+           ((size_t)original_p + thread_num * sizeof(PaddedGCMetadata) + cl_size - 1));
 
     // At last call constructor of the class; we use placement new
     for (size_t i = 0; i < thread_num; i++) {
@@ -548,7 +582,7 @@ protected:
       size_t malloc_size = cl_size * 3 * (thread_num + 1);
 #endif
 #ifdef USE_CXL
-      original_p2 = static_cast<unsigned char *>(shared_atomic_memory(bwtree_memory()).malloc(malloc_size));
+      original_p2 = static_cast<unsigned char *>(bwtree_metadata_memory().malloc(malloc_size));
 #else
       original_p2 = static_cast<unsigned char *>(malloc(malloc_size));
 #endif
@@ -664,6 +698,9 @@ protected:
    */
   inline void IncreaseEpoch() {
     epoch++;
+#if BWTREE_SPLIT_ATOMICS && defined(OPT_GC)
+    published_epoch.store(epoch.load());
+#endif
 #if defined(NO_CC) && defined(OPT_GC)
     uint64_t min_epoch = std::numeric_limits<uint64_t>::max();
     // Only workers may publish quiescence. Advancing a running worker's
@@ -724,12 +761,30 @@ protected:
    * when it reads the counter
    */
   inline uint64_t GetGlobalEpoch() {
+#if BWTREE_SPLIT_ATOMICS && defined(OPT_GC)
+    if (SimThreadInfo::is_follower()) return published_epoch.load();
+#endif
 #if defined(NO_CC) && !defined(OPT_GC)
     return epoch.load();
 #else
     return epoch;
 #endif
   }
+
+#if BWTREE_SPLIT_ATOMICS
+  template<class Native, class Remote> void VisitEpochStorage(Native native, Remote remote) const {
+#ifdef OPT_GC
+    static_assert(std::is_same<decltype(epoch), std::atomic<uint64_t>>::value);
+    native(&epoch);
+    remote(&published_epoch.get());
+#else
+    remote(&epoch.get());
+#endif
+#ifdef OPT_ROOT_READ
+    remote(&global_root_id.get());
+#endif
+  }
+#endif
 
   /*
    * GetGCMetaData() - Returns the thread-local metadata for GC for a specified
@@ -1383,6 +1438,7 @@ class BwTree : public BwTreeBase {
    *                  and delta node
    */
   class BaseNode {
+    friend class BwTree;
     // We hold its data structure as private to force using member functions
     // for member access
    private:
@@ -1390,7 +1446,7 @@ class BwTree : public BwTreeBase {
     NodeMetaData metadata;
 
    public:
-    virtual void FlushNode() const { clwb(this, sizeof(BaseNode)); }
+    virtual void FlushNode() const { bwtree_node_writeback(this, sizeof(BaseNode)); }
     /*
      * Constructor - Initialize type and metadata
      */
@@ -1407,17 +1463,17 @@ class BwTree : public BwTreeBase {
      * GetType() - Return the type of node
      *
      * This method does not allow overridding
-     * CoW node getters use ordinary cached loads. UB invalidates CACHE at
-     * mapping startup; writers flush new nodes before publishing pointers.
+     * Acquire immutable bytes after publication, including reused allocations.
+     * A private acquisition cache is invalidated before retirement ACKs.
      */
-    inline NodeType GetType() const { return metadata.type; }
+    inline NodeType GetType() const { AcquirePublishedNode(this); return metadata.type; }
 
     /*
      * GetNodeMetaData() - Returns a const reference to node metadata
      *
      * Please do not override this method
      */
-    inline const NodeMetaData &GetNodeMetaData() const { return metadata; }
+    inline const NodeMetaData &GetNodeMetaData() const { AcquirePublishedNode(this); return metadata; }
 
     /*
      * IsDeltaNode() - Return whether a node is delta node
@@ -1480,6 +1536,7 @@ class BwTree : public BwTreeBase {
      * a leaf node would result in Segmentation Fault
      */
     inline const KeyType &GetLowKey() const {
+      AcquirePublishedNode(this);
       return metadata.low_key_p->first;
     }
 
@@ -1490,6 +1547,7 @@ class BwTree : public BwTreeBase {
      * and inner nodes.
      */
     inline const KeyType &GetHighKey() const {
+      AcquirePublishedNode(this);
 #ifdef SHM_LOCAL_NCC
       CheckLocalHighKey();
 #endif
@@ -1500,6 +1558,7 @@ class BwTree : public BwTreeBase {
      * GetHighKeyPair() - Returns the pointer to high key node id pair
      */
     inline const KeyNodeIDPair &GetHighKeyPair() const {
+      AcquirePublishedNode(this);
 #ifdef SHM_LOCAL_NCC
       CheckLocalHighKey();
 #endif
@@ -1512,6 +1571,7 @@ class BwTree : public BwTreeBase {
      * The return value is nullptr for LeafNode and its delta chain
      */
     inline const KeyNodeIDPair &GetLowKeyPair() const {
+      AcquirePublishedNode(this);
       return *metadata.low_key_p;
     }
 
@@ -1519,6 +1579,7 @@ class BwTree : public BwTreeBase {
      * GetNextNodeID() - Returns the next NodeID of the current node
      */
     inline NodeID GetNextNodeID() const {
+      AcquirePublishedNode(this);
 #ifdef SHM_LOCAL_NCC
       CheckLocalHighKey();
 #endif
@@ -1538,6 +1599,7 @@ class BwTree : public BwTreeBase {
      * since the low key node ID for leaf node is not defined
      */
     inline NodeID GetLowKeyNodeID() const {
+      AcquirePublishedNode(this);
       assert(IsOnLeafDeltaChain() == false);
 
       return metadata.low_key_p->second;
@@ -1546,12 +1608,12 @@ class BwTree : public BwTreeBase {
     /*
      * GetDepth() - Returns the depth of the current node
      */
-    inline int GetDepth() const { return metadata.depth; }
+    inline int GetDepth() const { AcquirePublishedNode(this); return metadata.depth; }
 
     /*
      * GetItemCount() - Returns the item count of the current node
      */
-    inline int GetItemCount() const { return metadata.item_count; }
+    inline int GetItemCount() const { AcquirePublishedNode(this); return metadata.item_count; }
 
     /*
      * SetLowKeyPair() - Sets the low key pair of metadata
@@ -1583,7 +1645,7 @@ class BwTree : public BwTreeBase {
    public:
     const BaseNode *child_node_p;
 
-    void FlushNode() const override { clwb(this, sizeof(DeltaNode)); }
+    void FlushNode() const override { bwtree_node_writeback(this, sizeof(DeltaNode)); }
 
     virtual ~DeltaNode() {
     }
@@ -1613,7 +1675,7 @@ class BwTree : public BwTreeBase {
     // the item into the base leaf node
     std::pair<int, bool> index_pair;
     void FlushNode() const override {
-      clwb(this, sizeof(LeafDataNode));
+      bwtree_node_writeback(this, sizeof(LeafDataNode));
     }
 
     LeafDataNode(const KeyValuePair &p_item, NodeType p_type,
@@ -1642,7 +1704,7 @@ class BwTree : public BwTreeBase {
   class LeafInsertNode : public LeafDataNode {
    public:
     void FlushNode() const override {
-      clwb(this, sizeof(LeafInsertNode));
+      bwtree_node_writeback(this, sizeof(LeafInsertNode));
     }
 
     /*
@@ -1670,7 +1732,7 @@ class BwTree : public BwTreeBase {
   class LeafDeleteNode : public LeafDataNode {
    public:
     void FlushNode() const override {
-      clwb(this, sizeof(LeafDeleteNode));
+      bwtree_node_writeback(this, sizeof(LeafDeleteNode));
     }
     /*
      * Constructor
@@ -1702,7 +1764,7 @@ class BwTree : public BwTreeBase {
     KeyNodeIDPair insert_item;
 
     void FlushNode() const override {
-      clwb(this, sizeof(LeafSplitNode));
+      bwtree_node_writeback(this, sizeof(LeafSplitNode));
     }
 
     /*
@@ -1748,7 +1810,7 @@ class BwTree : public BwTreeBase {
     NodeID removed_id;
 
     void FlushNode() const override {
-      clwb(this, sizeof(LeafRemoveNode));
+      bwtree_node_writeback(this, sizeof(LeafRemoveNode));
     }
 
     /*
@@ -1784,7 +1846,7 @@ class BwTree : public BwTreeBase {
     const BaseNode *right_merge_p;
 
     void FlushNode() const override {
-      clwb(this, sizeof(LeafMergeNode));
+      bwtree_node_writeback(this, sizeof(LeafMergeNode));
     }
 
     /*
@@ -1835,7 +1897,7 @@ class BwTree : public BwTreeBase {
     const KeyNodeIDPair *location;
 
     void FlushNode() const override {
-      clwb(this, sizeof(InnerDataNode));
+      bwtree_node_writeback(this, sizeof(InnerDataNode));
     }
 
     InnerDataNode(const KeyNodeIDPair &p_item, NodeType p_type,
@@ -1866,7 +1928,7 @@ class BwTree : public BwTreeBase {
     KeyNodeIDPair next_item;
 
     void FlushNode() const override {
-      clwb(this, sizeof(InnerInsertNode));
+      bwtree_node_writeback(this, sizeof(InnerInsertNode));
     }
 
     /*
@@ -1914,7 +1976,7 @@ class BwTree : public BwTreeBase {
     KeyNodeIDPair next_item;
 
     void FlushNode() const override {
-      clwb(this, sizeof(InnerDeleteNode));
+      bwtree_node_writeback(this, sizeof(InnerDeleteNode));
     }
 
     /*
@@ -1958,7 +2020,7 @@ class BwTree : public BwTreeBase {
     KeyNodeIDPair insert_item;
 
     void FlushNode() const override {
-      clwb(this, sizeof(InnerSplitNode));
+      bwtree_node_writeback(this, sizeof(InnerSplitNode));
     }
 
     /*
@@ -1990,7 +2052,7 @@ class BwTree : public BwTreeBase {
     NodeID removed_id;
 
     void FlushNode() const override {
-      clwb(this, sizeof(InnerRemoveNode));
+      bwtree_node_writeback(this, sizeof(InnerRemoveNode));
     }
 
     /*
@@ -2017,7 +2079,7 @@ class BwTree : public BwTreeBase {
     const BaseNode *right_merge_p;
 
     void FlushNode() const override {
-      clwb(this, sizeof(InnerMergeNode));
+      bwtree_node_writeback(this, sizeof(InnerMergeNode));
     }
 
     /*
@@ -2048,7 +2110,7 @@ class BwTree : public BwTreeBase {
   class InnerAbortNode : public DeltaNode {
    public:
     void FlushNode() const override {
-      clwb(this, sizeof(InnerAbortNode));
+      bwtree_node_writeback(this, sizeof(InnerAbortNode));
     }
 
     /*
@@ -2127,7 +2189,7 @@ class BwTree : public BwTreeBase {
     // One reasonable amount of memory for each chunk is
     // delta chain len * struct len + sizeof this struct
     static constexpr size_t CHUNK_SIZE =
-#ifdef SHM_UB_SPLIT
+#if defined(SHM_UB_SPLIT) && !BWTREE_LOCAL_ONLY
         (sizeof(DeltaNodeUnion) * 8 + sizeof(AllocationMeta) + 63) & ~size_t(63);
 #else
         sizeof(DeltaNodeUnion) * 8 + sizeof(AllocationMeta);
@@ -2136,7 +2198,7 @@ class BwTree : public BwTreeBase {
    private:
     // This points to the higher address end of the chunk we are
     // allocating from
-#ifdef SHM_UB_SPLIT
+#if defined(SHM_UB_SPLIT) && !BWTREE_LOCAL_ONLY
     nt<char *>& tail;
 #elif defined(NO_CC)
     nt<char *> tail;
@@ -2150,24 +2212,22 @@ class BwTree : public BwTreeBase {
 #endif
     // This forms a linked list which needs to be traversed in order to
     // free chunks of memory
-#ifdef SHM_UB_SPLIT
-    std::atomic<AllocationMeta *>& next;
-#else
+    // Only B allocates/reclaims chunks; this native atomic is local to B's
+    // CACHE replica and must never be allocated in NC.
     std::atomic<AllocationMeta *> next;
-#endif
 
    public:
     /*
      * Constructor
      */
     AllocationMeta(char *p_tail, char *p_limit, size_t bytes = CHUNK_SIZE)
-#ifdef SHM_UB_SPLIT
+#if defined(SHM_UB_SPLIT) && !BWTREE_LOCAL_ONLY
         : tail(make_shared_atomic<nt<char *>>(p_tail)), limit{p_limit},
 #if defined(NO_CC) && BWTREE_PROCESS_MAPPING_CACHE
           allocation_bytes(bytes),
 #endif
-          next(make_shared_atomic<std::atomic<AllocationMeta *>>(nullptr)) {
-      clwb(this, sizeof(*this));
+          next(nullptr) {
+      bwtree_node_writeback(this, sizeof(*this));
     }
 #else
         : tail{p_tail}, limit{p_limit},
@@ -2176,6 +2236,12 @@ class BwTree : public BwTreeBase {
 #endif
           next{nullptr} { (void)bytes; }
 #endif
+
+    template<class Native, class Remote> void VisitStorage(Native native, Remote remote) const {
+      static_assert(std::is_same<decltype(next), std::atomic<AllocationMeta*>>::value);
+      native(&next);
+      remote(&tail);
+    }
 
     /*
      * TryAllocate() - Try to allocate from this chunk
@@ -2188,7 +2254,7 @@ class BwTree : public BwTreeBase {
      * size
      */
     void *TryAllocate(size_t size) {
-#ifdef SHM_UB_SPLIT
+#if defined(SHM_UB_SPLIT) && !BWTREE_LOCAL_ONLY
       // Different hosts must not publish independently dirty parts of one line.
       size = (size + 63) & ~size_t(63);
 #endif
@@ -2201,7 +2267,7 @@ class BwTree : public BwTreeBase {
 
       // This substracts size from tail, and assigns
       // the value to local variable in one atomic step
-#if defined(NO_CC) || defined(SHM_UB_SPLIT)
+#if defined(NO_CC) || (defined(SHM_UB_SPLIT) && !BWTREE_LOCAL_ONLY)
       char *new_tail = tail.fetch_sub((char*)size) - size;
 #else
       char *new_tail = tail.fetch_sub(size) - size;
@@ -2365,16 +2431,16 @@ class BwTree : public BwTreeBase {
     KeyNodeIDPair low_key;
     KeyNodeIDPair high_key;
 
-#ifdef OPT_IN_USE_FLAG
+#if defined(OPT_IN_USE_FLAG) && !BWTREE_PROCESS_MAPPING_CACHE
 #ifdef OPT_DUP_IN_USE_FLAG
-#ifdef SHM_UB_SPLIT
+#if defined(SHM_UB_SPLIT) && !BWTREE_LOCAL_ONLY
     std::array<nt<uint64_t>, OPT_DUP_IN_USE_FLAG>& status_flag =
         make_shared_atomic<std::array<nt<uint64_t>, OPT_DUP_IN_USE_FLAG>>();
 #else
     std::array<nt<uint64_t>, OPT_DUP_IN_USE_FLAG> status_flag;
 #endif
 #else
-#ifdef SHM_UB_SPLIT
+#if defined(SHM_UB_SPLIT) && !BWTREE_LOCAL_ONLY
     nt<uint64_t>& status_flag = make_shared_atomic<nt<uint64_t>>();
 #else
     nt<uint64_t> status_flag;
@@ -2549,7 +2615,7 @@ class BwTree : public BwTreeBase {
     inline int GetSize() const { return static_cast<int>(End() - Begin()); }
 
     void FlushNode() const override {
-      clwb(
+      bwtree_node_writeback(
           this, sizeof(ElasticNode) + sizeof(ElementType) * (End() - Begin()));
     }
 
@@ -3069,6 +3135,7 @@ class BwTree : public BwTreeBase {
    * has been called before we free the whole tree
    */
   ~BwTree() {
+    epoch_manager.StopThread();
     bwt_printf("Next node ID at exit: %lu\n", next_unused_node_id.load());
     bwt_printf("Destructor: Free tree nodes\n");
 
@@ -3094,7 +3161,7 @@ class BwTree : public BwTreeBase {
 #ifdef OPT_ROOT_READ
     // FreeNodeByNodeID() resolves the root through GetRootPtr(), so the
     // replicated-pointer helper must outlive the node teardown.
-    if (root_help_update) { root_help_update->~HelpUpdate<BaseNode>(); shared_atomic_memory(bwtree_memory()).free(root_help_update); }
+    if (root_help_update) { root_help_update->~HelpUpdate<BaseNode>(); bwtree_metadata_memory().free(root_help_update); }
     root_help_update = nullptr;
 #endif
 
@@ -3145,8 +3212,13 @@ class BwTree : public BwTreeBase {
     bwt_printf("Updating thread-local array to length %lu......\n",
                p_thread_num);
 
-    // 1. Frees all pending memory chunks
-    // 2. Frees the thread local array
+    const bool restart_epoch = epoch_manager.thread_p != nullptr;
+    epoch_manager.StopThread();
+#if defined(NO_CC) && BWTREE_PROCESS_MAPPING_CACHE
+    LocalMappingCache::release(this);
+#endif
+    // Workers must be quiescent before replacing their epoch publications.
+    // Stop both background readers before destroying the old NC words.
     ClearThreadLocalGarbage();
     DestroyThreadLocal();
 
@@ -3160,8 +3232,37 @@ class BwTree : public BwTreeBase {
     // Root replicas use the same worker-ID indexing as the GC metadata.
     ConfigureRootPointerReplicas();
 #endif
-
+#if defined(NO_CC) && BWTREE_PROCESS_MAPPING_CACHE
+    PrepareLocalMappingCache();
+#endif
+    PublishSharedLayout();
+    if (restart_epoch) epoch_manager.StartThread();
     return;
+  }
+
+  // Call before handing the tree to A. Fields read by A remain immutable;
+  // mutable shared control words are separately allocated NC atomics.
+  void PublishSharedLayout() {
+#if BWTREE_SPLIT_ATOMICS
+    clwb(gc_metadata_p, sizeof(PaddedGCMetadata) * thread_num);
+#ifdef OPT_ROOT_READ
+    clwb(metadata_p, sizeof(PaddedMetadata) * thread_num);
+    if (root_help_update) clwb(root_help_update, sizeof(*root_help_update));
+#endif
+    clwb(this, sizeof(*this));
+#endif
+  }
+  void AcquireSharedLayout() {
+#if BWTREE_SPLIT_ATOMICS
+    if (SimThreadInfo::is_follower()) {
+      clflush(this, sizeof(*this));
+      clflush(gc_metadata_p, sizeof(PaddedGCMetadata) * thread_num);
+#ifdef OPT_ROOT_READ
+      clflush(metadata_p, sizeof(PaddedMetadata) * thread_num);
+      if (root_help_update) clflush(root_help_update, sizeof(*root_help_update));
+#endif
+    }
+#endif
   }
 
   /*
@@ -3544,7 +3645,7 @@ class BwTree : public BwTreeBase {
   }
 
   void ConfigureRootPointerReplicas() {
-    if (root_help_update) { root_help_update->~HelpUpdate<BaseNode>(); shared_atomic_memory(bwtree_memory()).free(root_help_update); }
+    if (root_help_update) { root_help_update->~HelpUpdate<BaseNode>(); bwtree_metadata_memory().free(root_help_update); }
     root_help_update = nullptr;
     root_node_replicas.clear();
     root_node_replicas.resize(thread_num);
@@ -3559,7 +3660,7 @@ class BwTree : public BwTreeBase {
     for (size_t i = 0; i < thread_num; ++i) {
       root_node_replicas[i].store(const_cast<BaseNode *>(root_p));
     }
-    root_help_update = new (shared_atomic_memory(bwtree_memory()).malloc(sizeof(HelpUpdate<BaseNode>))) HelpUpdate<BaseNode>(
+    root_help_update = new (bwtree_metadata_memory().malloc(sizeof(HelpUpdate<BaseNode>))) HelpUpdate<BaseNode>(
         global_root_node_p, root_node_replicas, thread_num);
   }
 
@@ -3749,6 +3850,83 @@ class BwTree : public BwTreeBase {
    * If we want to keep the same snapshot then we should only
    * call GetNode() once and stick to that physical pointer
    */
+#if BWTREE_SPLIT_ATOMICS && BWTREE_PROCESS_MAPPING_CACHE
+  struct ReadAcquisitionCache {
+    struct Entry { const BaseNode* node=nullptr; uint64_t generation=0, version=0; };
+    static constexpr unsigned bits=12;
+    std::array<Entry, size_t{1}<<bits> entries{};
+  };
+  static ReadAcquisitionCache& ReadAcquisitions() {
+    static thread_local ReadAcquisitionCache cache;
+    return cache;
+  }
+#endif
+  // Keep cache hits small enough to inline into the metadata accessors.
+  // The miss path retains the same post-publication invalidation and fences.
+  static void AcquireNodeBytes(const BaseNode* node) {
+#if BWTREE_SPLIT_ATOMICS && BWTREE_PROCESS_MAPPING_CACHE
+    // Fetch the type and boundary pointers before inspecting a recycled header.
+    // No virtual dispatch or size calculation may precede this invalidation.
+    clflush(node,sizeof(BaseNode));
+    size_t bytes=sizeof(BaseNode);
+    switch(node->metadata.type) {
+      // ElasticNode::Get allocates item_count entries (size == item_count).
+      // The immutable count is in the already-acquired BaseNode header, so no
+      // second header fetch is needed to read ElasticNode::end.
+      case NodeType::InnerType:
+        bytes=sizeof(ElasticNode<KeyNodeIDPair>)+sizeof(KeyNodeIDPair)*node->metadata.item_count;
+        break;
+      case NodeType::LeafType:
+        bytes=sizeof(ElasticNode<KeyValuePair>)+sizeof(KeyValuePair)*node->metadata.item_count;
+        break;
+      case NodeType::InnerInsertType: bytes=sizeof(InnerInsertNode); break;
+      case NodeType::InnerDeleteType: bytes=sizeof(InnerDeleteNode); break;
+      case NodeType::InnerSplitType: bytes=sizeof(InnerSplitNode); break;
+      case NodeType::InnerRemoveType: bytes=sizeof(InnerRemoveNode); break;
+      case NodeType::InnerMergeType: bytes=sizeof(InnerMergeNode); break;
+      case NodeType::InnerAbortType: bytes=sizeof(InnerAbortNode); break;
+      case NodeType::LeafInsertType: bytes=sizeof(LeafInsertNode); break;
+      case NodeType::LeafDeleteType: bytes=sizeof(LeafDeleteNode); break;
+      case NodeType::LeafSplitType: bytes=sizeof(LeafSplitNode); break;
+      case NodeType::LeafRemoveType: bytes=sizeof(LeafRemoveNode); break;
+      case NodeType::LeafMergeType: bytes=sizeof(LeafMergeNode); break;
+    }
+    // Header lines are already fresh. Invalidate the remaining node lines and
+    // external boundary keys, with one completion fence for the entire batch.
+    // Do not read any of those bytes until the final clflush has completed.
+    struct Span { const void* address; size_t bytes; } spans[3];
+    size_t count=0;
+    const uintptr_t start=reinterpret_cast<uintptr_t>(node);
+    const uintptr_t end=start+bytes;
+    const uintptr_t remaining=(start+sizeof(BaseNode)+63)&~uintptr_t(63);
+    if (remaining<end) spans[count++]={reinterpret_cast<const void*>(remaining),end-remaining};
+    for (auto* key : {node->metadata.low_key_p,node->metadata.high_key_p}) {
+      const uintptr_t address=reinterpret_cast<uintptr_t>(key);
+      if (key && !(address>=start && address+sizeof(KeyNodeIDPair)<=end))
+        spans[count++]={key,sizeof(KeyNodeIDPair)};
+    }
+    for (size_t i=0;i<count;++i) clflush(spans[i].address,spans[i].bytes,i+1==count);
+#endif
+  }
+  static void AcquirePublishedNode(const BaseNode* node) {
+#if BWTREE_SPLIT_ATOMICS && BWTREE_PROCESS_MAPPING_CACHE
+    if (!node || !SimThreadInfo::is_follower()) return;
+    // Read AFTER obtaining the published node pointer. The receiver advances
+    // this page's private version before sending an ACK that permits reuse.
+    const auto generation=bwtree_process_cache::acquisition_generation().load(std::memory_order_acquire);
+    const auto version=bwtree_process_cache::acquisition_version(node);
+    auto& cache=ReadAcquisitions();
+    // Mix the full address: slab/chunk strides otherwise evict hot nodes at
+    // identical low offsets. Collisions only replace private cache entries;
+    // pointer, lifetime and retirement-version checks remain authoritative.
+    const uint64_t hash=(reinterpret_cast<uintptr_t>(node)>>3)*uint64_t{0x9e3779b97f4a7c15};
+    auto& entry=cache.entries[hash>>(64-ReadAcquisitionCache::bits)];
+    if (entry.node==node && entry.generation==generation && entry.version==version) return;
+    AcquireNodeBytes(node);
+    entry={node,generation,version};
+#endif
+  }
+
   inline const BaseNode *GetNode(const NodeID node_id, bool bypass_cache = BYPASS_CACHE_DEFAULT) {
     assert(node_id != INVALID_NODE_ID);
     assert(node_id < MAPPING_TABLE_SIZE);
@@ -3805,7 +3983,9 @@ class BwTree : public BwTreeBase {
     }
 #endif
 
-#ifdef OPT_ROOT_READ
+// Process-cache hits were handled above. An explicit cache bypass reads
+// the authoritative mapping entry, without consulting root replicas.
+#if defined(OPT_ROOT_READ) && !BWTREE_PROCESS_MAPPING_CACHE
     if (node_id == GetRootID(true) && node_id == global_root_id.load()) {
       #ifdef PLOAD_ROOT_STAT
         TimerAverage timer_root("pload_root_stat");
@@ -9067,7 +9247,7 @@ class BwTree : public BwTreeBase {
    public:
     GCFlushWorker(BwTree *p_tree_p, bool p_enabled)
         : tree_p{p_tree_p},
-          enabled{p_enabled},
+          enabled{p_enabled && !BWTREE_LOCAL_ONLY},
           stop{false},
           request_ready{false},
           request_done{false} {
@@ -9189,31 +9369,39 @@ class BwTree : public BwTreeBase {
   const KeyValuePairHashFunc key_value_pair_hash_obj;
 
   // This value is atomic and will change
+#ifndef OPT_ROOT_READ
 #ifdef NO_CC
-  nt<NodeID> root_id;
+  BwTreeSharedNT<NodeID> root_id;
 #else
   std::atomic<NodeID> root_id;
+#endif
 #endif
 
   // This value is non-atomic, but it remains constant after constructor
   NodeID first_leaf_id;
 
 #ifdef NO_CC
-  nt<NodeID> next_unused_node_id;
+  // Node IDs belong to the shared tree, independent of workload writer roles.
+  BwTreeSharedNT<NodeID> next_unused_node_id;
 #else
   std::atomic<NodeID> next_unused_node_id;
 #endif
 
 #ifdef NO_CC
   using mapping_table_t = std::array<nt<const BaseNode *>, MAPPING_TABLE_SIZE>;
+#if BWTREE_SPLIT_ATOMICS
+  BwTreeNCStorage<mapping_table_t> mapping_table_storage;
+  mapping_table_t& mapping_table = mapping_table_storage.get();
+#else
   mapping_table_t mapping_table;
+#endif
 #if BWTREE_PROCESS_MAPPING_CACHE
 #ifdef OPT_IN_USE_FLAG
-  using LocalMappingCache = ProcessMappingCache<MAPPING_TABLE_SIZE, nt>;
+  using LocalMappingCache = ProcessMappingCache<MAPPING_TABLE_SIZE, BwTreeSharedNT, BwTreeChannelMaintenance>;
 #else
   // NOOPT still participates in cacheline invalidation, without allocating a
   // software pointer cache. Both variants must ACK before storage can be reused.
-  using LocalMappingCache = ProcessMappingCache<0, nt>;
+  using LocalMappingCache = ProcessMappingCache<0, BwTreeSharedNT, BwTreeChannelMaintenance>;
 #endif
   typename LocalMappingCache::Channel mapping_cache_invalidations;
 #endif
@@ -9247,7 +9435,11 @@ class BwTree : public BwTreeBase {
   // The mapping table remains authoritative. These replicas accelerate the
   // frequently-read root pointer and are updated with the same cooperative
   // protocol used by CLevelHash's replicated meta pointer.
+#if BWTREE_SPLIT_ATOMICS
+  BwTreeNCStorage<nt_pointer<BaseNode>> global_root_node_p{nullptr};
+#else
   nt_pointer<BaseNode> global_root_node_p{nullptr};
+#endif
   std::vector<nt_pointer<BaseNode>, BwTreeAllocator<nt_pointer<BaseNode>>> root_node_replicas;
   HelpUpdate<BaseNode> *root_help_update{nullptr};
 #endif
@@ -9290,19 +9482,37 @@ class BwTree : public BwTreeBase {
   }
 
 #if defined(NO_CC) && BWTREE_PROCESS_MAPPING_CACHE
+  auto& GetLocalEpochPublication() {
+    return LocalMappingCache::epoch_publication(this, static_cast<size_t>(gc_id));
+  }
+  void UpdateLastActiveEpoch() {
+    auto& publication = GetLocalEpochPublication();
+    const auto current = GetGlobalEpoch();
+    if (publication.published_epoch != current) {
+      GetCurrentGCMetaData()->last_active_epoch.store(current);
+      publication.published_epoch = current;
+    }
+  }
+  void UnregisterThread(int id) {
+    LocalMappingCache::reset_epoch_publication(this, static_cast<size_t>(id));
+    BwTreeBase::UnregisterThread(id);
+  }
   void AssignGCID(int id) {
     PrepareLocalMappingCache();
+    LocalMappingCache::reset_epoch_publication(this, static_cast<size_t>(id));
     BwTreeBase::AssignGCID(id);
   }
   void PrepareLocalMappingCache() {
     LocalMappingCache::prepare(this, mapping_cache_invalidations,
         SimThreadInfo::worker_machine_id, [](CachelineInvalidation invalidation) {
+          BwTreeChannelMaintenance::acquire(invalidation.ranges, invalidation.count * sizeof(CachelineRange));
           for (size_t i = 0; i < invalidation.count; ++i) {
             const auto& range = invalidation.ranges[i];
             clflush(range.address, range.bytes); // Includes completion fence.
+            bwtree_process_cache::invalidate_acquisitions(range.address, range.bytes);
           }
         }, [this] { return GetGlobalEpoch(); },
-        [this](uint64_t cleared_epoch) { return SummarizeGCEpoch() > cleared_epoch; });
+        [this](uint64_t cleared_epoch) { return SummarizeGCEpoch() > cleared_epoch; }, GetThreadNum());
   }
 #endif
 #ifdef OPT_IN_USE_FLAG
@@ -9376,7 +9586,7 @@ class BwTree : public BwTreeBase {
     // Garbage collection interval (milliseconds)
     constexpr static int GC_INTERVAL = 50;
 
-#ifdef USE_CXL
+#if defined(USE_CXL) && !BWTREE_LOCAL_ONLY
     bool ForwardRemoteEpochGCIfNeeded(const BaseNode *node_p) {
       if (SimThreadInfo::worker_machine_count <= 1) {
         return false;
@@ -9495,7 +9705,7 @@ class BwTree : public BwTreeBase {
       // Use cacheable allocator for shared memory support
       std::cout << "[EpochManager] Allocating EpochNode using bwtree_memory().malloc" << std::endl;
       std::cout.flush();
-      current_epoch_p = static_cast<EpochNode*>(shared_atomic_memory(bwtree_memory()).malloc(sizeof(EpochNode)));
+      current_epoch_p = static_cast<EpochNode*>(bwtree_metadata_memory().malloc(sizeof(EpochNode)));
       std::cout << "[EpochManager] Allocated EpochNode at " << current_epoch_p << std::endl;
       std::cout.flush();
       if (current_epoch_p == nullptr) {
@@ -9547,32 +9757,7 @@ class BwTree : public BwTreeBase {
      * and we neither wait nor free the pointer.
      */
     ~EpochManager() {
-      // Set stop flag and let thread terminate
-      // Also if there is an external GC thread then it should
-      // check this flag everytime it does cleaning since otherwise
-      // the un-thread-safe function ClearEpoch() would be ran
-      // by more than 1 threads
-      exited_flag.store(true);
-
-      // If thread pointer is nullptr then we know the GC thread
-      // is not started. In this case do not wait for the thread, and just
-      // call destructor
-      //
-      // NOTE: The destructor routine is not thread-safe, so if an external
-      // GC thread is being used then that thread should check for
-      // exited_flag everytime it wants to do GC
-      //
-      // If the external thread calls ThreadFunc() then it is safe
-      if (thread_p != nullptr) {
-        bwt_printf("Waiting for thread\n");
-
-        thread_p->join();
-
-        // Free memory
-        delete thread_p;
-
-        bwt_printf("Thread stops\n");
-      }
+      StopThread();
 
       // So that in the following function the comparison
       // would always fail, until we have cleaned all epoch nodes
@@ -9627,7 +9812,7 @@ class BwTree : public BwTreeBase {
       bwt_printf("Creating new epoch...\n");
 
       // Use cacheable allocator for shared memory support
-      EpochNode *epoch_node_p = static_cast<EpochNode*>(shared_atomic_memory(bwtree_memory()).malloc(sizeof(EpochNode)));
+      EpochNode *epoch_node_p = static_cast<EpochNode*>(bwtree_metadata_memory().malloc(sizeof(EpochNode)));
       new (epoch_node_p) EpochNode{};
 
       epoch_node_p->active_thread_count = 0;
@@ -9675,7 +9860,7 @@ class BwTree : public BwTreeBase {
 
       // These two could be predetermined
 #ifdef USE_CXL
-      GarbageNode *garbage_node_p = static_cast<GarbageNode*>(shared_atomic_memory(bwtree_memory()).malloc(sizeof(GarbageNode)));
+      GarbageNode *garbage_node_p = static_cast<GarbageNode*>(bwtree_metadata_memory().malloc(sizeof(GarbageNode)));
       new (garbage_node_p) GarbageNode{};
 #else
       GarbageNode *garbage_node_p = new GarbageNode;
@@ -9812,13 +9997,33 @@ class BwTree : public BwTreeBase {
     }
 
     inline EpochNode *JoinEpoch() {
+#if defined(NO_CC) && BWTREE_PROCESS_MAPPING_CACHE
+      auto& publication = tree_p->GetLocalEpochPublication();
+      if (publication.operations_until_refresh == 0) {
+        // Between operations there are no retained node references. The
+        // previous announcement protects this entire bounded batch.
+        tree_p->UpdateLastActiveEpoch();
+        publication.operations_until_refresh = 64;
+      }
+      --publication.operations_until_refresh;
+#else
       tree_p->UpdateLastActiveEpoch();
-
+#endif
       return nullptr;
     }
 
     inline void LeaveEpoch(EpochNode *epoch_p) {
+#if BWTREE_LOCAL_ONLY
+      // A local RPC worker may now wait on an empty queue indefinitely.
+      // Publish quiescence after dropping all node references; keeping its
+      // last epoch here would pin every other worker's retired nodes.
+      tree_p->UnregisterThread(BwTreeBase::gc_id);
+#elif !(defined(NO_CC) && BWTREE_PROCESS_MAPPING_CACHE)
       tree_p->UpdateLastActiveEpoch();
+#else
+      // Keep the batch's conservative announcement until the next refresh.
+      // Unregister publishes quiescence and clears the process-local state.
+#endif
 
       (void)epoch_p;
       return;
@@ -9847,7 +10052,7 @@ class BwTree : public BwTreeBase {
      * recycling NodeID
      */
     void FreeEpochDeltaChain(const BaseNode *node_p) {
-#ifdef USE_CXL
+#if defined(USE_CXL) && !BWTREE_LOCAL_ONLY
       if (ForwardRemoteEpochGCIfNeeded(node_p)) {
         return;
       }
@@ -10107,7 +10312,7 @@ class BwTree : public BwTreeBase {
           // This invalidates any further reference to its
           // members (so we saved next pointer above)
           // Use bwtree_memory().free for shared memory support
-          shared_atomic_memory(bwtree_memory()).free(const_cast<void*>(static_cast<const void*>(garbage_node_p)));
+          bwtree_metadata_memory().free(const_cast<void*>(static_cast<const void*>(garbage_node_p)));
         }  // for
 
         // First need to save this in order to delete current node
@@ -10115,7 +10320,7 @@ class BwTree : public BwTreeBase {
         EpochNode *next_epoch_node_p = head_epoch_p->next_p;
 
         // Use bwtree_memory().free for shared memory support
-        shared_atomic_memory(bwtree_memory()).free(static_cast<void*>(head_epoch_p));
+        bwtree_metadata_memory().free(static_cast<void*>(head_epoch_p));
 
 #ifdef BWTREE_DEBUG
         epoch_freed++;
@@ -10162,7 +10367,16 @@ class BwTree : public BwTreeBase {
      * NOTE: This is not called in the constructor, and needs to be
      * called manually
      */
+    void StopThread() {
+      exited_flag.store(true);
+      if (thread_p) {
+        thread_p->join();
+        delete thread_p;
+        thread_p = nullptr;
+      }
+    }
     void StartThread() {
+      exited_flag.store(false);
       thread_p = new std::thread(bwtree_background_thread([this]() { this->ThreadFunc(); }));
 
       return;
@@ -11041,7 +11255,7 @@ class BwTree : public BwTreeBase {
   void AddGarbageNode(const BaseNode *node_p, const NodeID node_id = 0) {
     const size_t estimated_bytes = EstimateGCNodeBytes(node_p);
 #ifdef USE_CXL
-    GarbageNode *garbage_node_p = static_cast<GarbageNode*>(shared_atomic_memory(bwtree_memory()).malloc(sizeof(GarbageNode)));
+    GarbageNode *garbage_node_p = static_cast<GarbageNode*>(bwtree_metadata_memory().malloc(sizeof(GarbageNode)));
     assert(garbage_node_p != nullptr);
     new (garbage_node_p)
         GarbageNode{GetGlobalEpoch(), (void *)(node_p), node_id,
@@ -11058,6 +11272,9 @@ class BwTree : public BwTreeBase {
     // and then update last_p
     GetCurrentGCMetaData()->last_p->next_p = garbage_node_p;
     GetCurrentGCMetaData()->last_p = garbage_node_p;
+#if defined(NO_CC) && BWTREE_PROCESS_MAPPING_CACHE
+    if (!GetCurrentGCMetaData()->first_unpublished) GetCurrentGCMetaData()->first_unpublished = garbage_node_p;
+#endif
 
     // Update the counter
     GetCurrentGCMetaData()->node_count++;
@@ -11105,10 +11322,10 @@ class BwTree : public BwTreeBase {
     GarbageNode *first_p = header_p->next_p;
 
 #if defined(NO_CC) && BWTREE_PROCESS_MAPPING_CACHE
-    // One broadcast carries both node IDs and NC allocation-range descriptors.
+    // One broadcast carries node IDs and published CACHE allocation-range descriptors.
     // Each receiver clears mappings, waits out pre-clear readers, invalidates
     // cachelines and then ACKs. GC never waits synchronously inside an operation.
-    auto* pending = first_p;
+    auto* pending = GetGCMetaData(thread_id)->first_unpublished;
     while (pending && pending->delete_epoch < min_epoch) {
       if (pending->cache_invalidation.sequence) {
         pending = pending->next_p;
@@ -11127,8 +11344,9 @@ class BwTree : public BwTreeBase {
           CollectRetiredCachelineRanges(static_cast<const BaseNode*>(next->node_p), ranges);
           if (ranges.empty()) throw std::logic_error("Empty retired BwTree allocation ranges");
           auto* shared = static_cast<CachelineRange*>(
-              shared_atomic_memory(bwtree_memory()).malloc(ranges.size() * sizeof(CachelineRange)));
+              bwtree_metadata_memory().malloc(ranges.size() * sizeof(CachelineRange)));
           std::copy(ranges.begin(), ranges.end(), shared);
+          bwtree_node_writeback(shared, ranges.size() * sizeof(CachelineRange));
           next->cacheline_ranges = {shared, ranges.size()};
         }
         batch[count] = next;
@@ -11142,6 +11360,7 @@ class BwTree : public BwTreeBase {
       for (size_t i = 0; i < count; ++i) batch[i]->cache_invalidation = ticket;
       pending = next;
     }
+    GetGCMetaData(thread_id)->first_unpublished = pending;
 #endif
     const auto reclaimable = [this, min_epoch](const GarbageNode *node) {
       if (node == nullptr || node->delete_epoch >= min_epoch) return false;
@@ -11176,8 +11395,8 @@ class BwTree : public BwTreeBase {
       // Then free memory
       epoch_manager.FreeEpochDeltaChain((const BaseNode *)garbage_p->node_p);
 #if defined(NO_CC) && BWTREE_PROCESS_MAPPING_CACHE
-      // All recipients have finished reading this NC descriptor before ACK.
-      shared_atomic_memory(bwtree_memory()).free(
+      // All recipients have finished reading this published descriptor before ACK.
+      bwtree_metadata_memory().free(
           const_cast<CachelineRange*>(garbage_p->cacheline_ranges.ranges));
 #endif
       RecordReleasedGCBytes(garbage_p->estimated_bytes);
@@ -11186,7 +11405,7 @@ class BwTree : public BwTreeBase {
 
 #ifdef USE_CXL
       garbage_p->~GarbageNode();
-      shared_atomic_memory(bwtree_memory()).free(garbage_p);
+      bwtree_metadata_memory().free(garbage_p);
 #else
       delete garbage_p;
 #endif
@@ -11240,7 +11459,7 @@ class BwTree : public BwTreeBase {
     std::string type_str;
     std::lock_guard<std::mutex> lk(dump_mutex);
     // inner node or inner delta node
-    if (node_id == root_id.load()) {
+    if (node_id == GetRootID()) {
       root_change_count++;
       type_str = "Root";
     }

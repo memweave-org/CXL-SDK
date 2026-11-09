@@ -63,7 +63,11 @@ class BwTreeDB : public DB {
  private:
   TreeType* tree;
   int thread_num;
+#if BWTREE_LOCAL_ONLY || defined(YCSB_UB_TWO_HOST)
+  std::vector<std::atomic<uint8_t>> bits;
+#else
   cxl_vector<std::atomic<uint8_t>> bits;
+#endif
   std::atomic<size_t> read_cnt{0};
   std::atomic<size_t> update_cnt{0};
   std::atomic<size_t> insert_cnt{0};

@@ -64,7 +64,7 @@ def main():
     os.environ.pop('SHM_UB_STARTUP_INVALIDATE', None)
     if args.startup_invalidate is not None:
         os.environ['SHM_UB_STARTUP_INVALIDATE'] = str(int(args.startup_invalidate))
-    # BwTree follows the original startup-only reader invalidation protocol.
+    # The legacy generic CoW switch stays off; BwTree has its own page-version acquisition.
     os.environ['SHM_UB_COW_ACQUIRE'] = '0'
     if args.trace:
         os.environ['LOCAL_NCC_TRACE_DIR'] = str(output)
@@ -75,7 +75,8 @@ def main():
                   initial_cache=args.initial_cache, startup_invalidate=args.startup_invalidate is not False,
                   startup_policy='production-default' if args.startup_invalidate is None else 'explicit-override',
                   read_ahead_lines=args.read_ahead_lines, check_reads=args.check_reads,
-                  cow_acquire=False, empty_lines_fill_on_read=True,
+                  cow_acquire=False, bwtree_acquire="retirement-page-version" if args.db=="bwtree" else None,
+                  empty_lines_fill_on_read=True,
                   fault_injection=args.drop, cpu=cpu, threads_a=1, threads_b=1,
                   records=args.records, ops_per_host=args.ops, value_size=args.value_size, binary=str(binary),
                   binary_sha256=hashlib.sha256(binary.read_bytes()).hexdigest())

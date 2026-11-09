@@ -12,7 +12,7 @@
 #ifdef ENABLE_CLEVEL_HASH_DB
 #include "clevel_hash.hpp"
 #endif
-#if defined(ENABLE_BWTREE_DB) && defined(OPT_IN_USE_FLAG) && BWTREE_PROCESS_MAPPING_CACHE
+#ifdef ENABLE_BWTREE_DB
 #include "bwtree.h"
 #endif
 #include <sys/wait.h>
@@ -35,6 +35,67 @@ void transfer(int fd,void* p,size_t n,bool writing) {
   }
 }
 void barrier(int in,int out) { char token=1;transfer(out,&token,1,true);transfer(in,&token,1,false); }
+#if defined(ENABLE_BWTREE_DB) && BWTREE_LOCAL_ONLY
+void local_bwtree_contract() {
+  using Tree=wangziqi2013::bwtree::BwTree<long,long>;
+  static_assert(!BWTREE_PROCESS_MAPPING_CACHE, "RPC must not compile invalidation channels");
+  static_assert(std::is_same<typename Tree::mapping_table_t::value_type,
+                            std::atomic<const Tree::BaseNode*>>::value,
+                "RPC mapping entries must use native DRAM atomics");
+  // Deliberately omit PrivateIndexMemoryScope: the tree's own allocation mode
+  // must keep metadata local even when called outside the wrapper's TLS scope.
+  require(private_index_memory==nullptr,"local-tree assertion unexpectedly has an allocator override");
+  require(SimThreadInfo::worker_machine_count==2,"local-tree assertion needs the real two-host topology");
+  const size_t nc_before=allocator_test::allocation_count(true);
+  auto* tree=new(bwtree_metadata_memory().malloc(sizeof(Tree))) Tree(false,true);
+  require(ycsbc_ub::in_local_index(tree,sizeof(Tree)),"RPC tree allocated shared metadata");
+  require(!tree->gc_flush_worker.IsEnabled(),"local RPC tree started a GC flush worker");
+  tree->UpdateThreadLocal(2);
+  tree->AssignGCID(0);
+  static_assert(std::is_same<decltype(tree->root_id),std::atomic<NodeID>>::value,
+                "RPC root must use native DRAM atomics");
+  static_assert(std::is_same<decltype(tree->GetGCMetaData(0)->last_active_epoch),
+                            std::atomic<uint64_t>>::value,
+                "RPC epochs must use native DRAM atomics");
+  for(const void* p:{static_cast<const void*>(&tree->mapping_table),
+                    static_cast<const void*>(tree->GetGCMetaData(0)),
+                    static_cast<const void*>(tree->GetGCMetaData(1)),
+                    static_cast<const void*>(tree->epoch_manager.current_epoch_p)})
+    require(ycsbc_ub::in_local_index(p),"RPC control/epoch metadata escaped local DRAM");
+  for(long key=1;key<=256;++key) require(tree->Insert(key,key+100),"local RPC tree insert failed");
+  for(long key=1;key<=256;++key) {
+    std::vector<long> values;tree->GetValue(key,values);
+    require(values.size()==1 && values.front()==key+100,"local RPC tree read failed");
+  }
+  require(tree->GetGCMetaData(0)->last_active_epoch.load()==std::numeric_limits<uint64_t>::max(),
+          "idle RPC point-operation worker still pins the GC epoch");
+  for(NodeID id=1;id<tree->next_unused_node_id.load();++id) {
+    const auto* node=tree->mapping_table[id].load();
+    if(node) require(ycsbc_ub::in_local_index(node),"RPC node escaped local DRAM");
+  }
+  // Retire an independent allocation while a local reader holds its epoch.
+  // Release only that local reader: reclaim must not require any peer ACK.
+  auto* retired=Tree::ElasticNode<Tree::KeyNodeIDPair>::Get(
+      0,Tree::NodeType::InnerType,0,0,std::make_pair(0L,NodeID{0}),std::make_pair(0L,NodeID{0}));
+  require(ycsbc_ub::in_local_index(retired),"RPC retired node escaped local DRAM");
+  tree->AssignGCID(1);tree->UpdateLastActiveEpoch();
+  tree->AssignGCID(0);
+  tree->AddGarbageNode(retired,MAPPING_TABLE_SIZE-1);
+  auto* metadata=tree->GetGCMetaData(0);
+  const auto pending=metadata->node_count;
+  require(pending>0 && ycsbc_ub::in_local_index(metadata->last_p),"RPC garbage descriptor escaped local DRAM");
+  tree->IncreaseEpoch();tree->UpdateLastActiveEpoch();
+  tree->PerformGC(0);
+  require(metadata->node_count==pending,"RPC GC ignored the local reader epoch");
+  tree->UnregisterThread(1);
+  tree->PerformGC(0);
+  require(metadata->node_count==0,"RPC GC still waits for non-local progress");
+  tree->UnregisterThread(0);
+  tree->~Tree();bwtree_metadata_memory().free(tree);
+  require(allocator_test::allocation_count(true)==nc_before,"local RPC tree allocated shared NC memory");
+  std::cout<<"BWTREE_RPC_LOCAL_PASS native_atomics=1 shared_nc_allocations=0 peer_ack=0 gc_flush_worker=0\n";
+}
+#endif
 void generation_contract(utils::Properties props) {
   // Force every B operation to UPDATE: A must still produce only READs,
   // both with and without the suite switch that caused the regression.
@@ -107,16 +168,16 @@ void queue_contract(bool owner,int in,int out) {
   if(owner) queue->~UbReadQueue();
 }
 #if defined(ENABLE_BWTREE_DB) && defined(OPT_IN_USE_FLAG) && BWTREE_PROCESS_MAPPING_CACHE
+template<size_t retired_count=70>
 void mapping_gc_contract(bool owner,int in,int out,bool drop_remote_invalidate=false) {
   using Tree=wangziqi2013::bwtree::BwTree<long,long>;
   constexpr NodeID id=MAPPING_TABLE_SIZE-1;
-  constexpr size_t retired_count=70; // Cross the production 64-node batch boundary.
   struct State {
     Tree* tree; const Tree::BaseNode* old; const Tree::BaseNode* replacement;
     std::array<const Tree::BaseNode*,retired_count-1> more_old{},more_new{};
   } state{};
   if(owner) {
-    state.tree=new(shared_atomic_memory().malloc(sizeof(Tree))) Tree(false,false);
+    state.tree=new(bwtree_metadata_memory().malloc(sizeof(Tree))) Tree(false,false);
     state.tree->UpdateThreadLocal(2);
     auto node=[] {
       auto* result = reinterpret_cast<Tree::InnerNode*>(Tree::ElasticNode<Tree::KeyNodeIDPair>::Get(
@@ -132,9 +193,19 @@ void mapping_gc_contract(bool owner,int in,int out,bool drop_remote_invalidate=f
       state.tree->mapping_table[id-i].store(state.more_old[i-1]);
     }
   }
+  if(owner) state.tree->PublishSharedLayout();
   transfer(owner?out:in,&state,sizeof(state),owner);
   auto* tree=state.tree;
+  if(!owner) tree->AcquireSharedLayout();
   tree->AssignGCID(owner?0:1);
+  // Re-enter within the same global epoch after publishing quiescence.
+  const int slot = owner ? 0 : 1;
+  tree->UnregisterThread(slot);
+  require(tree->GetGCMetaData(slot)->last_active_epoch.load()==std::numeric_limits<uint64_t>::max(),
+          "unregister failed to publish quiescence");
+  tree->AssignGCID(slot);
+  require(tree->GetGCMetaData(slot)->last_active_epoch.load()==tree->GetGlobalEpoch(),
+          "same-epoch registration left a live reader quiescent");
   tree->PrepareLocalMappingCache();
   if(!owner && drop_remote_invalidate) {
 #ifdef SHM_LOCAL_NCC
@@ -191,8 +262,12 @@ void mapping_gc_contract(bool owner,int in,int out,bool drop_remote_invalidate=f
     auto* garbage=meta->header.next_p;
     require(garbage && garbage->cache_invalidation.sequence,"GC did not send a message");
     auto* last=meta->last_p;
-    require(last->cache_invalidation.sequence>garbage->cache_invalidation.sequence,
-            "GC did not split retirement into multiple batches");
+    if constexpr (retired_count > 1024) {
+      require(last->cache_invalidation.sequence==0,"pressure test did not fill the 16x64 ring");
+    } else {
+      require(last->cache_invalidation.sequence>garbage->cache_invalidation.sequence,
+              "GC did not split retirement into multiple batches");
+    }
     auto* cursor=garbage;
     for(size_t i=0;i<64;++i,cursor=cursor->next_p)
       require(cursor->cache_invalidation.sequence==garbage->cache_invalidation.sequence,
@@ -240,6 +315,21 @@ void mapping_gc_contract(bool owner,int in,int out,bool drop_remote_invalidate=f
       std::this_thread::yield();
     }
     require(allocator_test::live_bytes(false)<live_before_gc,"GC did not return CACHE storage to the allocator");
+  }
+  barrier(in,out); // Retirement ACKs completed, but reuse is not published yet.
+#ifdef SHM_LOCAL_NCC
+  if (!owner && retired_count <= 1024) {
+    local_ncc_prefetch(state.old);
+    // Pin an old tail line too: a fresh header alone must not let a partial
+    // node acquisition pass by cold-filling the untested variable-sized tail.
+    const auto* tail=reinterpret_cast<const char*>(state.old)
+        +sizeof(Tree::ElasticNode<Tree::KeyNodeIDPair>)+63*sizeof(Tree::KeyNodeIDPair);
+    local_ncc_prefetch(tail);
+  }
+#endif
+  barrier(in,out); // Deliberately cache the retired bytes AFTER the last ACK.
+  if (owner) {
+    if constexpr (retired_count <= 1024) {
     // Verify actual retired-address reuse and the remote reread below.
     // Production allocators no longer maintain a high-water statistic.
     auto* reused=reinterpret_cast<Tree::InnerNode*>(Tree::ElasticNode<Tree::KeyNodeIDPair>::Get(
@@ -248,21 +338,24 @@ void mapping_gc_contract(bool owner,int in,int out,bool drop_remote_invalidate=f
     reused->FlushNode();
     require(reused==state.old,"retired BwTree CACHE address was not reused");
     tree->mapping_table[id].store(reused);
+    }
   }
   barrier(in,out);
   if(!owner) {
+    if constexpr (retired_count <= 1024) {
     tree->AssignGCID(1);
     const auto* reused=tree->GetNode(id,true);
     require(reused==state.old && reused->GetLowKey()==41 && reused->GetHighKey()==99,
             "remote cacheline survived allocation reuse");
     require(static_cast<const Tree::InnerNode*>(reused)->Begin()[63].first==363,
             "remote variable-sized payload cacheline survived reuse");
+    }
     tree->UnregisterThread(1);
     bwtree_process_cache::shutdown();
   }
   barrier(in,out);
   if(owner) {
-    tree->epoch_manager.FreeEpochDeltaChain(state.old);
+    if constexpr (retired_count <= 1024) tree->epoch_manager.FreeEpochDeltaChain(state.old);
     tree->mapping_table[id].store(nullptr);
     tree->epoch_manager.FreeEpochDeltaChain(state.replacement);
     for(size_t i=1;i<retired_count;++i) {
@@ -271,7 +364,7 @@ void mapping_gc_contract(bool owner,int in,int out,bool drop_remote_invalidate=f
     }
     tree->UnregisterThread(0);
     tree->~Tree();
-    shared_atomic_memory().free(tree);
+    bwtree_metadata_memory().free(tree);
   }
 }
 #endif
@@ -511,6 +604,250 @@ void index_contract(bool owner,bool rpc,const std::string& index,int in,int out)
     db->~DB();shared_atomic_memory().free(db);
   }
 }
+#if defined(ENABLE_BWTREE_DB)
+void growth_contract(bool owner, int in, int out, bool bad_native_atomic=false) {
+  using Tree=wangziqi2013::bwtree::BwTree<long,long>;
+  constexpr int writers=8, count=16384;
+  struct Shared { Tree* tree; nt<uint64_t>* committed; } shared{};
+  if(owner) {
+    shared.tree=new(bwtree_metadata_memory().malloc(sizeof(Tree))) Tree(false,false);
+    shared.tree->UpdateThreadLocal(writers+1);
+    shared.committed=static_cast<nt<uint64_t>*>(shared_atomic_memory().malloc(count*sizeof(nt<uint64_t>)));
+    for(int k=0;k<count;++k) new(shared.committed+k) nt<uint64_t>(0);
+  }
+  if(owner) shared.tree->PublishSharedLayout();
+  transfer(owner?out:in,&shared,sizeof(shared),owner);
+  auto* tree=shared.tree;
+  if(!owner) tree->AcquireSharedLayout();
+  if (!owner && bad_native_atomic) {
+#ifdef SHM_LOCAL_NCC
+    require(tree->insert_op_count.load()==0,"unexpected counter");
+#else
+    throw std::runtime_error("native CACHE atomic negative requires LOCAL_NCC");
+#endif
+  }
+#if defined(OPT_IN_USE_FLAG) && BWTREE_PROCESS_MAPPING_CACHE
+  tree->PrepareLocalMappingCache();
+#endif
+  barrier(in,out);
+  if(owner) {
+    std::vector<std::thread> workers;
+    std::atomic<int> errors{0};
+    for(int tid=0;tid<writers;++tid) workers.emplace_back([&,tid] {
+      SimThreadInfo::setup_worker_ids(0,tid);
+      tree->AssignGCID(tid);
+      for(int i=tid;i<count;i+=writers) {
+        const int k=(i*6181)&(count-1);
+        if(!tree->Insert(k+1,k+101)) ++errors;
+        shared.committed[k].store(true,std::memory_order_release);
+      }
+      tree->UnregisterThread(tid);
+    });
+    for(auto& t:workers)t.join();
+    require(errors.load()==0,"concurrent growth insert failed");
+  } else {
+    tree->AssignGCID(writers);
+    for(int k=0;k<count;++k) {
+      while(!shared.committed[k].load(std::memory_order_acquire)) std::this_thread::yield();
+      std::vector<long> values;tree->GetValue(k+1,values);
+      require(values.size()==1 && values[0]==k+101,"concurrent growth lost or corrupted committed key");
+    }
+    tree->UnregisterThread(writers);
+  }
+  barrier(in,out);
+  if(!owner) {
+    tree->AssignGCID(writers);
+    for(int k=count-1;k>=0;--k) {
+      std::vector<long> values;tree->GetValue(k+1,values);
+      require(values.size()==1 && values[0]==k+101,"post-growth read returned wrong value");
+    }
+    std::vector<long> missing;tree->GetValue(count+1,missing);
+    require(missing.empty(),"absent key unexpectedly found");
+    tree->UnregisterThread(writers);
+#if defined(OPT_IN_USE_FLAG) && BWTREE_PROCESS_MAPPING_CACHE
+    bwtree_process_cache::shutdown();
+#endif
+  }
+  barrier(in,out);
+  if(owner) {
+    require(tree->next_unused_node_id.load()>130,"growth did not exercise enough splits");
+    tree->~Tree();bwtree_metadata_memory().free(tree);
+    shared_atomic_memory().free(shared.committed);
+  }
+}
+#endif
+
+#if defined(ENABLE_BWTREE_DB) && !BWTREE_LOCAL_ONLY
+void shared_metadata_contract(bool owner,int in,int out) {
+  using Tree=wangziqi2013::bwtree::BwTree<long,long>;
+  struct Shared {
+    Tree* tree;
+    Tree::AllocationMeta* chunk;
+    uint64_t first_id;
+  } shared{};
+  if(owner) {
+    shared.tree=new(bwtree_metadata_memory().malloc(sizeof(Tree))) Tree(false,false);
+    shared.tree->UpdateThreadLocal(2);
+    shared.tree->AssignGCID(0);
+    auto* leaf=static_cast<const Tree::LeafNode*>(shared.tree->GetNode(shared.tree->first_leaf_id));
+    shared.chunk=Tree::LeafNode::GetAllocationHeader(leaf);
+    shared.first_id=shared.tree->next_unused_node_id.load();
+    shared.tree->PublishSharedLayout();
+    clwb(shared.chunk,sizeof(*shared.chunk));
+  }
+  transfer(owner?out:in,&shared,sizeof(shared),owner);
+  auto* tree=shared.tree;
+  if(!owner) {
+    tree->AcquireSharedLayout();
+    clflush(shared.chunk,sizeof(*shared.chunk));
+    tree->AssignGCID(1);
+  }
+  // Exercise only shared control words. A still never writes CACHE payloads;
+  // this checks their semantics without claiming a multi-writer tree protocol.
+  constexpr size_t count=256;
+  std::array<uint64_t,count> ids{};
+  barrier(in,out);
+  for(auto& id:ids) id=tree->GetNextNodeID();
+  uintptr_t reserved=reinterpret_cast<uintptr_t>(shared.chunk->TryAllocate(64));
+  require(reserved!=0,"shared chunk reservation failed");
+  barrier(in,out);
+  if(owner) {
+    std::array<uint64_t,count> peer_ids{};
+    uintptr_t peer_reserved=0;
+    transfer(in,peer_ids.data(),sizeof(peer_ids),false);
+    transfer(in,&peer_reserved,sizeof(peer_reserved),false);
+    std::vector<uint64_t> combined(ids.begin(),ids.end());
+    combined.insert(combined.end(),peer_ids.begin(),peer_ids.end());
+    std::sort(combined.begin(),combined.end());
+    for(size_t i=0;i<combined.size();++i)
+      require(combined[i]==shared.first_id+i,"cross-host NodeID allocation collided or lost progress");
+    require(tree->next_unused_node_id.load()==shared.first_id+2*count,
+            "NodeID counter is not globally shared");
+    require(reserved>peer_reserved ? reserved-peer_reserved==64 : peer_reserved-reserved==64,
+            "cross-host chunk reservations overlap");
+    tree->UnregisterThread(0);
+    tree->IncreaseEpoch();
+  } else {
+    transfer(out,ids.data(),sizeof(ids),true);
+    transfer(out,&reserved,sizeof(reserved),true);
+  }
+  barrier(in,out);
+  auto minimum=[&](int slot) {
+#ifdef OPT_GC
+    return tree->SummarizeGCEpoch2(slot);
+#else
+    (void)slot;return tree->SummarizeGCEpoch();
+#endif
+  };
+  if(!owner) {
+    require(tree->GetGlobalEpoch()==1,"remote epoch publication missing");
+    require(minimum(0)==0 && minimum(1)==0,"remote active reader lost global minimum protection");
+    tree->UnregisterThread(1);
+  }
+  barrier(in,out);
+  if(owner) tree->IncreaseEpoch();
+  barrier(in,out);
+  if(!owner) {
+    require(tree->GetGlobalEpoch()==2,"second remote epoch publication missing");
+    require(minimum(0)==UINT64_MAX && minimum(1)==UINT64_MAX,
+            "remote reclaimer cannot observe the updated minimum epoch");
+  }
+  barrier(in,out);
+  if(owner) { tree->~Tree();bwtree_metadata_memory().free(tree); }
+}
+
+template<class Tree> void check_bwtree_layout(Tree* tree) {
+#if BWTREE_SPLIT_ATOMICS
+  auto nc=[](const void* address) {
+    const auto p=reinterpret_cast<uintptr_t>(address);
+    require(p>=0x400000000000ul && p<0x400008000000ul,"BwTree nt word escaped NC");
+  };
+  auto cache=[](const void* address) {
+    const auto p=reinterpret_cast<uintptr_t>(address);
+    require(p>=0x300000000000ul && p<0x300008000000ul,"BwTree ordinary state escaped CACHE");
+  };
+  cache(tree); cache(&tree->gc_stats); cache(&tree->epoch_manager);
+  cache(&tree->gc_flush_worker); cache(&tree->insert_op_count);
+  cache(tree->epoch_manager.current_epoch_p);
+#ifndef OPT_ROOT_READ
+  nc(&tree->root_id.get());
+#endif
+  nc(&tree->next_unused_node_id.get());
+  nc(tree->mapping_table.data());
+#ifdef OPT_ROOT_READ
+  cache(tree->root_help_update);
+  nc(&tree->global_root_node_p.get());
+  nc(tree->root_node_replicas.data());
+#endif
+  for(size_t i=0;i<tree->GetThreadNum();++i) {
+#ifdef OPT_ROOT_READ
+    cache(tree->GetMetaData(i));
+    nc(&tree->GetMetaData(i)->cached_root_id.get());
+#endif
+    auto* gc=tree->GetGCMetaData(i);cache(gc);cache(&gc->header);cache(&gc->node_count);
+    nc(&gc->last_active_epoch.get());
+#ifdef OPT_GC
+    nc(&gc->minimun_epoch.get());
+#endif
+  }
+  tree->mapping_cache_invalidations.visit_storage(
+      [&](const auto& word) { cache(&word); nc(&word.get()); },
+      [&](const void* bytes,size_t) { cache(bytes); });
+  // All owner-only native atomics remain native and outside NC.
+  tree->VisitEpochStorage(cache,nc);
+  auto* leaf=reinterpret_cast<const typename Tree::LeafNode*>(tree->GetNode(tree->first_leaf_id));
+  Tree::LeafNode::GetAllocationHeader(leaf)->VisitStorage(cache,nc);
+  // Each chunk needs one shared tail; the obsolete per-node flag adds none.
+  const size_t nc_before=allocator_test::allocation_count(true);
+  using Leaf=typename Tree::LeafNode;
+  for(int i=0;i<16;++i) {
+    auto* probe=Leaf::Get(1,Tree::NodeType::LeafType,0,1,{0,0},{100,0});
+    auto* header=Leaf::GetAllocationHeader(probe);
+    header->VisitStorage(cache,nc);
+    auto* extra=header->GrowChunk();
+    extra->VisitStorage(cache,nc);
+    require(allocator_test::allocation_count(true)==nc_before+2*(i+1),
+            "BwTree node/chunk allocated unnecessary NC state");
+    probe->~ElasticNode();
+    header->Destroy();
+  }
+  std::cout<<"BWTREE_LAYOUT_PASS tree=CACHE native_atomics=CACHE nt_words=NC ring_payload=CACHE\n";
+#endif
+}
+void epoch_contract() {
+  using Tree=wangziqi2013::bwtree::BwTree<long,long>;
+  auto* tree=new(bwtree_metadata_memory().malloc(sizeof(Tree))) Tree(false,false);
+  constexpr int held_worker=599; // Reader IDs need not fit the 512 producer lanes.
+  tree->UpdateThreadLocal(held_worker+1);
+  tree->AssignGCID(held_worker);
+  check_bwtree_layout(tree);
+  auto* held=tree->epoch_manager.JoinEpoch();
+  const auto held_epoch=tree->GetGCMetaData(held_worker)->last_active_epoch.load();
+  tree->IncreaseEpoch();
+  tree->AssignGCID(0);
+  tree->IncreaseEpoch();
+  for(int i=0;i<257;++i) {
+    auto* token=tree->epoch_manager.JoinEpoch();
+    tree->epoch_manager.LeaveEpoch(token);
+  }
+  require(tree->GetGCMetaData(0)->last_active_epoch.load()==tree->GetGlobalEpoch(),
+          "completed operations did not advance their epoch");
+  require(tree->SummarizeGCEpoch()==held_epoch,"active reader lost epoch protection");
+  tree->UnregisterThread(0);
+  auto* token=tree->epoch_manager.JoinEpoch();
+  require(tree->GetGCMetaData(0)->last_active_epoch.load()==tree->GetGlobalEpoch(),
+          "same-epoch reentry after unregister left a live reader quiescent");
+  tree->epoch_manager.LeaveEpoch(token);
+  tree->UnregisterThread(0);
+  tree->AssignGCID(held_worker);
+  tree->epoch_manager.LeaveEpoch(held);
+  tree->UnregisterThread(held_worker);
+  require(tree->SummarizeGCEpoch()==std::numeric_limits<uint64_t>::max(),
+          "unregistered workers still pin the epoch");
+  tree->~Tree();bwtree_metadata_memory().free(tree);
+}
+#endif
+
 void run(bool owner,const std::string& mode,int in,int out) {
   const bool queue=mode=="queue";
   const bool rpc=mode.find("+rpc")!=std::string::npos
@@ -561,10 +898,18 @@ void run(bool owner,const std::string& mode,int in,int out) {
   if(owner) transfer(out,&ready,1,true);
   VALUE_ADDR_SIZE=64;
   if(owner) generation_contract(props);
+#if defined(ENABLE_BWTREE_DB) && BWTREE_LOCAL_ONLY
+  if(rpc && !queue && index=="bwtree") {
+    barrier(in,out);
+    local_bwtree_contract();
+    barrier(in,out);
+  }
+#endif
   if(mode=="bwtree+legacy") unsetenv("YCSB_UB_SUITE");
-  if(mode=="bwtree+cache-gc" || mode=="bwtree+cache-gc-no-invalidate") {
+  if(mode=="bwtree+cache-gc" || mode=="bwtree+cache-gc-no-invalidate" || mode=="bwtree+cache-gc-pressure") {
 #if defined(ENABLE_BWTREE_DB) && defined(OPT_IN_USE_FLAG) && BWTREE_PROCESS_MAPPING_CACHE
-    mapping_gc_contract(owner,in,out,mode=="bwtree+cache-gc-no-invalidate");
+    if(mode=="bwtree+cache-gc-pressure") mapping_gc_contract<1100>(owner,in,out);
+    else mapping_gc_contract(owner,in,out,mode=="bwtree+cache-gc-no-invalidate");
 #else
     throw std::runtime_error("mapping cache GC contract requires BwTree OPT");
 #endif
@@ -572,6 +917,14 @@ void run(bool owner,const std::string& mode,int in,int out) {
 #ifdef ENABLE_CLEVEL_HASH_DB
   else if(mode=="clevelhash+metadata" || mode=="clevelhash+metadata-no-writeback")
     clevel_metadata_contract(owner,in,out,mode=="clevelhash+metadata-no-writeback");
+#endif
+#ifdef ENABLE_BWTREE_DB
+  else if(mode=="bwtree+growth" || mode=="bwtree+native-cache-atomic")
+    growth_contract(owner,in,out,mode=="bwtree+native-cache-atomic");
+#endif
+#if defined(ENABLE_BWTREE_DB) && !BWTREE_LOCAL_ONLY
+  else if(mode=="bwtree+epoch") { if(owner) epoch_contract(); }
+  else if(mode=="bwtree+shared-metadata") shared_metadata_contract(owner,in,out);
 #endif
   else if(queue) queue_contract(owner,in,out);
   else if(rpc) partitioned_rpc_contract(owner,index,in,out);
@@ -601,6 +954,10 @@ int main(int argc,char** argv) {
     int status=0;waitpid(child,&status,0);require(WIFEXITED(status)&&WEXITSTATUS(status)==0,"child failed");
     if(std::string(argv[1])=="bwtree+cache-gc")
       std::cout<<"PASS bwtree+cache-gc: combined mapping/cacheline notification, held-reader grace, ACK and remote CACHE reuse verified\n";
+    else if(std::string(argv[1])=="bwtree+epoch")
+      std::cout<<"PASS bwtree+epoch: held-reader protection, refresh progress and same-epoch reentry verified\n";
+    else if(std::string(argv[1])=="bwtree+growth")
+      std::cout<<"PASS bwtree+growth: 16384 concurrent inserts, cross-process reads, splits and missing-key lookup verified\n";
     else std::cout<<"PASS "<<argv[1]<<": A read-only; routing, value bytes and memory placement verified\n";
   } catch(const std::exception& e) {
     std::cerr<<e.what()<<'\n';

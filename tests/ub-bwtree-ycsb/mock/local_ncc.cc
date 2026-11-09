@@ -235,8 +235,13 @@ extern "C" void local_ncc_write(void* address, size_t bytes) {
   access(address, bytes, true);
 }
 extern "C" void local_ncc_atomic(const void* address, size_t bytes) {
-  if (contains(address, bytes))
-    throw std::runtime_error("LOCAL_NCC requires atomics in shared NC memory, not private CACHE replicas");
+  if (!contains(address, bytes)) return;
+  // B's native atomics synchronize its own CPU threads, not the remote host.
+  // A must use NC atomics for cross-host synchronization; it cannot operate on
+  // B's owner-local counters, allocator links, mutexes or thread state.
+  if (!replica.writer)
+    throw std::runtime_error("LOCAL_NCC: reader used a native atomic in CACHE");
+  access(address, bytes, true);
 }
 extern "C" void local_ncc_prefetch(const void* address) {
   // Prefetch is non-faulting for unmapped/out-of-range pointers.

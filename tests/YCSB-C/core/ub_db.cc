@@ -126,7 +126,11 @@ public:
 
 DB* create_index(IndexKind kind,int threads) {
 #ifdef ENABLE_BWTREE_DB
-  if(kind==IndexKind::BwTree) return shared_new<BwTreeDB>(threads+1);
+  if(kind==IndexKind::BwTree) {
+    auto* db = new(cacheable.malloc(sizeof(BwTreeDB))) BwTreeDB(threads+1);
+    if (!BWTREE_LOCAL_ONLY) clwb(db, sizeof(*db));
+    return db;
+  }
 #endif
 #ifdef ENABLE_CLEVEL_HASH_DB
   if(kind==IndexKind::ClevelHash) return shared_new<CLevelHashDB>(threads+1);
@@ -138,7 +142,7 @@ DB* create_index(IndexKind kind,int threads) {
 // completion counter, or pointer to a private index is published to the peer.
 class LocalDB final : public DB {
   DB* target_;
-  const bool rpc_, sherman_, owner_;
+  const bool rpc_, sherman_, owner_, bwtree_;
   const unsigned machine_;
   UbReadQueue *incoming_=nullptr, *outgoing_=nullptr;
   std::unique_ptr<RpcQueueRouter> outgoing_router_;
@@ -183,7 +187,7 @@ class LocalDB final : public DB {
 public:
   explicit LocalDB(UbDB& descriptor)
       : target_(nullptr),rpc_(descriptor.rpc),sherman_(descriptor.kind==IndexKind::Sherman),
-        owner_(SimThreadInfo::is_master()),machine_(SimThreadInfo::worker_machine_id),
+        owner_(SimThreadInfo::is_master()),bwtree_(descriptor.kind==IndexKind::BwTree),machine_(SimThreadInfo::worker_machine_id),
         counts_(rpc_ ? ycsbc_ub::threads(machine_) : 0) {
     if(rpc_) {
       PrivateIndexMemoryScope scope(&cacheable);
@@ -197,7 +201,13 @@ public:
 #else
       throw std::runtime_error("Sherman is not built");
 #endif
-    } else target_=descriptor.shared_target;
+    } else {
+      target_=descriptor.shared_target;
+#ifdef ENABLE_BWTREE_DB
+      if (descriptor.kind==IndexKind::BwTree && !owner_)
+        clflush(target_, sizeof(BwTreeDB));
+#endif
+    }
     if(!rpc_) return;
     // Reuse the original MQ worker loop, bucket scheduling and local queues.
     // Only the remote task representation differs: slot IDs and value bytes.
@@ -239,7 +249,8 @@ public:
     if(sherman_) delete target_;
     else if(rpc_ || owner_) {
       PrivateIndexMemoryScope scope(rpc_ ? &cacheable : nullptr);
-      target_->~DB(); shared_atomic_memory().free(target_);
+      target_->~DB();
+      (rpc_ || bwtree_ ? cacheable : shared_atomic_memory()).free(target_);
     }
   }
   int ThreadInit() override {

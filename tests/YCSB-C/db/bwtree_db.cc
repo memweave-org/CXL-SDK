@@ -22,7 +22,7 @@ namespace ycsbc {
 int ThreadPool::pool_index = 0;
 #endif
 
-#ifdef USE_CXL
+#if defined(USE_CXL) && !BWTREE_LOCAL_ONLY
 namespace {
 std::atomic<bool> bwtree_gc_dispatcher_registered{false};
 
@@ -47,7 +47,7 @@ BwTreeDB::BwTreeDB(int thread_num)
   SimThreadInfo::setup_worker_db_id();
 #endif
   if (tree != nullptr) {
-#ifdef USE_CXL
+#if defined(USE_CXL) && !BWTREE_LOCAL_ONLY
     bool expected = false;
     // UB has a single writer/allocator B; its collector frees all nodes locally.
     // No remote GC requests or message-queue dispatcher are needed on A.
@@ -110,7 +110,13 @@ void BwTreeDB::PoolThreadClose(int thread_id) {
 int BwTreeDB::ThreadInit() {
   // int thread_id = allocate();
   int thread_id = SimThreadInfo::worker_thread_id;
+  tree->AcquireSharedLayout();
   tree->AssignGCID(thread_id);
+#if BWTREE_LOCAL_ONLY
+  // RPC services and clients register before loading/READY and can remain
+  // idle indefinitely. JoinEpoch announces actual tree access later.
+  tree->UnregisterThread(thread_id);
+#endif
 #if defined(OPT_IN_USE_FLAG) && BWTREE_PROCESS_MAPPING_CACHE
   // A attaches to B's shared tree without running its constructor. Create
   // this process's private table during registration, before worker READY.
@@ -170,6 +176,13 @@ int BwTreeDB::ReadInternal(uint64_t key, uintptr_t &value) {
     return DB::kErrorNoData;
   }
   value = val[0];
+#if BWTREE_SPLIT_ATOMICS
+  // The value is a separate immutable allocation. Acquiring its node does not
+  // invalidate payload lines that A prefetched before B published this value.
+  // Keep the same read protocol in UB and CXL, including full multi-line values.
+  if (SimThreadInfo::is_follower())
+    clflush(reinterpret_cast<const void*>(value), static_cast<size_t>(VALUE_ADDR_SIZE));
+#endif
   // access the real value by address
   utils::AccessValueByAddress(value);
   return DB::kOK;

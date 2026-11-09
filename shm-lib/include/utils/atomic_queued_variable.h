@@ -5,6 +5,7 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <type_traits>
 #include <algorithm> // For std::max
 #include <ctime>     // For clock_gettime, CLOCK_MONOTONIC, timespec
 #include <iostream>
@@ -202,7 +203,12 @@ public:
     ub_assert_atomic_target(&value);
 #endif
     T old_value;
-    old_value = __atomic_fetch_sub(&value, i, __ATOMIC_SEQ_CST);
+    // The legacy nt pointer API encodes a byte count as a pointer. The
+    // compiler builtin requires an integer displacement, including for char*.
+    if constexpr (std::is_pointer<T>::value)
+      old_value = __atomic_fetch_sub(&value, reinterpret_cast<uintptr_t>(i), __ATOMIC_SEQ_CST);
+    else
+      old_value = __atomic_fetch_sub(&value, i, __ATOMIC_SEQ_CST);
     if (nt) {
       AtomicRequestQueue::pend_cas_req(const_cast<const void*>(static_cast<const volatile void*>(&value)));
     }

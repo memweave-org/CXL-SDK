@@ -19,8 +19,14 @@ Observer& observer() {
 }
 void record(memkind_t kind, void* pointer, size_t bytes) {
   if (!pointer) return;
+#ifdef YCSB_CXL_TWO_PROCESS
+  const auto address=reinterpret_cast<uintptr_t>(pointer);
+  const bool atomic=address>=0x400000000000ul && address<0x400008000000ul;
+  if (!atomic && !(address>=0x300000000000ul && address<0x300008000000ul)) return;
+#else
   const bool atomic = ub_arena_owns(true, pointer);
   if (!atomic && !ub_arena_owns(false, pointer)) return;
+#endif
   auto& state = observer();
   std::lock_guard<std::mutex> guard(state.mutex);
   state.live.emplace(pointer, Allocation{kind, (std::max(bytes, size_t(1)) + 63) & ~size_t(63), atomic});

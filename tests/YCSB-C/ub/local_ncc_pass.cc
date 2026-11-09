@@ -5,6 +5,7 @@
 #include <llvm/IR/PassManager.h>
 #include <llvm/Passes/PassBuilder.h>
 #include <llvm/Passes/PassPlugin.h>
+#include <llvm/Transforms/Utils/BasicBlockUtils.h>
 using namespace llvm;
 namespace {
 struct LocalNccPass : PassInfoMixin<LocalNccPass> {
@@ -55,7 +56,32 @@ struct LocalNccPass : PassInfoMixin<LocalNccPass> {
           auto* callee = call->getCalledFunction();
           if (!callee) continue;
           const auto name = callee->getName();
-          if (callee->getIntrinsicID() == Intrinsic::prefetch) {
+          const auto id = callee->getIntrinsicID();
+          if (id == Intrinsic::masked_load || id == Intrinsic::masked_store ||
+              id == Intrinsic::masked_gather || id == Intrinsic::masked_scatter) {
+            // Optimized strided CACHE reads become gathers. Ignoring these
+            // would consume stale replica bytes without a demand fill/check.
+            // Touch active lanes only: masked-off pointers may be invalid.
+            const bool writing = id == Intrinsic::masked_store || id == Intrinsic::masked_scatter;
+            const bool indexed = id == Intrinsic::masked_gather || id == Intrinsic::masked_scatter;
+            auto* vector_type = dyn_cast<FixedVectorType>(writing ? call->getArgOperand(0)->getType()
+                                                                 : call->getType());
+            if (!vector_type) report_fatal_error("LOCAL_NCC: scalable masked access unsupported");
+            auto* pointer = call->getArgOperand(writing ? 1 : 0);
+            auto* mask = call->getArgOperand(writing ? 3 : 2);
+            auto* element_type = vector_type->getElementType();
+            for (unsigned lane = 0; lane < vector_type->getNumElements(); ++lane) {
+              builder.SetInsertPoint(instruction);
+              auto* active = builder.CreateExtractElement(mask, lane);
+              auto* then_end = SplitBlockAndInsertIfThen(active, instruction, false);
+              builder.SetInsertPoint(then_end);
+              auto* address = indexed ? builder.CreateExtractElement(pointer, lane)
+                                      : builder.CreateGEP(element_type, pointer, builder.getInt32(lane));
+              access(writing ? store_hook : hook, address, size(element_type));
+            }
+          } else if (id == Intrinsic::masked_expandload || id == Intrinsic::masked_compressstore) {
+            report_fatal_error("LOCAL_NCC: packed masked access unsupported");
+          } else if (id == Intrinsic::prefetch) {
             builder.CreateCall(prefetch_hook, {call->getArgOperand(0)});
           } else if ((name == "memcmp" || name == "bcmp") && call->arg_size() == 3) {
             read(call->getArgOperand(0), call->getArgOperand(2));

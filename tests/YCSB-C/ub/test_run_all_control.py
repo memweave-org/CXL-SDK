@@ -28,6 +28,23 @@ EXPECTED={
 
 
 class RoutingTests(unittest.TestCase):
+    def test_bwtree_wrapper_uses_ub_and_only_requires_two_bundles(self):
+        env=dict(os.environ,YCSB_BACKEND='cxl')
+        command=['bash',str(HERE/'run_bwtree.sh'),'--thread-counts','1']
+        result=subprocess.run(command+['--dry-run'],env=env,
+                              capture_output=True,text=True,check=True)
+        plan=json.loads(result.stdout)
+        self.assertEqual(plan['backend'],'ub')
+        self.assertEqual(plan['cases'],['bwtree','bwtree+opt'])
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary)
+            for mode in ('noopt','opt'):
+                (root/'bundles'/mode/'lib').mkdir(parents=True)
+                (root/'bundles'/mode/'ycsbc').touch()
+            subprocess.run(command+['--build-only','--bundles',str(root/'bundles'),
+                                    '--output',str(root/'results')],env=env,
+                           capture_output=True,text=True,check=True)
+
     def test_cxl_plan_uses_same_cases_workload_and_memory_as_ub(self):
         env={k:v for k,v in os.environ.items() if k not in ('THREAD_COUNTS','YCSB_BACKEND')}
         plans={}

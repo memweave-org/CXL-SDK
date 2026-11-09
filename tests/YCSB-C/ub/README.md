@@ -1,5 +1,18 @@
 # 原 YCSB-C 框架的 CXL/UB 多进程模式
 
+单独对比 UB BwTree NO OPT / OPT：两端配置好 `ub/config.sh` 后，在 B 先运行，
+A 随后运行相同命令（从仓库根目录执行）：
+
+```sh
+bash tests/YCSB-C/ub/run_bwtree.sh --dry-run
+bash tests/YCSB-C/ub/run_bwtree.sh --thread-counts 32 64 128
+```
+
+该入口固定 UB，依次运行 `bwtree` 和 `bwtree+opt`，只构建 BwTree 的 `noopt/`、
+`opt/` 两个 bundle。支持 `--build-only`、`--bundles DIR` 复用构建和 `--output DIR`
+指定结果目录；默认线程数为每端 32、64、128，其他参数沿用 `config.sh`。
+结果目录保存 `summary.csv`、`summary.json` 及各模式/线程数的日志。
+
 ## 八种模式：run_all
 
 CXL 在同一台机器运行独立 A/B 进程，全部八项均使用该模型：

@@ -43,10 +43,15 @@ inline std::memory_order failure_order(std::memory_order order) {
 
 template<class T> inline T load(const T* address, std::memory_order order) {
   check(address);
+#if defined(__aarch64__)
+  // Native atomic loads provide the requested ordering without extra fences.
+  return __atomic_load_n(address, int(order));
+#else
   before(order);
   T value = __atomic_load_n(address, int(order));
   after(order);
   return value;
+#endif
 }
 template<class T> inline void store(T* address, T value, std::memory_order order) {
   check(address);

@@ -138,12 +138,19 @@ def main(argv=None):
     directory=None
     try:
         bundles=(args.bundles or out/'bundles').resolve()
+        cases_by_mode={mode:[case for case in args.cases
+                            if ('rpc' if case.endswith('+rpc') else
+                                'opt' if case.endswith('+opt') else 'noopt')==mode]
+                       for mode in ('noopt','opt','rpc')}
+        cases_by_mode={mode:cases for mode,cases in cases_by_mode.items() if cases}
         if not args.bundles:
-            for mode,opt in [('noopt','0'),('opt','1'),('rpc','0')]:
-                env=dict(os.environ,YCSB_BACKEND=args.backend,OPT=opt,YCSB_RPC_BUILD=str(int(mode=='rpc')),YCSB_INDEXES='bwtree;clevel-hash;sherman')
+            for mode,cases in cases_by_mode.items():
+                indexes=list(dict.fromkeys('clevel-hash' if case.startswith('clevelhash')
+                                           else case.split('+')[0] for case in cases))
+                env=dict(os.environ,YCSB_BACKEND=args.backend,OPT=str(int(mode=='opt')),YCSB_RPC_BUILD=str(int(mode=='rpc')),YCSB_INDEXES=';'.join(indexes))
                 with (out/f'build-{mode}.log').open('w') as log:
                     run_command(['bash','build.sh',str(bundles/mode)],env,log)
-        for mode in ('noopt','opt','rpc'):
+        for mode in cases_by_mode:
             if not (bundles/mode/'ycsbc').is_file() or not (bundles/mode/'lib').is_dir():
                 raise RuntimeError(f'Incomplete bundle: {bundles/mode}')
         if not args.build_only:

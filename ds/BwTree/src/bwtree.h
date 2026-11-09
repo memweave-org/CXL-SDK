@@ -6604,16 +6604,17 @@ class BwTree : public BwTreeBase {
 
   void TraverseReadOptimized(Context *context_p,
                              std::vector<ValueType> *value_list_p) {
-  std::vector<NodeID> node_id_path;
-  [[maybe_unused]] auto print_path = [&]() {
-    std::cout << (uint64_t)gettid() << " Node ID path: ";
-    for (auto node_id : node_id_path) {
-      auto node_p = GetNode(node_id, true);
-      std::cout << (int)node_p->GetType() << " " << node_id << " -> ";
-    }
-    std::cout << std::endl;
-    std::cout.flush();
-  };
+    // Temporarily disable unused path tracing to avoid vector allocations.
+    // std::vector<NodeID> node_id_path;
+    // [[maybe_unused]] auto print_path = [&]() {
+    //   std::cout << (uint64_t)gettid() << " Node ID path: ";
+    //   for (auto node_id : node_id_path) {
+    //     auto node_p = GetNode(node_id, true);
+    //     std::cout << (int)node_p->GetType() << " " << node_id << " -> ";
+    //   }
+    //   std::cout << std::endl;
+    //   std::cout.flush();
+    // };
   retry_traverse:
     assert(context_p->abort_flag == false);
 #ifdef BWTREE_DEBUG
@@ -6696,7 +6697,7 @@ class BwTree : public BwTreeBase {
 
       // This is the node we have just loaded
       NodeSnapshot *snapshot_p = GetLatestNodeSnapshot(context_p);
-      node_id_path.push_back(snapshot_p->node_id);
+      // node_id_path.push_back(snapshot_p->node_id);
 
       if (snapshot_p->IsLeaf() == true) {
         bwt_printf("The next node is a leaf (RO)\n");
